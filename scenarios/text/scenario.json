@@ -1,0 +1,81 @@
+{
+  "version": "1.0.0",
+  "tools": [
+    {
+      "name": "text_stats",
+      "description": "统计字符数、非空行数与出现次数最多的词。",
+      "permission": "text.read",
+      "action_level": "read",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 8192
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "summary": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 8192
+          },
+          "characters": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "lines": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "keywords": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "term": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 32768
+                },
+                "count": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              },
+              "required": [
+                "term",
+                "count"
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": [
+          "summary",
+          "characters",
+          "lines",
+          "keywords"
+        ],
+        "additionalProperties": false
+      },
+      "adapter": {
+        "type": "python",
+        "handler": "statistics"
+      }
+    }
+  ],
+  "id": "text",
+  "name": "文本分析",
+  "description": "统计输入的字符、非空行及重复词。英文忽略大小写，连续汉字按一项统计。",
+  "example": "统计文本：计划 计划 复盘",
+  "offline_tool": "text_stats"
+}
