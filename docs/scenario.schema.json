@@ -1,0 +1,151 @@
+{
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[a-z][a-z0-9_]*$"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "description": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024
+    },
+    "example": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 8192
+    },
+    "version": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)$"
+    },
+    "tools": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "pattern": "^[a-z][a-z0-9_]*$"
+          },
+          "description": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024
+          },
+          "action_level": {
+            "enum": [
+              "read",
+              "propose_write",
+              "commit_write"
+            ]
+          },
+          "permission": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "input_schema": {
+            "type": "object"
+          },
+          "output_schema": {
+            "type": "object"
+          },
+          "object_ids_field": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "adapter": {
+            "oneOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "const": "python"
+                  },
+                  "handler": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 64,
+                    "pattern": "^[a-z][a-z0-9_]*$"
+                  }
+                },
+                "additionalProperties": false,
+                "required": [
+                  "type",
+                  "handler"
+                ]
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "const": "http"
+                  },
+                  "url": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 2048
+                  },
+                  "method": {
+                    "enum": [
+                      "POST",
+                      "GET"
+                    ]
+                  }
+                },
+                "additionalProperties": false,
+                "required": [
+                  "type",
+                  "url",
+                  "method"
+                ]
+              }
+            ]
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "description",
+          "action_level",
+          "permission",
+          "input_schema",
+          "output_schema",
+          "adapter"
+        ]
+      },
+      "maxItems": 128
+    },
+    "offline_tool": {
+      "type": "string",
+      "maxLength": 64
+    },
+    "documents": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "name",
+    "description",
+    "example",
+    "version",
+    "tools"
+  ]
+}
