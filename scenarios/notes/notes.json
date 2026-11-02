@@ -1,0 +1,20 @@
+[
+  {
+    "source_id": "note-meeting",
+    "title": "会议纪要的记录要求",
+    "snippet": "会议纪要应记录日期、参与者、已作出的决定，以及每项待办的负责人和截止日期。",
+    "version": "1.0.0"
+  },
+  {
+    "source_id": "note-review",
+    "title": "周复盘笔记",
+    "snippet": "周复盘可记录本周完成事项、遇到的问题和下一周准备尝试的改进。",
+    "version": "1.0.0"
+  },
+  {
+    "source_id": "note-archive",
+    "title": "笔记归档与命名",
+    "snippet": "归档文件名使用日期和主题，正文保留来源与修订日期，便于以后核对。",
+    "version": "1.0.0"
+  }
+]

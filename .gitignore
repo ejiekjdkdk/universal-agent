@@ -1,0 +1,12 @@
+__pycache__/
+.pytest_cache/
+.venv/
+.env
+var/
+*.db
+*.db-*
+*.sqlite*
+*.egg-info/
+build/
+dist/
+.coverage
