@@ -50,3 +50,18 @@
 | 网页 | 真实 Chrome 验证原有资料问答与文本分析，以及持久计划的提交、三步依赖、证据、尝试次数和刷新恢复 |
 
 当前验收限于只读任务的本机执行与恢复。审批、正式业务写入、发布灰度、生产数据库和线上模型质量分别验收。[启动与复验步骤](v2/durable-plans.md)
+
+## V2 本地版 · P2 与 P3 验收
+
+在 Windows、Python 3.11、本机 SQLite 和回环 HTTP 上完成。最终 `python -m pytest -q` 输出 `214 passed, 12 subtests passed in 90.80s`。原有独立项目模板、V1 权限与幂等、P1 真实进程故障恢复均在本次全量范围内。另用升级前保存的 V1 数据库副本逐字段核对原任务、13 条历史事件与同键重放响应，全部匹配。
+
+| 设计验收项 | 观察到的结果 | 复验依据 |
+| --- | --- | --- |
+| T15–T21 模拟写入 | 默认拒绝，独立身份批准后有唯一账本回执。拒绝、过期、取消、重复或并发决定、撤权、载荷与版本冲突均有测试。确认超时可核对原回执，无须重新提交 | `tests/test_approvals.py`、`tests/test_governance_api.py` |
+| 审批跨进程恢复 | API 和原 Worker 退出后保留待审提案。批准后撤销审批人的对象操作资格，新的独立 Worker 拒绝提交，账本无回执 | `tests/test_approval_recovery.py` |
+| T22–T25 发布治理 | 稳定分桶、破坏性升级校验、不可变版本、逐级回滚、能力与快照紧急禁用均可复现。新旧任务使用各自版本，禁用的后续步骤没有发出工具调用 | `tests/test_releases.py`、`tests/test_release_flow.py` |
+| T26 场景扩展 | 模拟变更场景在运行时复制到底座仓库之外，从自己的目录加载。查看 `git diff --name-only afde95a 0ffbfb2`，该次接入仅增加场景、金标、演示脚本与测试 | `python scripts/local_governance.py --verify` |
+| T27–T30 安全、评测与观测 | 强制探针覆盖注入、越权、循环计划等故障。管理员可读取指标、告警及分页 OTLP JSON。导出测试覆盖敏感文本、伪造标识与凭据泄露，缺少模型用量或价格时保留空值 | `tests/test_evaluations.py`、`tests/test_observability.py`、`tests/test_providers.py` |
+| 实际网页 | 临时 Chrome 配置中打开申请工作台和审批页两个窗口。两种身份分别提交、复核、批准；审批页显示回执，工作台转为完成并展示模拟提交确认事件 | `python scripts/local_governance.py` |
+
+自动演示依次使用 `1.0.0 → 1.1.0 → 1.0.0`，三次获批的逻辑变更对应三个不同回执，账本版本为 `1 → 2 → 3`。四组离线金标全部通过，共 26 个评测结果，含每组重复运行的五项强制安全探针。该数据不代表线上模型准确率。[机器可读结果](v2/local-acceptance.json) · [操作与回滚说明](v2/governance.md)

@@ -1,0 +1,98 @@
+{
+  "environment": "offline-loopback",
+  "runs": [
+    {
+      "task_id": "task_e37dd7e319d144bb83f3f2d0d838742a",
+      "release_version": "1.0.0",
+      "receipt_id": "receipt_8b1bd83282c94ad8a7ee754b075398f9",
+      "new_object_version": 1
+    },
+    {
+      "task_id": "task_5f7fa1687020458cb05b33cfbf3c2195",
+      "release_version": "1.1.0",
+      "receipt_id": "receipt_72c65ae017a4445b89a3f6dcd0aa8588",
+      "new_object_version": 2
+    },
+    {
+      "task_id": "task_389323454300409aa1e41c1f8c87536c",
+      "release_version": "1.0.0",
+      "receipt_id": "receipt_c7c450cf4168437a9aa1d72fb2e1f6ce",
+      "new_object_version": 3
+    }
+  ],
+  "candidate_gate": true,
+  "evaluations": [
+    {
+      "environment": "offline",
+      "golden_version": "1.0.0",
+      "planner_version": "offline-v1",
+      "scenario_version": "1.0.0",
+      "suite_digest": "42f915256249ada8f493f880cb54ee2fa0914087e551aef050881ba23b8445b8",
+      "business_id": "notes",
+      "passed": true,
+      "metrics": {
+        "case_count": 7,
+        "passed_count": 7,
+        "routing_case_count": 2,
+        "security_case_count": 5,
+        "routing_accuracy": 1.0,
+        "security_pass_rate": 1.0,
+        "evidence_coverage_rate": 1.0
+      }
+    },
+    {
+      "environment": "offline",
+      "golden_version": "1.0.0",
+      "planner_version": "offline-v1",
+      "scenario_version": "1.0.0",
+      "suite_digest": "10d7376375cbbaa6511a8d8391ff29f5e8a4c0443a9cc4790e6763334bc67d4a",
+      "business_id": "text",
+      "passed": true,
+      "metrics": {
+        "case_count": 6,
+        "passed_count": 6,
+        "routing_case_count": 1,
+        "security_case_count": 5,
+        "routing_accuracy": 1.0,
+        "security_pass_rate": 1.0,
+        "evidence_coverage_rate": null
+      }
+    },
+    {
+      "environment": "offline",
+      "golden_version": "1.0.0",
+      "planner_version": "offline-v1",
+      "scenario_version": "1.0.0",
+      "suite_digest": "d9e995b5831ecba0bd11c76a8dc50180aeb86e2a65e88eefc13b0990de91e4b4",
+      "business_id": "project_brief",
+      "passed": true,
+      "metrics": {
+        "case_count": 6,
+        "passed_count": 6,
+        "routing_case_count": 1,
+        "security_case_count": 5,
+        "routing_accuracy": 1.0,
+        "security_pass_rate": 1.0,
+        "evidence_coverage_rate": 1.0
+      }
+    },
+    {
+      "environment": "offline",
+      "golden_version": "1.0.0",
+      "planner_version": "offline-v1",
+      "scenario_version": "1.0.0",
+      "suite_digest": "a9044663ccc3e62861d48a16e352a273bfb474fcf0a257cbe29495fa22bc8bca",
+      "business_id": "change_requests",
+      "passed": true,
+      "metrics": {
+        "case_count": 7,
+        "passed_count": 7,
+        "routing_case_count": 2,
+        "security_case_count": 5,
+        "routing_accuracy": 1.0,
+        "security_pass_rate": 1.0,
+        "evidence_coverage_rate": null
+      }
+    }
+  ]
+}
