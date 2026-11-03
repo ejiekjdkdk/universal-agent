@@ -29,3 +29,6 @@
 - Final: Ruling: MCP健康观察与目录缓存是进程内状态，快照共用当前进程网关；跨进程持续撤销由操作者修改可信enabled/批准配置，代价是不提供分布式健康一致性，实际调用仍每次刷新目录。凭据轮换使P2旧结果失效是安全边界而非静默换身份。
 - Final: minor (deferred): 无。
 - Task 5 local acceptance: complete — 505 passed、12 subtests，186.28秒；四模块mypy、compileall、node --check（app/review）、pip check、差异检查通过。日志work/v31-p2-after-review.log。最终上传与公开待执行，main仍af952ae。
+
+- Task 5: complete — 最终代码8e39dcc已推送origin/codex/v31-p2；2026-11-03按用户明确授权公开仓库，连接器/API确认public，匿名读取验收HTTP200。main保持af952ae，原分支全保留，无PR/合并/强推。完整Git源码zip、最终日志、审查报告和交接已保存聊天outputs；交付文档随后单独提交。
+- 公开前复扫：652对象/413blob/3720287字节，6处均为已人工确认的拒绝测试虚构样例，无敏感数据文件；无新增命中。没有把规则扫描等同绝对无秘密保证。

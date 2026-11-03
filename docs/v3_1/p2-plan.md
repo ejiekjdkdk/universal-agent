@@ -78,4 +78,4 @@ Files: docs/v3_1/p2-{acceptance,usage,progress}.md；README.md；.env.example。
 - [x] V31-022～035逐项记录PASS/FAIL/NOT_RUN，原001～021回归不覆盖遗留安装器缺口。
 - [x] 全量pytest，受改模块适用类型检查、compileall、node --check、pip check和差异空白检查。
 - [x] 独立全分支审查，重要问题复现修复；说明任何未返回的审查结论，不能冒充完成。
-- [ ] 提交并上传codex/v31-p2，验证private及main未变；完整源码包、验收日志与更新交接放聊天outputs。
+- [x] 提交并上传codex/v31-p2，依用户后续明确授权公开仓库，验证public及main未变；完整源码包、验收日志与更新交接放聊天outputs。
