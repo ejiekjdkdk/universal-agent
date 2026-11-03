@@ -116,6 +116,7 @@ class Store(ApprovalStore, PlanStore):
         self._db.execute("PRAGMA foreign_keys=ON")
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.executescript(SCHEMA + PLAN_SCHEMA + APPROVAL_SCHEMA)
+        self._migrate_history_types()
         if recover_reactive:
             with self._transaction():
                 running = self._db.execute("""SELECT task_id FROM tasks t WHERE finished_at IS NULL
@@ -123,6 +124,55 @@ class Store(ApprovalStore, PlanStore):
                 for row in running:
                     error = Fault("TASK_INTERRUPTED", "The service restarted during this task.", 503).as_dict()
                     self._finish(row["task_id"], "failed", {}, error)
+
+    def _migrate_history_types(self):
+        # 建表和回填放在同一写事务中，API、Worker 同时启动或中途退出均可重试。
+        with self._transaction():
+            if self._db.execute("""SELECT 1 FROM sqlite_master WHERE type='table'
+                    AND name='task_history_types'""").fetchone():
+                return
+            self._db.execute("""CREATE TABLE task_history_types (
+                task_id TEXT NOT NULL REFERENCES tasks(task_id), resource_type TEXT NOT NULL,
+                PRIMARY KEY(task_id,resource_type))""")
+            rows = self._db.execute("""SELECT t.task_id,t.session_id,t.mode,t.status,r.context,
+                (SELECT MIN(e.rowid) FROM events e WHERE e.task_id=t.task_id
+                 AND e.event IN ('provider_selected','model_round')) AS model_start,
+                COALESCE((SELECT MAX(e.rowid) FROM events e WHERE e.task_id=t.task_id
+                 AND e.event IN ('task_completed','task_cancelled','task_failed')),9223372036854775807) AS end_event
+                FROM tasks t JOIN runs r USING(task_id) ORDER BY t.session_id,end_event""")
+            session_id = None
+            for row in rows:
+                if session_id != row["session_id"]:
+                    session_id = row["session_id"]
+                    first_completion = {}
+                scope = json.loads(row["context"])
+                kind = scope.get("object_type")
+                objects = frozenset(scope.get("object_ids", ()))
+                inherited = set()
+                if row["mode"] == "openai":
+                    # 旧库没有记录选中的六轮及当时的授权。检查同会话中模型调用前已完成、
+                    # 对象范围匹配的所有可能来源，包括间接来源，可能多要求一种旧权限。
+                    cutoff = row["model_start"] or row["end_event"]
+                    for (source_type, source_objects, required_type), completed in first_completion.items():
+                        if completed >= cutoff or not source_objects.issubset(objects):
+                            continue
+                        if kind and source_type and source_type != kind:
+                            continue
+                        inherited.add(required_type)
+                    self._record_history_types(row["task_id"], inherited)
+                if row["status"] == "completed":
+                    for needed in inherited | ({kind} if kind else set()):
+                        # 查询已按完成顺序排列，相同范围和权限只需记录最早完成的一轮。
+                        first_completion.setdefault((kind, objects, needed), row["end_event"])
+
+    def _record_history_types(self, task_id, types):
+        self._db.executemany("INSERT OR IGNORE INTO task_history_types VALUES (?,?)",
+                             [(task_id, kind) for kind in types])
+
+    def history_types(self, task_id):
+        with self._lock:
+            return {row[0] for row in self._db.execute(
+                "SELECT resource_type FROM task_history_types WHERE task_id=?", (task_id,))}
 
     @contextmanager
     def _transaction(self, identity=None, action=None, resource=None, *, write=True):
@@ -304,12 +354,16 @@ class Store(ApprovalStore, PlanStore):
                 scope = json.loads(row["context"])
                 if allowed is not None and not allowed.issuperset(scope.get("object_ids", ())):
                     continue
-                if allowed_types is not None and scope.get("object_type") and scope["object_type"] not in allowed_types:
+                types = self.history_types(row["task_id"])
+                if scope.get("object_type"):
+                    types.add(scope["object_type"])
+                if allowed_types is not None and not types.issubset(allowed_types):
                     continue
                 required = self.permissions(row["task_id"])
                 if allowed_permissions is not None and not required.issubset(allowed_permissions):
                     continue
                 if inherit_to:
+                    self._record_history_types(inherit_to, types)
                     self._db.executemany("INSERT OR IGNORE INTO task_permissions VALUES (?,?)",
                                          [(inherit_to, permission) for permission in required])
                 visible.append(row)

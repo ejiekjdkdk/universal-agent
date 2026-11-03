@@ -20,6 +20,33 @@ OTHER = {"Authorization": "Bearer other-test-user"}
 SERVICE = {"Authorization": "Bearer internal-test-token"}
 
 
+@pytest.mark.parametrize("tokens", [("",), ("   ",), ("read-only", "privileged")])
+def test_embedded_service_rejects_ambiguous_identity_at_startup(tmp_path, tokens):
+    principals = {
+        token: {"tenant_id": "t", "org_id": "o", "user_id": "u",
+                "grants": {"text": {"permissions": ["text.read"] if i == 0 else []}}}
+        for i, token in enumerate(tokens)
+    }
+    app = create_app(database=tmp_path / "db", scenarios=SCENARIOS, principals=principals)
+    with pytest.raises(ValueError), TestClient(app):
+        pass
+
+
+def test_invalid_live_principal_update_fails_closed_and_can_be_corrected(tmp_path):
+    actor = {"tenant_id": "t", "org_id": "o", "user_id": "u", "grants": {"text": {"permissions": ["text.read"]}}}
+    actors = {"owner": actor}
+    app = create_app(database=tmp_path / "db", scenarios=SCENARIOS, principals=actors)
+    with TestClient(app, base_url="http://localhost") as client:
+        actors["second"] = dict(actor, grants={"text": {"permissions": []}})
+        response = client.post(API + "/chat", headers={"Authorization": "Bearer second"},
+                               json={"business_id": "text", "message": "sample"})
+        assert response.status_code == 503
+        assert response.json()["error"]["code"] == "IDENTITY_SOURCE_UNAVAILABLE"
+        del actors["second"]
+        assert client.get(API + "/scenarios").status_code == 401
+        assert client.get(API + "/scenarios", headers={"Authorization": "Bearer owner"}).status_code == 200
+
+
 @pytest.fixture
 def secured_app(tmp_path, monkeypatch, request):
     monkeypatch.setenv("AGENT_SERVICE_TOKEN", "internal-test-token")

@@ -4,6 +4,7 @@ import hashlib
 import json
 import time
 
+from .catalog import tool_slot
 from .errors import Fault
 from .providers import run_provider
 
@@ -150,7 +151,7 @@ class Gateway:
             deadline = min(deadline, started + self.lease["deadline"] - time.time())
         try:
             async with asyncio.timeout(self.runtime.tool_timeout):
-                async with self.runtime.slots:
+                async with tool_slot(self.runtime.slots):
                     for attempt in range(2):
                         try:
                             # 排队或退避期间可能撤权，每次发出请求前都要复查。
@@ -235,6 +236,7 @@ class Runtime:
         if not valid:
             self.store.audit("scenario_access", "deny", identity, resource=scenario, code="PERMISSION_DENIED")
             raise Fault("PERMISSION_DENIED", "没有场景或对象访问权限", 403)
+        return grant
 
     def gateway(self, run_id):
         ctx = self.store.run(run_id)
@@ -243,8 +245,9 @@ class Runtime:
         return self.gateways.get(run_id) or Gateway(self, run_id)
 
     def authorize_task(self, actor, scenario, task_id):
-        self.authorize(actor, scenario, self.store.scope(task_id))
-        if not self.store.permissions(task_id).issubset(self.grant(actor, scenario)["permissions"]):
+        grant = self.authorize(actor, scenario, self.store.scope(task_id))
+        if (not self.store.permissions(task_id).issubset(grant.get("permissions", []))
+                or not self.store.history_types(task_id).issubset(grant.get("resource_types", []))):
             self.store.audit("task_access", "deny", actor, task_id, scenario, "PERMISSION_DENIED")
             raise Fault("PERMISSION_DENIED", "读取本次任务所需的权限已撤销", 403)
 

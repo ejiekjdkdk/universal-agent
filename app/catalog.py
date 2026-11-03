@@ -1,6 +1,9 @@
 """加载已审核的本地场景，在单个场景的权限范围内调度工具。"""
 import asyncio
 import copy
+from concurrent.futures import Future
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 import importlib.util
@@ -16,6 +19,47 @@ import httpx
 from jsonschema import Draft202012Validator, SchemaError
 
 from app.errors import Fault
+
+
+_unfinished_threads = ContextVar("unfinished_tool_threads", default=None)
+
+
+@asynccontextmanager
+async def tool_slot(slots):
+    await slots.acquire()
+    unfinished = []
+    token = _unfinished_threads.set(unfinished)
+    try:
+        yield
+    finally:
+        _unfinished_threads.reset(token)
+        if unfinished:
+            # 等待者已取消，仍在执行的线程负责归还本次调用的名额。
+            asyncio.gather(*unfinished).add_done_callback(lambda _: slots.release())
+        else:
+            slots.release()
+
+
+async def _call_sync(handler, arguments, retrieve):
+    unfinished = _unfinished_threads.get()
+    if unfinished is None:
+        return await asyncio.to_thread(handler, arguments, retrieve)
+    # asyncio 的等待对象被取消时，线程可能尚在排队，也可能已进入处理器。
+    finished = Future()
+
+    def invoke():
+        if finished.set_running_or_notify_cancel():
+            try:
+                return handler(arguments, retrieve)
+            finally:
+                finished.set_result(None)
+
+    try:
+        return await asyncio.to_thread(invoke)
+    except asyncio.CancelledError:
+        if not finished.cancel():
+            unfinished.append(asyncio.wrap_future(finished))
+        raise
 
 
 def _object(properties, required=None):
@@ -333,7 +377,7 @@ class Catalog:
             if inspect.iscoroutinefunction(handler):
                 result = await handler(arguments, retrieve)
             else:
-                result = await asyncio.to_thread(handler, arguments, retrieve)
+                result = await _call_sync(handler, arguments, retrieve)
         try:
             _check(result, ENVELOPE)
             _check(result["data"], tool["output_schema"])

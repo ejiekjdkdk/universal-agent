@@ -192,6 +192,8 @@ def create_app(*, scenarios=None, database=None, token=None, model_settings=None
 
     def identify(request: Request):
         presented = bearer(request)
+        if not presented.strip():
+            raise Fault("UNAUTHORIZED", "请使用本地访问令牌", 401)
         for registered, actor in runtime().principals.items():
             if hmac.compare_digest(registered.encode(), presented.encode()):
                 return actor
@@ -244,24 +246,30 @@ def create_app(*, scenarios=None, database=None, token=None, model_settings=None
     async def scene_list(actor=Depends(identify)):
         agent_runtime = runtime()
         scenes = []
+        unavailable = []
         for scenario_id in agent_runtime.catalog.scenarios:
             grant = agent_runtime.grant(actor, scenario_id)
             if not grant:
                 continue
             try:
                 selected = agent_runtime.releases.select(scenario_id, actor, "")
+                catalog = agent_runtime.release_catalog(selected, scenario_id)
             except Fault as exc:
+                if exc.code == "RELEASE_SNAPSHOT_INVALID":
+                    unavailable.append(scenario_id)
+                    continue
                 if exc.code == "CAPABILITY_REVOKED":
                     continue
                 raise
-            scene = agent_runtime.release_catalog(selected, scenario_id).scenarios[scenario_id]
+            scene = catalog.scenarios[scenario_id]
             objects = grant.get("objects", [])
             summary = {field: scene.get(field) for field in ("id", "name", "description", "version", "example")}
-            plan_path = agent_runtime.release_catalog(selected, scenario_id).root / scenario_id / "plan.json"
+            plan_path = catalog.root / scenario_id / "plan.json"
             summary["durable_plan"] = plan_path.is_file()
             summary["default_object"] = objects[0] if len(objects) == 1 else None
             scenes.append(summary)
-        return {"scenarios": scenes, "model_available": model_ready, "model_name": model.get("model", ""),
+        return {"scenarios": scenes, "unavailable_scenarios": unavailable,
+                "model_available": model_ready, "model_name": model.get("model", ""),
                 "can_review": any("approval.decide" in g["permissions"] for g in actor["grants"].values())}
 
     @app.post(API + "/sessions", status_code=201)

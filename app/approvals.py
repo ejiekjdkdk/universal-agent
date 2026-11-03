@@ -38,6 +38,10 @@ CREATE TABLE IF NOT EXISTS mock_receipts (
 
 RULE = "independent_object_approver_v1"
 
+# 直接读取任务创建时持久化的类型，使历史审批单也按同一范围鉴权。
+APPROVAL_QUERY = """SELECT a.*,json_extract(r.context,'$.object_type') AS object_type
+                    FROM approvals a JOIN runs r USING(task_id)"""
+
 
 def enabled(setting=None):
     return os.getenv("AGENT_MOCK_WRITES") == "1" if setting is None else setting is True
@@ -82,7 +86,8 @@ def _visible(actor, row):
     if actor["tenant_id"] != row["tenant_id"] or actor["org_id"] != row["org_id"]:
         return False, False
     grant = actor.get("grants", {}).get(row["business_id"], {})
-    if row["object_id"] not in grant.get("objects", []):
+    if (row["object_id"] not in grant.get("objects", [])
+            or (row["object_type"] and row["object_type"] not in grant.get("resource_types", []))):
         return False, False
     permissions = grant.get("permissions", [])
     is_requester = actor["user_id"] == row["user_id"] and row["permission"] in permissions
@@ -138,14 +143,14 @@ class ApprovalStore:
                 "decided_at": _stamp(a["decided_at"]), "can_decide": may_decide and a["status"] == "requested" and time.time() < a["expires"]}
 
     def _approval(self, actor, approval_id):
-        approval = self._db.execute("SELECT * FROM approvals WHERE approval_id=?", (approval_id,)).fetchone()
+        approval = self._db.execute(APPROVAL_QUERY + " WHERE a.approval_id=?", (approval_id,)).fetchone()
         if not approval or not any(_visible(actor, approval)):
             raise Fault("APPROVAL_NOT_FOUND", "审批单不可见。", 404)
         return approval
 
     def approvals(self, actor, status, limit, offset):
         with self._transaction(actor, "approval.list"):
-            rows = self._db.execute("""SELECT * FROM approvals WHERE tenant_id=? AND org_id=? AND (? IS NULL OR status=?)
+            rows = self._db.execute(APPROVAL_QUERY + """ WHERE tenant_id=? AND org_id=? AND (? IS NULL OR status=?)
                 ORDER BY created DESC,approval_id""", (actor["tenant_id"], actor["org_id"], status, status))
             result = []
             for row in rows:
@@ -284,7 +289,7 @@ class ApprovalStore:
                 self.release_guard(plan["snapshot_id"], task["business_id"], tool["name"])
             capability_version = task["business_version"]
             subject = (task["tenant_id"], task["org_id"], task["user_id"], task["business_id"])
-            approval = self._db.execute("SELECT * FROM approvals WHERE task_id=? AND step_id=?", (task_id, step_id)).fetchone()
+            approval = self._db.execute(APPROVAL_QUERY + " WHERE a.task_id=? AND a.step_id=?", (task_id, step_id)).fetchone()
             object_key = (task["tenant_id"], task["org_id"], task["business_id"], args["object_id"])
             ledger_row = self._db.execute(
                 "SELECT version FROM mock_ledger WHERE tenant_id=? AND org_id=? AND business_id=? AND object_id=?",

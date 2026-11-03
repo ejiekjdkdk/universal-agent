@@ -78,9 +78,10 @@ def system(tmp_path, monkeypatch, request):
                                   worker=PlanWorker(rt, snap), db=db, snap=snap)
 
 
-def submit(s):
-    plan, budget = prepare_plan(s.cat, SID, BODY["message"], {"draft.propose"}, SCOPE)
-    task, _ = s.store.start(s.principals["owner"], BODY, None, "1.0.0", plan=plan, budget=budget, snapshot_id="snap")
+def submit(s, scope=SCOPE):
+    plan, budget = prepare_plan(s.cat, SID, BODY["message"], {"draft.propose"}, scope)
+    task, _ = s.store.start(s.principals["owner"], {**BODY, "context": scope}, None, "1.0.0",
+                            plan=plan, budget=budget, snapshot_id="snap")
     return task["task_id"]
 
 
@@ -93,8 +94,8 @@ def work(s):
 BASE = "/api/v1/agent/approvals"
 
 
-def proposal(s):
-    tid = submit(s)
+def proposal(s, scope=SCOPE):
+    tid = submit(s, scope)
     work(s)
     response = s.client.get(BASE, headers={"Authorization": "judge"})
     assert response.status_code == 200, response.text
@@ -108,6 +109,46 @@ def proposal(s):
 def decide(s, p, who="judge", decision="approve", key="one", **extra):
     return s.client.post(f"{BASE}/{p['approval_id']}/decision", headers={"Authorization": who, "Idempotency-Key": key},
                          json={"decision": decision, "proposal_digest": p["proposal_digest"], **extra})
+
+
+@pytest.fixture
+def typed_proposal(system):
+    for who in ("owner", "judge"):
+        system.principals[who]["grants"][SID]["resource_types"] = ["draft"]
+    return proposal(system, {**SCOPE, "object_type": "draft"})
+
+
+def test_type_scope_controls_approval_queue_detail_decision_and_receipt(system, typed_proposal):
+    s = system
+    _, p = typed_proposal
+    path = f"{BASE}/{p['approval_id']}"
+    s.principals["judge2"]["grants"][SID]["resource_types"] = ["other"]
+    outsider = {"Authorization": "judge2"}
+    assert s.client.get(BASE, headers=outsider).json()["approvals"] == []
+    assert s.client.get(path, headers=outsider).status_code == 404
+    assert decide(s, p, who="judge2").status_code == 404
+    assert decide(s, p).status_code == 200
+    work(s)
+    for who in ("owner", "judge"):
+        headers = {"Authorization": who}
+        assert s.client.get(path + "/receipt", headers=headers).status_code == 200
+        s.principals[who]["grants"][SID]["resource_types"].clear()
+        assert s.client.get(BASE, headers=headers).json()["approvals"] == []
+        assert s.client.get(path, headers=headers).status_code == 404
+        assert s.client.get(path + "/receipt", headers=headers).status_code == 404
+
+
+@pytest.mark.parametrize("who", ["owner", "judge"])
+def test_type_revoked_after_approval_prevents_commit(system, typed_proposal, who):
+    s = system
+    tid, p = typed_proposal
+    assert decide(s, p).status_code == 200
+    s.principals[who]["grants"][SID]["resource_types"].clear()
+    work(s)
+    assert s.store.task(s.principals["owner"], tid)["error"]["code"] == "PERMISSION_DENIED"
+    with closing(sqlite3.connect(s.db)) as db:
+        assert db.execute("SELECT COUNT(*) FROM mock_receipts").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM mock_ledger").fetchone()[0] == 0
 
 
 def test_disabled_and_reactive_paths_cannot_mutate(system, monkeypatch):

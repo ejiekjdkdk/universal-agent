@@ -57,6 +57,33 @@ def test_deeply_nested_candidate_documents_return_422_and_can_be_corrected(tmp_p
         publish(client, "notes")
 
 
+def test_broken_active_snapshot_is_isolated_from_other_scenes(tmp_path, monkeypatch):
+    source = ROOT / "scenarios"
+    candidate(tmp_path, "notes", source)
+    monkeypatch.setenv("AGENT_ADMIN_TOKEN", "project-admin")
+    monkeypatch.setenv("AGENT_RELEASE_CANDIDATES", str(tmp_path / "candidates"))
+    app = create_app(database=tmp_path / "db", scenarios=source, token="project-owner")
+    with TestClient(app, base_url="http://localhost") as client:
+        release_id = publish(client, "notes").rsplit("/", 1)[1]
+        extra = app.state.snapshots.directory / release_id / "notes" / "unexpected.txt"
+        extra.touch()
+        listed = client.get(BASE + "/scenarios", headers=OWNER)
+        assert listed.status_code == 200
+        assert [scene["id"] for scene in listed.json()["scenarios"]] == ["text"]
+        assert listed.json()["unavailable_scenarios"] == ["notes"]
+        for scene, expected in (("notes", 409), ("text", 200)):
+            response = client.post(BASE + "/chat", headers=OWNER, json={"business_id": scene, "message": "test"})
+            assert response.status_code == expected
+            if scene == "notes":
+                assert response.json()["error"]["code"] == "RELEASE_SNAPSHOT_INVALID"
+            else:
+                assert response.json()["status"] == "completed"
+        extra.unlink()
+        listed = client.get(BASE + "/scenarios", headers=OWNER)
+        assert {scene["id"] for scene in listed.json()["scenarios"]} == {"notes", "text"}
+        assert listed.json()["unavailable_scenarios"] == []
+
+
 def test_running_task_stays_pinned_but_emergency_revoke_stops_dispatch(tmp_path, monkeypatch):
     scene = "project_brief"
     source = ROOT / "examples" / "durable" / "scenarios"

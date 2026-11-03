@@ -4,6 +4,7 @@ const limit = 20;
 let token = "";
 let offset = 0;
 let generation = 0;
+let receiptTimer;
 
 function item(tag, value) {
   const node = document.createElement(tag);
@@ -83,6 +84,7 @@ function card(row) {
 }
 
 async function load(message = "") {
+  clearTimeout(receiptTimer);
   // 重载队列或退出登录都会更新编号；只显示当前身份最后一次请求的结果。
   const active = ++generation;
   try {
@@ -97,6 +99,13 @@ async function load(message = "") {
     el("pages").hidden = offset === 0 && data.approvals.length < limit;
     el("prev").disabled = offset === 0;
     el("next").disabled = data.approvals.length < limit;
+    // 审批决定可能早于 Worker 回执，只在当前页面还有待提交项时刷新。
+    if (el("filter").value === "approved" && data.approvals.some(row =>
+      ["not_started", "in_progress"].includes(row.commit_status) &&
+      !["completed", "partial", "failed", "cancelled"].includes(row.task_status)
+    )) {
+      receiptTimer = setTimeout(() => load(message), 1500);
+    }
   } catch (error) {
     if (active === generation) {
       el("feedback").textContent = error.message;
@@ -111,6 +120,7 @@ el("access").onsubmit = (e) => {
   load();
 };
 el("exit").onclick = () => {
+  clearTimeout(receiptTimer);
   generation++;
   token = "";
   offset = 0;

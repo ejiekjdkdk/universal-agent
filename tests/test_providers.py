@@ -16,6 +16,9 @@ class Gateway:
     def trace(self, event, data):
         self.events.append((event, data))
 
+    def context(self):
+        return {}
+
     async def discover(self):
         return [{"name": "outline", "description": "Prepare an outline",
                  "input_schema": {"type": "object"}, "output_schema": {"type": "object"},
@@ -46,6 +49,27 @@ def run(gateway, handler, history=None, **settings):
     config = {"base_url": "https://llm.example/v1", "model": "test-model",
               "api_key": "private-token", "transport": httpx.MockTransport(handler), **settings}
     return asyncio.run(run_provider("openai", {}, "my private request", history or [], gateway, config))
+
+
+def test_revoked_after_tool_returns_stops_next_model_request():
+    gateway = Gateway()
+    sent = []
+
+    def check_context():
+        if gateway.executions:
+            raise Fault("PERMISSION_DENIED", "历史资源授权已撤销", 403)
+
+    gateway.context = check_context
+
+    def upstream(request):
+        sent.append(request)
+        if len(sent) == 1:
+            return completion(calls=[tool("a", "execute_capability", {"name": "outline", "arguments": {}})])
+        return completion("finished")
+
+    with pytest.raises(Fault, match="历史资源授权已撤销"):
+        run(gateway, upstream)
+    assert len(sent) == 1
 
 
 def test_tool_round_trip_uses_scoped_gateway_and_clean_messages():

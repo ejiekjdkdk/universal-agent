@@ -241,6 +241,8 @@ def _record_usage(gateway, round_no, usage, rates):
 async def _model_loop(client, url, model, messages, gateway, max_rounds, max_calls, rates):
     seen, sources = set(), {}
     for round_no in range(1, max_rounds + 1):
+        # 本轮仍会发送历史和前序工具结果，发送前复核这些数据依赖的当前授权。
+        gateway.context()
         gateway.trace("model_round", {"round": round_no})
         reply, usage = await _completion(client, url, model, messages)
         _record_usage(gateway, round_no, usage, rates)

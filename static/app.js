@@ -313,11 +313,19 @@ async function boot() {
   }
   if (result.scenarios.length) {
     await select(result.scenarios[0]);
+  } else if (result.unavailable_scenarios?.length) {
+    $("title").textContent = "场景暂不可用";
+    $("description").textContent = "修复发布快照后，刷新页面即可重试。";
+    $("submit").disabled = true;
+    $("example").disabled = true;
   } else {
     $("title").textContent = "还没有场景";
     $("description").textContent = "将场景包放入 scenarios 目录并重启服务。";
     $("submit").disabled = true;
     $("example").disabled = true;
+  }
+  if (result.unavailable_scenarios?.length) {
+    notice("快照校验失败：" + result.unavailable_scenarios.join("、"));
   }
 }
 
