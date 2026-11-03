@@ -177,11 +177,12 @@ def _trace(store, tid, settings, page):
     # 不写入导出的 span。
     with store._transaction(write=False):
         row = store._db.execute("""SELECT t.request_id,t.status,t.created_at,t.finished_at,t.mode,
-            json_extract(t.error,'$.code') AS error_code,s.business_id,p.snapshot_id
-            FROM tasks t JOIN sessions s USING(session_id) LEFT JOIN plans p USING(task_id)
+            json_extract(t.error,'$.code') AS error_code,s.business_id
+            FROM tasks t JOIN sessions s USING(session_id)
             WHERE t.task_id=?""", (tid,)).fetchone()
         if not row:
             raise HTTPException(404, "Task not found")
+        release_id = store.task_snapshot(tid)
         # 根据服务端记录校验标识，避免事件载荷中的任意字符串
         # 冒充工具、审批或步骤标识进入导出结果。
         events = store._db.execute("""SELECT e.event_id AS id,e.event,e.timestamp,s.step_id,a.approval_id,
@@ -220,7 +221,7 @@ def _trace(store, tid, settings, page):
             data["parentSpanId"] = parent
         return data
     root = span("root", "agent.request", start, end, {"request_id": row["request_id"], "task_id": tid,
-                "business_id": row["business_id"], "release_id": row["snapshot_id"],
+                "business_id": row["business_id"], "release_id": release_id,
                 "planner_id": row["mode"] if row["mode"] in {"offline", "openai"} else None,
                 "outcome": row["status"] if row["status"] in OUTCOMES else None, "error_code": _error(row["error_code"])},
                 row["status"] == "failed", bool(row["finished_at"]), parent=None)

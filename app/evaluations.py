@@ -16,12 +16,14 @@ from .errors import Fault
 from .plans import prepare_plan
 from .providers import run_provider
 from .runtime import Gateway, Runtime
+from .snapshots import Bundle, snapshot_files
 from .store import Store
 
 
 ROOT = Path(__file__).resolve().parents[1]
 SUITES = ROOT / "evals" / "v1"
 VERSION = "1.0.0"
+MAX_FILE_BYTES = 2_000_000
 SUBJECT = {"tenant_id": "fixture_tenant", "org_id": "fixture_org", "user_id": "fixture_user"}
 CASE_FIELDS = {"case_id", "business_id", "golden_version", "input", "context_fixture",
                "expected_capabilities", "expected_status", "expected_evidence_refs", "allowed_variants",
@@ -34,8 +36,8 @@ def _load(data):
 
 def _read(folder, name):
     with _local_file(folder, name).open("rb") as stream:
-        data = stream.read(2_000_001)
-    if len(data) > 2_000_000:
+        data = stream.read(MAX_FILE_BYTES + 1)
+    if len(data) > MAX_FILE_BYTES:
         raise ValueError("fixture file too large")
     return data
 
@@ -80,13 +82,24 @@ class _RecordedHTTP:
         return httpx.Response(status, json=reply)
 
 
-def _isolated_catalog(root, sid, suite, temp):
-    """仅复制核验过的字节，从隔离目录运行，避免直接导入候选目录的模块或字节码。"""
-    folder = (root / sid).resolve()
-    if folder.parent != root.resolve():
+def _evaluation_files(source, sid):
+    if isinstance(source, Bundle):
+        # 发布门禁使用本次检查已冻结的字节，避免执行前再次读取原目录。
+        if sid not in source.scenarios or any(len(data) > MAX_FILE_BYTES for data in source.files.values()):
+            raise ValueError("invalid frozen evaluation bundle")
+        return source.files
+    folder = Path(source.root).resolve() / sid
+    if folder.resolve() != folder:
         raise ValueError("nonlocal scenario")
-    manifest = _read(folder, "scenario.json")
-    scene = _load(manifest)
+    return snapshot_files(folder, max_file_bytes=MAX_FILE_BYTES)
+
+
+def _isolated_catalog(source, sid, suite, temp):
+    """仅复制核验过的字节，从隔离目录运行，避免直接导入候选目录的模块或字节码。"""
+    files = _evaluation_files(source, sid)
+    scene = _load(files["scenario.json"])
+    if scene["id"] != sid:
+        raise ValueError("scenario ID does not match evaluation suite")
     bindings = {}
     for tool in scene["tools"]:
         adapter = tool["adapter"]
@@ -99,11 +112,8 @@ def _isolated_catalog(root, sid, suite, temp):
         if not (read_only or mock_write):
             raise ValueError("unreviewed bindings")
     http = _RecordedHTTP(scene, suite.get("http_fixtures", []))
-    target = temp / sid
-    target.mkdir()
-    (target / "scenario.json").write_bytes(manifest)
     if any(adapter_type == "python" for adapter_type, _, _, _ in bindings.values()):
-        code = _read(folder, "adapter.py").replace(b"\r\n", b"\n")
+        code = files["adapter.py"]
         # 历史摘要只能由运维写入可信金标，供仍受支持的旧版本重新评测和回滚。
         previous_hashes = suite.get("previous_adapter_sha256", [])
         if not isinstance(previous_hashes, list) or any(
@@ -111,18 +121,16 @@ def _isolated_catalog(root, sid, suite, temp):
             for value in previous_hashes
         ):
             raise ValueError("invalid historical adapter hashes")
-        digest = hashlib.sha256(code).hexdigest()
+        # 授权摘要兼容源码换行差异；评测仍执行发布包中的原始字节。
+        digest = hashlib.sha256(code.replace(b"\r\n", b"\n")).hexdigest()
         if digest != suite["adapter_sha256"] and digest not in previous_hashes:
             raise ValueError("adapter not approved for offline evaluation")
-        (target / "adapter.py").write_bytes(code)
-    if scene.get("documents"):
-        name = scene["documents"]
-        if not re.fullmatch(r"[a-zA-Z0-9_-]+\.json", name) or name in {"scenario.json", "plan.json"}:
-            raise ValueError("invalid document fixture")
-        (target / name).write_bytes(_read(folder, name))
-    if (folder / "plan.json").exists():
-        (target / "plan.json").write_bytes(_read(folder, "plan.json"))
-    return Catalog(temp, http_transport=httpx.MockTransport(http.respond)), http
+    target = temp / sid
+    target.mkdir()
+    for name, data in files.items():
+        (target / name).write_bytes(data)
+    adapter_sources = {sid: files["adapter.py"]} if "adapter.py" in files else {}
+    return Catalog(temp, http_transport=httpx.MockTransport(http.respond), adapter_sources=adapter_sources), http
 
 
 def _row(case_id, issues, group):
@@ -275,7 +283,7 @@ def evaluate_release(catalog, scene_id):
                        or c["security_expectations"] != ["no_committed_writes"] for c in cases)):
             raise ValueError("invalid trusted fixtures")
         with tempfile.TemporaryDirectory() as temp:
-            safe, http = _isolated_catalog(Path(catalog.root), scene_id, suite, Path(temp))
+            safe, http = _isolated_catalog(catalog, scene_id, suite, Path(temp))
             report["scenario_version"] = safe.scenarios[scene_id]["version"]
             rows = asyncio.run(_run(safe, scene_id, suite))
             if http.rejected or http.replies.keys() != http.seen:

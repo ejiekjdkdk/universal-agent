@@ -230,6 +230,8 @@ def prepare_plan(
         args = _prepare_arguments(step, tools, ancestors[sid], step_tools, message)
         if mock:
             validate_write(args, context)
+            # 清单校验已经结束，此标记仅由服务端写入，用于在提案落库前识别审批阶段。
+            step["requires_approval"] = True
         field = tool.get("object_ids_field")
         if field and (
             not args.get(field) or not set(args[field]).issubset(context.get("object_ids", []))

@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 import json
@@ -299,3 +300,85 @@ def test_cancellation_from_other_connection_invalidates_approved_commit_lease(sy
     assert s.store.task(s.principals["owner"], tid)["status"] == "cancelled"
     assert s.client.get(f"{BASE}/{p['approval_id']}/receipt", headers={"Authorization": "judge"}).status_code == 404
     assert s.store.events(tid)[-1]["event"] == "task_cancelled"
+
+
+def test_proposal_and_execution_attempts_match_views_events_and_claims(system, monkeypatch):
+    import time
+    s = system
+    now = [time.time()]
+    monkeypatch.setattr(time, "time", lambda: now[0])
+    tid = submit(s)
+
+    def view_count():
+        step = s.store.plan_view(tid)["steps"][0]
+        return step["phase"], step["attempt_no"]
+
+    def claim_count(worker):
+        claim = s.store.claim_step(worker, 1)
+        assert (claim["phase"], claim["attempt_no"]) == view_count()
+        return claim
+
+    assert view_count() == ("proposal", 0)
+    lost_proposal = claim_count("lost-proposal")
+    now[0] += 2
+    retry_proposal = claim_count("prepare")
+    assert not s.store.settle_step(lost_proposal, error={"code": "stale"})
+    asyncio.run(s.worker.execute(retry_proposal))
+    assert view_count() == ("proposal", 2)
+    approval = s.client.get(BASE, headers={"Authorization": "judge"}).json()["approvals"][0]
+    assert decide(s, approval).status_code == 200
+    assert view_count() == ("execution", 0)
+    lost_commit = claim_count("lost-commit")
+    assert (lost_commit["attempt_no"], lost_commit["token"]) == (1, 3)
+    now[0] += 2
+    final_commit = claim_count("commit")
+    assert (final_commit["attempt_no"], final_commit["token"]) == (2, 4)
+    assert not s.store.renew_step(lost_commit, 1)
+    asyncio.run(s.worker.execute(final_commit))
+    assert view_count() == ("execution", 2)
+    events = s.store.events(tid)
+    for name, expected in {
+        "step_leased": [("proposal", 1), ("proposal", 2), ("execution", 1), ("execution", 2)],
+        "step_retrying": [("proposal", 2), ("execution", 2)],
+        "step_started": [("execution", 2)], "step_completed": [("execution", 2)],
+    }.items():
+        data = [e["data"] for e in events if e["event"] == name]
+        assert [(d["phase"], d["attempt_no"]) for d in data] == expected
+        if name == "step_retrying":
+            assert all(d["attempt"] == d["attempt_no"] for d in data)
+
+
+def test_legacy_approved_step_uses_persisted_proposal_token_without_rewriting_events(system):
+    s = system
+    tid, p = proposal(s)
+    assert decide(s, p).status_code == 200
+    with closing(sqlite3.connect(s.db)) as db, db:
+        old = json.loads(db.execute("SELECT definition FROM plan_steps WHERE task_id=?", (tid,)).fetchone()[0])
+        old.pop("requires_approval", None)
+        db.execute("UPDATE plan_steps SET definition=? WHERE task_id=?", (json.dumps(old), tid))
+        legacy = '{"task_id":"legacy","attempt":2}'
+        db.execute("UPDATE events SET payload=? WHERE task_id=? AND event='step_leased'", (legacy, tid))
+    work(s)
+    step = s.store.plan_view(tid)["steps"][0]
+    assert step["attempt_no"] == 1
+    assert step["phase"] == "execution"
+    assert next(e["data"] for e in s.store.events(tid) if e["event"] == "step_leased") == json.loads(legacy)
+
+
+def test_plan_template_cannot_declare_internal_approval_marker(system):
+    s = system
+    path = s.cat.root / SID / "plan.json"
+    template = json.loads(path.read_text(encoding="utf-8"))
+    template["steps"][0]["requires_approval"] = False
+    path.write_text(json.dumps(template), encoding="utf-8")
+    with pytest.raises(Fault) as invalid:
+        submit(s)
+    assert invalid.value.code == "PLAN_INVALID"
+
+
+def test_internal_phase_marker_preserves_existing_plan_digest(system):
+    s = system
+    plan, _ = prepare_plan(s.cat, SID, BODY["message"], {"draft.propose"}, SCOPE)
+    assert plan["steps"][0].pop("requires_approval") is True
+    old_encoding = json.dumps(plan, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    assert s.store.plan_view(submit(s))["digest"] == hashlib.sha256(old_encoding).hexdigest()

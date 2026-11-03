@@ -350,6 +350,7 @@ class Store(ApprovalStore, PlanStore):
                     "object_type": context.get("object_type")}
 
     def _event(self, task_id, event, data):
+        data = self._step_event_metrics(task_id, event, data)
         self._db.execute("""INSERT INTO events(task_id,event_id,event,payload,timestamp)
             SELECT ?, COALESCE(MAX(event_id),0)+1, ?, ?, ? FROM events WHERE task_id=?""",
             (task_id, event, _json({**data, "task_id": task_id}), _now(), task_id))
@@ -448,7 +449,7 @@ class Store(ApprovalStore, PlanStore):
             detail = {"capability_id": cap_id, "execution_id": execution}
             if step:
                 self._mark_call_started(step)
-                detail.update(step_id=step["step_id"], attempt_no=step["token"])
+                detail["step_id"] = step["step_id"]
             self._event(task_id, "step_started", detail)
             return execution, None
 
@@ -476,5 +477,5 @@ class Store(ApprovalStore, PlanStore):
             if error is not None:
                 detail["error"] = error
             if step:
-                detail.update(step_id=step["step_id"], attempt_no=step["token"])
+                detail["step_id"] = step["step_id"]
             self._event(task_id, ("tool_call_" if step else "step_") + status, detail)

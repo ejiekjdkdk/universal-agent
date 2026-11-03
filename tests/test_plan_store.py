@@ -219,6 +219,15 @@ def test_third_attempt_committed_result_gets_one_fenced_replay_only_lease(stores
         assert api.task(ACTOR, tid)["error"]["code"] == "STEP_ATTEMPTS_EXHAUSTED"
     assert api.plan_view(tid)["steps"][0]["attempt_no"] == 3
     assert api.task(ACTOR, tid)["tool_calls"][0]["status"] == "completed"
+    events = api.events(tid)
+    leases = [entry["data"] for entry in events if entry["event"] == "step_leased"]
+    assert [(e["phase"], e["attempt_no"]) for e in leases] == [
+        ("execution", 1), ("execution", 2), ("execution", 3), ("execution", 3),
+    ]
+    assert leases[-1]["recovery_only"]
+    for entry in events:
+        if entry["event"] in ("step_completed", "step_failed", "tool_call_completed"):
+            assert (entry["data"]["phase"], entry["data"]["attempt_no"]) == ("execution", 3)
 
 
 def test_expired_final_lease_preserves_persisted_security_error_on_optional_step(stores, monkeypatch):

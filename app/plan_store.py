@@ -28,6 +28,26 @@ ACTIVE = {"leased", "running"}
 # 仅这些错误允许可选步骤降级。未分类的依赖错误可能来自错误入参或上游拒绝授权。
 OPTIONAL_ERRORS = {"UPSTREAM_UNAVAILABLE", "TOOL_TIMEOUT", "RATE_LIMITED", "STEP_ATTEMPTS_EXHAUSTED"}
 
+APPROVAL_JOIN = " FROM plan_steps s LEFT JOIN approvals a USING(task_id, step_id)"
+APPROVAL_ATTEMPT_COLUMNS = "a.status AS approval_status, a.proposal_token"
+
+
+def _phase_attempt_number(step, token):
+    return token - step["proposal_token"] if step["approval_status"] == "approved" else token
+
+
+def _attempt_metrics(step, token):
+    """租约 token 始终递增。获批后提交次数重新起算，额外的缓存核验租约不增加次数。"""
+    phase = "execution"
+    if step["approval_status"] != "approved" and (
+        step["approval_status"] is not None or json.loads(step["definition"]).get("requires_approval")
+    ):
+        # 旧计划没有标记时，仍可根据已经持久化的审批单识别提案阶段。
+        phase = "proposal"
+    phase_attempt = _phase_attempt_number(step, token)
+    return {"phase": phase, "attempt_no": min(phase_attempt, MAX_ATTEMPTS),
+            "recovery_only": phase_attempt > MAX_ATTEMPTS}
+
 
 def _dump(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
@@ -57,7 +77,9 @@ class PlanStore:
                 or not steps or len(steps) > budget["max_steps"]):
             raise Fault("INVALID_PLAN", "Invalid plan contract or budget.", 422)
         plan_id = "plan_" + uuid4().hex
-        digest = hashlib.sha256(_dump(plan).encode()).hexdigest()
+        # 此标记只解释监控数据。审批继续绑定原计划参数及快照，沿用旧版本的计划摘要。
+        contract_steps = [{key: value for key, value in step.items() if key != "requires_approval"} for step in steps]
+        digest = hashlib.sha256(_dump({**plan, "steps": contract_steps}).encode()).hexdigest()
         deadline = time.time() + budget["deadline_ms"] / 1000
         self._db.execute("INSERT INTO plans VALUES(?,?,?,?,?,?,?,?,?)",
                          (task_id, plan_id, str(plan["schema_version"]), plan["result_contract"], digest,
@@ -78,7 +100,22 @@ class PlanStore:
             return self._db.execute("SELECT 1 FROM plans WHERE task_id=?", (task_id,)).fetchone() is not None
 
     def _steps(self, task_id):
-        return self._db.execute("SELECT * FROM plan_steps WHERE task_id=? ORDER BY ordinal", (task_id,)).fetchall()
+        query = "SELECT s.*, " + APPROVAL_ATTEMPT_COLUMNS + APPROVAL_JOIN + " WHERE s.task_id=? ORDER BY s.ordinal"
+        return self._db.execute(query, (task_id,)).fetchall()
+
+    def _step_event_metrics(self, task_id, event, data):
+        if not event.startswith(("step_", "tool_call_")) or not isinstance(data.get("step_id"), str):
+            return data
+        query = ("SELECT s.token, s.definition, " + APPROVAL_ATTEMPT_COLUMNS + APPROVAL_JOIN
+                 + " WHERE s.task_id=? AND s.step_id=?")
+        step = self._db.execute(query, (task_id, data["step_id"])).fetchone()
+        if step is None:
+            return data
+        attempt = _attempt_metrics(step, step["token"])
+        data = {**data, "phase": attempt["phase"], "attempt_no": attempt["attempt_no"]}
+        if event == "step_retrying":
+            data["attempt"] = attempt["attempt_no"]
+        return data
 
     def plan_view(self, task_id):
         with self._lock:
@@ -89,9 +126,10 @@ class PlanStore:
             for row in self._steps(task_id):
                 definition = json.loads(row["definition"])
                 error = json.loads(row["error"] or "null")
+                attempt = _attempt_metrics(row, row["token"])
                 steps.append({"step_id": row["step_id"], "capability_id": definition["capability_id"],
                               "required": definition.get("required", True), "depends_on": definition["depends_on"],
-                              "status": row["status"], "attempt_no": min(row["token"], MAX_ATTEMPTS),
+                              "status": row["status"], "phase": attempt["phase"], "attempt_no": attempt["attempt_no"],
                               "error": {"code": error["code"]} if error else None})
             return {"task_id": task_id, "plan_id": p["plan_id"], "revision": 1, "digest": p["digest"],
                     "snapshot_id": p["snapshot_id"], "schema_version": p["schema_version"],
@@ -164,9 +202,7 @@ class PlanStore:
                 continue
             call = self._db.execute("""SELECT status,error FROM calls WHERE task_id=? AND call_id=?""",
                                     (task_id, "plan." + step_row["step_id"])).fetchone()
-            approved_proposal = self._db.execute("""SELECT proposal_token FROM approvals WHERE task_id=? AND step_id=?
-                AND status='approved'""", (task_id, step_row["step_id"])).fetchone()
-            operation_attempt = step_row["token"] - (approved_proposal[0] if approved_proposal else 0)
+            operation_attempt = _phase_attempt_number(step_row, step_row["token"])
             if call and call["status"] == "failed":
                 error = json.loads(call["error"])
             elif operation_attempt < MAX_ATTEMPTS or (
@@ -267,18 +303,11 @@ class PlanStore:
                         WHERE task_id=? AND step_id=?""", (token, worker_id, min(now + lease_seconds, plan["deadline"]), *key))
                     if lease_expired:
                         self._event(task_id, "step_retrying", {
-                            "step_id": step_id, "attempt": min(token, MAX_ATTEMPTS), "error_code": "LEASE_EXPIRED",
+                            "step_id": step_id, "error_code": "LEASE_EXPIRED",
                         })
-                    approved_proposal = self._db.execute("""SELECT proposal_token FROM approvals WHERE task_id=? AND step_id=?
-                        AND status='approved'""", key).fetchone()
-                    # token 跨审批持续递增。获批后从提案时的 token 起算本次提交的尝试次数。
-                    operation_attempt = token - (approved_proposal[0] if approved_proposal else 0)
-                    recovery_only = operation_attempt > MAX_ATTEMPTS
-                    attempt = min(operation_attempt, MAX_ATTEMPTS)
-                    self._event(task_id, "step_leased", {"step_id": step_id, "attempt_no": attempt,
-                                                      "recovery_only": recovery_only})
-                    return {"task_id": task_id, "step_id": step_id, "token": token, "attempt_no": attempt,
-                            "recovery_only": recovery_only,
+                    attempt = _attempt_metrics(step_row, token)
+                    self._event(task_id, "step_leased", {"step_id": step_id, **attempt})
+                    return {"task_id": task_id, "step_id": step_id, "token": token, **attempt,
                             "worker_id": worker_id, "business_id": self._task_row(task_id)["business_id"],
                             "run_context_id": self.context_id(task_id), "snapshot_id": plan["snapshot_id"],
                             "step": step, "outputs": _predecessor_outputs(step, rows),

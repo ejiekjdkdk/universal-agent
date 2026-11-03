@@ -7,8 +7,9 @@ import importlib.util
 import inspect
 import ipaddress
 import json
+import ntpath
 import re
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from urllib.parse import urlsplit
 
 import httpx
@@ -83,10 +84,15 @@ def _check_schema(schema):
 
 
 def _local_file(directory, name):
-    if Path(name).name != name or name in {".", ".."}:
+    if hasattr(ntpath, "isreserved"):
+        reserved = ntpath.isreserved(name)
+    else:
+        reserved = PureWindowsPath(name).is_reserved()
+    if (not name or name.startswith(".") or name.endswith((" ", ".")) or Path(name).name != name
+            or re.search(r'[<>:"/\\|?*\x00-\x1f]', name) or reserved):
         raise ValueError("invalid local filename")
     target = directory / name
-    if target.resolve().parent != directory.resolve() or not target.is_file():
+    if target.is_symlink() or target.resolve() != directory.resolve() / name or not target.is_file():
         raise ValueError(f"missing or nonlocal file {name}")
     return target
 
@@ -103,6 +109,14 @@ def _reject_duplicate_keys(pairs):
 def _read_json(directory, name):
     return json.loads(_local_file(directory, name).read_text(encoding="utf-8"),
                       object_pairs_hook=_reject_duplicate_keys)
+
+
+def _validate_documents(name, documents):
+    if name and name.casefold() in {"scenario.json", "plan.json", "adapter.py"}:
+        raise ValueError("document collection must be a separate data file")
+    _check(documents, DOCS)
+    if len({doc["source_id"] for doc in documents}) != len(documents):
+        raise ValueError("duplicate source_id")
 
 
 def _check_url(url):
@@ -204,9 +218,7 @@ class Catalog:
         if sid != directory.name or sid in self.scenarios:
             raise ValueError("scenario ID must be unique and match its directory")
         documents = _read_json(directory, scene["documents"]) if "documents" in scene else []
-        _check(documents, DOCS)
-        if len({doc["source_id"] for doc in documents}) != len(documents):
-            raise ValueError("duplicate source_id")
+        _validate_documents(scene.get("documents"), documents)
         self._documents[sid] = documents
         module = None
         tools = {}

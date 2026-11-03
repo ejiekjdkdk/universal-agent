@@ -6,21 +6,24 @@ from types import SimpleNamespace
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.testclient import TestClient
 
-from app.observability import install_observability_routes
+from app.observability import _trace, install_observability_routes
 from app.store import Store
 
 
 def test_admin_metrics_and_otlp_trace_are_correlated_and_redacted(tmp_path):
     with closing(Store(tmp_path / "telemetry.db")) as store:
         actor = {"tenant_id": "secret-tenant", "org_id": "secret-org", "user_id": "secret-name"}
-        t, _ = store.start(actor, {"business_id": "notes", "message": "secret-prompt"}, None, "1.0.0")
+        release_id = "a" * 64
+        t, _ = store.start(actor, {"business_id": "notes", "message": "secret-prompt"},
+                           None, "1.0.0", snapshot_id=release_id)
         tid = t["task_id"]
         execution_id, _ = store.begin_call(tid, "one", "read_notes", "1.0.0", {"x": "secret-arg"})
         store.complete_call(tid, "one", {"data": {"summary": "secret-tool-output"}})
         store.emit(tid, "approval_requested", {"approval_id": "ap_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                                               "step_id": "secret-step", "raw": "secret-proposal",
                                               "status": "secret-outcome", "error_code": "SECRET_CUSTOM_ERROR",
-                                              "execution_id": "secret-execution", "capability_id": "secret-tool"})
+                                              "execution_id": "secret-execution", "capability_id": "secret-tool",
+                                              "release_id": "secret-forged-release", "snapshot_id": "secret-forged-pin"})
         for _ in range(145):
             store.emit(tid, "step_queued", {"step_id": "secret-forged"})
         store.audit("tool_permission", "deny", actor, tid, "secret-resource", "PERMISSION_DENIED")
@@ -53,8 +56,39 @@ def test_admin_metrics_and_otlp_trace_are_correlated_and_redacted(tmp_path):
             assert first.headers["X-Next-Page"] == "1"
             next_page = client.get(base + "/traces/" + tid + "?page=1")
             next_spans = next_page.json()["resourceSpans"][0]["scopeSpans"][0]["spans"]
+            assert "secret-" not in next_page.text
             assert len(next_spans) > 1 and "X-Next-Page" not in next_page.headers
             assert {s["spanId"] for s in next_spans[1:]}.isdisjoint(s["spanId"] for s in spans[1:])
+            for root in (spans[0], next_spans[0]):
+                attributes = {a["key"]: a["value"] for a in root["attributes"]}
+                assert attributes["agent.release_id"] == {"stringValue": release_id}
+            assert next_spans[0]["traceId"] == spans[0]["traceId"]
+
+
+def test_trace_keeps_legacy_durable_pin_and_omits_unknown_release():
+    with closing(Store(":memory:")) as store:
+        actor = {"tenant_id": "t", "org_id": "o", "user_id": "u"}
+        body = {"business_id": "notes", "message": "private text"}
+        plan = {"schema_version": "2.0", "result_contract": "summary_v1", "steps": [
+            {"step_id": "read", "capability_id": "notes_search", "arguments": {}, "depends_on": []}
+        ]}
+        budget = {"max_steps": 1, "max_tool_calls": 1, "max_parallel_steps": 1, "deadline_ms": 1000}
+        pin = "b" * 64
+        durable, _ = store.start(actor, body, None, "1.0.0", plan=plan, budget=budget, snapshot_id=pin)
+        unbound, _ = store.start(actor, body, None, "1.0.0")
+
+        def release_attribute(task):
+            trace, _ = _trace(store, task["task_id"], {}, 0)
+            root = trace["resourceSpans"][0]["scopeSpans"][0]["spans"][0]
+            return [a["value"] for a in root["attributes"] if a["key"] == "agent.release_id"]
+
+        assert release_attribute(durable) == [{"stringValue": pin}]
+        # 模拟升级前仅在计划表保存绑定的持久化任务。
+        with store._transaction():
+            store._db.execute("DELETE FROM task_snapshots WHERE task_id=?", (durable["task_id"],))
+        assert release_attribute(durable) == [{"stringValue": pin}]
+        store.emit(unbound["task_id"], "provider_selected", {"release_id": pin, "snapshot_id": pin})
+        assert release_attribute(unbound) == []
 
 
 def test_app_exports_completed_sse_and_enforces_distinct_admin(tmp_path, monkeypatch):

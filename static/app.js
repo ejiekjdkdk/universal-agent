@@ -186,10 +186,12 @@ function showPlan(plan) {
     );
     const deps = step.depends_on.length ? step.depends_on.join("、") : "无";
     const attempt = step.attempt_no ? "第 " + step.attempt_no + " 次尝试" : "尚未尝试";
+    const phase = {proposal: "提案阶段", execution: "执行阶段"}[step.phase];
+    const progress = phase ? phase + " · " + attempt : attempt;
     row.append(
       heading,
       element("div", step.capability_id + " · " + (step.required ? "必需" : "可选"), "meta"),
-      element("div", "依赖：" + deps + " · " + attempt, "step-detail")
+      element("div", "依赖：" + deps + " · " + progress, "step-detail")
     );
     if (step.error?.code) {
       row.append(element("div", step.error.code, "meta"));

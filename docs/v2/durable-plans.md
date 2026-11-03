@@ -39,6 +39,8 @@ python run.py
 | GET /api/v1/agent/tasks/{id}/events | 支持 Last-Event-ID 的 SSE 重放 |
 | POST /api/v1/agent/tasks/{id}/cancel | 停止后续调度，旧租约的迟到结果无法提交 |
 
+步骤查询和新产生的步骤事件中，`phase` 表示当前阶段，`attempt_no` 表示该阶段的领取次数。普通只读步骤属于 `execution`。需要审批的步骤先进入 `proposal`，获批后进入 `execution`，此时尚未领取为 0，首次领取为 1。达到尝试上限后仅核验缓存回执的领取沿用上一次编号。历史事件保留原始字段。老计划在产生审批单之前若没有阶段标记，沿用执行阶段口径。
+
 ## 接入自己的场景
 
 把 [plan.json 示例](../../examples/durable/scenarios/project_brief/plan.json) 与项目自己的 `scenario.json`、`adapter.py` 放在同一目录。每步通过 `capability_id` 选择已注册的只读工具。将请求文本绑定为 `{"$message":true}`，或用 `{"$step_output":"progress","path":"/data/summary"}` 引用前驱已声明的输出。支持直接和传递依赖；路径只指向允许的输出字段。调度器验证依赖、类型、权限、对象范围和预算。结果契约 `summary_v1` 读取成功末端步骤的 `data.summary`，汇集各步证据。允许降级的可选步骤失败时，结果附带缺失输出和限制。权限错误与数据结构错误会令任务失败。
