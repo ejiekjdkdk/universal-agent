@@ -41,6 +41,8 @@ AGENT_MODEL_API_KEY=
 
 ## 为自己的项目复用
 
+已有独立项目时，可以从[独立项目接入模板](templates/external-project/README.md)开始。将模板复制到仓库外，项目后端用公开 API 提问，底座再调用项目自己的只读接口。随附的验收脚本会启动两个本地进程，核对回答、证据、Trace 和幂等重放，并在结束时关闭它们。
+
 复制一个场景目录，修改清单、输入输出 Schema 和适配器，放入 `scenarios/` 后重启。也可让 `AGENT_SCENARIOS` 指向你自己的独立目录。配置可以为空；工作台仍可启动并展示空状态。场景包支持本地 Python 工具、固定目标的 HTTPS 工具、可选本地资料和权限码。[场景接入指南](docs/scenarios.md)
 
 前端或其他程序使用 REST 与 SSE。开发配置可设 `AGENT_ACCESS_TOKEN` 为自己的高熵令牌；服务重启后，网页会要求输入令牌。下例从调用端环境读取同一个令牌。
