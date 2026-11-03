@@ -54,10 +54,10 @@ Files: app/read_cache.py；app/runtime.py；tests/test_read_cache.py、test_read
 
 Interfaces: ReadCache.run(key,participant,operation)→已验证输出；participant带可信guard和预算回调，operation接收共享guard。key由Gateway从身份/权限/对象/版本/参数/时效/技能/MCP映射构造，模型不能直接给key。
 
-- [ ] 先写同参数同权限一次物理读取、每任务独立执行ID/审计、不同主体/版本/freshness不合并、命中撤权拒绝、输出深拷贝、失败不缓存、写/agent不缓存。
-- [ ] 写单个取消/超时、全部取消、首调用者撤权、额度耗尽、异常后无悬挂flight测试。
-- [ ] 仅可信逐工具策略有TTL和freshness时启用，有界容量/时间；不跨进程合并。保留原Runtime有限重试与并发槽，所有退出路径回收共享资源。
-- [ ] 专项和预算/Worker回归通过，提交。
+- [x] 先写同参数同权限一次物理读取、每任务独立执行ID/审计、不同主体/版本/freshness不合并、命中撤权拒绝、输出深拷贝、失败不缓存、写/agent不缓存。
+- [x] 写单个取消/超时、全部取消、首调用者撤权、额度耗尽、异常后无悬挂flight测试。
+- [x] 仅可信逐工具策略有TTL和freshness时启用，有界容量/时间；不跨进程合并。保留原Runtime有限重试与并发槽，所有退出路径回收共享资源。
+- [x] 专项和预算/Worker回归通过，提交。
 
 ## Task 4：MCP目录、漂移、健康和协议矩阵
 
@@ -65,11 +65,11 @@ Files: app/mcp_gateway.py；scripts/mcpctl.py；examples/mcp；tests/test_mcp_p2
 
 Interfaces: 扩展受信任可选策略与候选目录检查命令，原MCPGateway.execute不变；health状态不进入Task枚举。目录缓存与协议摘要只使用安装SDK实证支持的接口。
 
-- [ ] 先写批准目录摘要、描述/Schema漂移、新工具拒绝、TTL/cacheScope、主体隔离、缓存撤销和映射变化测试。
-- [ ] 写失败阈值/熔断/单探测/取消释放/限流、disabled和incompatible不自动恢复、写入未知不重试测试。
-- [ ] 实现有界缓存、可信摘要及候选目录/差异日志；无法证明协议摘要保护时强制调用前刷新。
-- [ ] 用真实官方SDK Server验证HTTP以及批准本地stdio；2025版本依据实际SDK能力测试，未支持明确拒绝。网络策略保持DNS/私网/重定向拒绝，不扩大企业接入。
-- [ ] 记录实际支持/拒绝/未验证矩阵；专项通过提交。
+- [x] 先写批准目录摘要、描述/Schema漂移、新工具拒绝、TTL/cacheScope、主体隔离、缓存撤销和映射变化测试。
+- [x] 写失败阈值/熔断/单探测/取消释放/限流、disabled和incompatible不自动恢复、写入未知不重试测试。
+- [x] 实现有界缓存、可信摘要及候选目录/差异日志；无法证明协议摘要保护时强制调用前刷新。
+- [x] 用真实官方SDK Server验证HTTP；本地stdio按设计边界保持拒绝并记录NOT_RUN，2024/2025版本明确拒绝。网络策略保持DNS/私网/重定向拒绝，不扩大企业接入。
+- [x] 记录实际支持/拒绝/未验证矩阵；专项通过提交。
 
 ## Task 5：整体验收与交付
 

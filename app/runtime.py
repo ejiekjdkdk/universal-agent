@@ -14,6 +14,7 @@ from .providers import run_provider
 from .skills import SkillError, SkillRegistry
 from .mcp_gateway import MCPContext
 from .result_store import ResultStore, load_p2_policy
+from .read_cache import ReadCache
 
 
 def preview(value, depth=0):
@@ -183,6 +184,117 @@ class Gateway:
                 self.store.audit("object_access", "deny", context, self.task_id, name, "PERMISSION_DENIED")
                 raise Fault("PERMISSION_DENIED", "请求的对象超出了本次任务范围", 403)
 
+    def _mcp_binding(self, tool, arguments):
+        """幂等调用和共享缓存都必须重新核验远端映射及任务固定摘要。"""
+        context = self.context()
+        scenario = context["business_id"]
+        adapter = self.catalog._tools[scenario][tool["name"]]["adapter"]
+        remote_context = MCPContext(tenant_id=context["tenant_id"],
+            principal_id=json.dumps([context["org_id"], context["user_id"]]), run_context_id=self.run_id,
+            trace_id=self.task_id, authorize=lambda: self.authorize_tool(tool, arguments))
+        remote_gateway = self.catalog._mcp_gateway
+        endpoint, server, mapped = remote_gateway._resolve(adapter["server_id"], adapter["tool_id"], remote_context)
+        for field in ("action_level", "input_schema", "output_schema"):
+            if mapped[field] != tool[field]:
+                raise Fault("MCP_PROTOCOL_INCOMPATIBLE", "MCP缓存映射与本地声明不符", 502)
+        version = tool.get("version", self.catalog.scenarios[scenario]["version"])
+        if mapped["capability_id"] != tool["name"] or mapped["version"] != version:
+            raise Fault("MCP_PROTOCOL_INCOMPATIBLE", "MCP缓存映射与本地版本不符", 502)
+        from .mcp_gateway import _json
+        digest = hashlib.sha256(_json([endpoint, server, mapped]).encode()).hexdigest()
+        self.store.pin_mcp_configuration(self.task_id, adapter["server_id"] + "/" + adapter["tool_id"], digest)
+        return remote_gateway._scope_key(endpoint, server, remote_context), "p2" in server
+
+    def _cache_scope(self, tool, arguments):
+        cache = self.runtime.read_cache
+        context = self.context()
+        scenario = context["business_id"]
+        adapter = self.catalog._tools[scenario][tool["name"]]["adapter"]
+        if cache is None or tool["action_level"] != "read" or adapter["type"] == "agent":
+            return None
+        policy = cache.policies.get(scenario + "/" + tool["name"])
+        if policy is None:
+            return None
+        current = tool
+        if self.runtime.releases:
+            current = self.runtime.releases.current_tool(scenario, context, "", tool["name"])
+        key_parts = {"identity": [context[key] for key in ("tenant_id", "org_id", "user_id")],
+                     "business": scenario, "grant": self.runtime.grant(context, scenario),
+                     "scope": self.store.scope(self.task_id), "tool": tool, "current": current,
+                     "adapter": adapter, "arguments": arguments, "policy": policy,
+                     "skill": self.pin, "snapshot": self.snapshot_id}
+        if adapter["type"] == "mcp":
+            binding, governed = self._mcp_binding(tool, arguments)
+            if not governed:
+                return None
+            key_parts["mcp"] = binding
+        encoded = json.dumps(key_parts, ensure_ascii=False, sort_keys=True, allow_nan=False)
+        return hashlib.sha256(encoded.encode()).hexdigest(), policy["ttl_s"]
+
+    async def _shared_output(self, tool, arguments, call_id, cache_scope):
+        key, ttl = cache_scope
+        def guard():
+            self.authorize_tool(tool, arguments)
+            self.store._guard_lease(self.task_id, self.lease, call_id)
+            if self._cache_scope(tool, arguments) != cache_scope:
+                raise Fault("CAPABILITY_REVOKED", "只读缓存的授权范围或数据版本已改变", 403)
+
+        def charge():
+            if self.read_only:
+                limit = self.skill.get("max_tool_calls", 16) if self.skill else 16
+                self.store.consume_tool_attempt(self.task_id, limit, lease=self.lease)
+
+        async def operation(select):
+            # 只有实际执行者占并发名额；等待者不会阻塞自己等待的查询。
+            async with asyncio.timeout(self.runtime.tool_timeout):
+                async with tool_slot(self.runtime.slots):
+                    deadline = time.monotonic() + self.runtime.tool_timeout
+                    def authorize_retrieval():
+                        gateway = select()
+                        context = gateway.context()
+                        gateway.check_skill_tool(context, "retrieve_knowledge")
+                        gateway.check(context, "knowledge.read", "retrieve_knowledge")
+                        return context["object_ids"]
+                    options = {"authorize_retrieval": authorize_retrieval}
+                    if self.runtime.result_store:
+                        options["validate_output"] = self.runtime.result_store.validate_output
+                    gateway = select()
+                    context = gateway.context()
+                    adapter = self.catalog._tools[context["business_id"]][tool["name"]]["adapter"]
+                    if adapter["type"] == "mcp":
+                        options["mcp_context"] = MCPContext(tenant_id=context["tenant_id"],
+                            principal_id=json.dumps([context["org_id"], context["user_id"]]),
+                            run_context_id=gateway.run_id, trace_id=gateway.task_id,
+                            authorize=lambda: select(),
+                            trace=lambda event, data: select().trace(event, data),
+                            pin_configuration=lambda name, digest: select().store.pin_mcp_configuration(
+                                select().task_id, name, digest))
+                    for attempt in range(2):
+                        try:
+                            gateway = select(True)
+                            scenario = gateway.context()["business_id"]
+                            output = await self.catalog.execute(scenario, tool["name"], arguments, **options)
+                            gateway = select()
+                            context = gateway.context()
+                            for item in output["evidence"]:
+                                if "object_id" in item and item["object_id"] not in context["object_ids"]:
+                                    raise Fault("PERMISSION_DENIED", "工具返回了范围外的证据", 403)
+                            gateway.check_output_secrets(output)
+                            return output
+                        except Fault as exc:
+                            if attempt or not exc.retryable:
+                                raise
+                            delay = max(0.2, getattr(exc, "retry_after", 0.2))
+                            if time.monotonic() + delay >= deadline:
+                                raise
+                            select().trace("tool_retry", {"capability_id": tool["name"],
+                                           "error_code": exc.code, "delay_s": delay})
+                            await asyncio.sleep(delay)
+        participant = {"guard": guard, "charge": charge, "value": self}
+        output = await self.runtime.read_cache.run(key, ttl, participant, operation)
+        self.trace("read_cache_result", {"capability_id": tool["name"], "scope_digest": key})
+        return output
+
     async def execute(self, name, arguments, call_id):
         context = self.context()
         scenario_id = context["business_id"]
@@ -207,6 +319,8 @@ class Gateway:
             self.task_id, call_id, name, version, arguments, max_calls=call_budget, lease=self.lease
         )
         if cached is not None:
+            if adapter["type"] == "mcp":
+                self._mcp_binding(tool, arguments)
             self.remember(cached.get("evidence", []))
             return cached
         started = time.monotonic()
@@ -217,67 +331,71 @@ class Gateway:
             deadline = min(deadline, started + self.lease["deadline"] - time.time())
         try:
             async with asyncio.timeout(self.runtime.tool_timeout):
-                slots = self.runtime.slots
-                if adapter["type"] == "agent":
-                    # 委派等待子工具时不能占用子工具需要的同一组并发名额。
-                    slots = self.runtime.delegate_slots
-                async with tool_slot(slots):
-                    # 回调只准备一次；每次实际调用时仍重新读取身份并核验权限。
-                    def authorize_retrieval():
-                        ctx = self.context()
-                        self.check_skill_tool(ctx, "retrieve_knowledge")
-                        self.check(ctx, "knowledge.read", "retrieve_knowledge")
-                        return ctx["object_ids"]
-
-                    options = {"authorize_retrieval": authorize_retrieval}
-                    if self.runtime.result_store:
-                        options["validate_output"] = self.runtime.result_store.validate_output
+                cache_scope = self._cache_scope(tool, arguments)
+                if cache_scope is not None:
+                    output = await self._shared_output(tool, arguments, call_id, cache_scope)
+                else:
+                    slots = self.runtime.slots
                     if adapter["type"] == "agent":
-                        async def delegate(target, payload):
-                            self.authorize_tool(tool, arguments)
-                            self.trace("agent_delegated", {"execution_id": execution_id, "capability_id": name})
-                            child_id = "agent." + hashlib.sha256((call_id + "/" + target).encode()).hexdigest()[:32]
-                            child = await self.execute(target, payload, child_id)
-                            self.trace("agent_returned", {"execution_id": execution_id,
-                                       "child_execution_id": child["execution_id"]})
-                            return {"data": child["data"], "evidence": child["evidence"]}
-                        options["delegate"] = delegate
-                    if adapter["type"] == "mcp":
-                        options["mcp_context"] = MCPContext(
-                            tenant_id=context["tenant_id"],
-                            principal_id=json.dumps([context["org_id"], context["user_id"]]),
-                            run_context_id=self.run_id,
-                            trace_id=self.task_id,
-                            authorize=lambda: self.authorize_tool(tool, arguments),
-                            trace=lambda event, data: self.trace(event, {**data, "execution_id": execution_id}),
-                            pin_configuration=lambda key, digest: self.store.pin_mcp_configuration(self.task_id, key, digest),
-                        )
+                        # 委派等待子工具时不能占用子工具需要的同一组并发名额。
+                        slots = self.runtime.delegate_slots
+                    async with tool_slot(slots):
+                        # 回调只准备一次；每次实际调用时仍重新读取身份并核验权限。
+                        def authorize_retrieval():
+                            ctx = self.context()
+                            self.check_skill_tool(ctx, "retrieve_knowledge")
+                            self.check(ctx, "knowledge.read", "retrieve_knowledge")
+                            return ctx["object_ids"]
 
-                    for attempt in range(2):
-                        try:
-                            # 排队或退避期间可能撤权，每次发出请求前都要复查。
-                            self.authorize_tool(tool, arguments)
-                            if self.read_only and adapter["type"] != "agent":
-                                attempt_limit = 16
-                                if self.skill:
-                                    attempt_limit = self.skill.get("max_tool_calls", 16)
-                                self.store.consume_tool_attempt(self.task_id, attempt_limit, lease=self.lease)
+                        options = {"authorize_retrieval": authorize_retrieval}
+                        if self.runtime.result_store:
+                            options["validate_output"] = self.runtime.result_store.validate_output
+                        if adapter["type"] == "agent":
+                            async def delegate(target, payload):
+                                self.authorize_tool(tool, arguments)
+                                self.trace("agent_delegated", {"execution_id": execution_id, "capability_id": name})
+                                child_id = "agent." + hashlib.sha256((call_id + "/" + target).encode()).hexdigest()[:32]
+                                child = await self.execute(target, payload, child_id)
+                                self.trace("agent_returned", {"execution_id": execution_id,
+                                           "child_execution_id": child["execution_id"]})
+                                return {"data": child["data"], "evidence": child["evidence"]}
+                            options["delegate"] = delegate
+                        if adapter["type"] == "mcp":
+                            options["mcp_context"] = MCPContext(
+                                tenant_id=context["tenant_id"],
+                                principal_id=json.dumps([context["org_id"], context["user_id"]]),
+                                run_context_id=self.run_id,
+                                trace_id=self.task_id,
+                                authorize=lambda: self.authorize_tool(tool, arguments),
+                                trace=lambda event, data: self.trace(event, {**data, "execution_id": execution_id}),
+                                pin_configuration=lambda key, digest: self.store.pin_mcp_configuration(self.task_id, key, digest),
+                            )
 
-                            output = await self.catalog.execute(scenario_id, name, arguments, **options)
-                            self.authorize_tool(tool, arguments)
-                            if any("object_id" in item and item["object_id"] not in context["object_ids"]
-                                   for item in output["evidence"]):
-                                raise Fault("PERMISSION_DENIED", "工具返回了范围外的证据", 403)
-                            self.check_output_secrets(output)
-                            break
-                        except Fault as exc:
-                            if attempt or not exc.retryable or tool["action_level"] != "read":
-                                raise
-                            delay = max(0.2, getattr(exc, "retry_after", 0.2))
-                            if time.monotonic() + delay >= deadline:
-                                raise
-                            self.trace("tool_retry", {"execution_id": execution_id, "error_code": exc.code, "delay_s": delay})
-                            await asyncio.sleep(delay)
+                        for attempt in range(2):
+                            try:
+                                # 排队或退避期间可能撤权，每次发出请求前都要复查。
+                                self.authorize_tool(tool, arguments)
+                                if self.read_only and adapter["type"] != "agent":
+                                    attempt_limit = 16
+                                    if self.skill:
+                                        attempt_limit = self.skill.get("max_tool_calls", 16)
+                                    self.store.consume_tool_attempt(self.task_id, attempt_limit, lease=self.lease)
+
+                                output = await self.catalog.execute(scenario_id, name, arguments, **options)
+                                self.authorize_tool(tool, arguments)
+                                if any("object_id" in item and item["object_id"] not in context["object_ids"]
+                                       for item in output["evidence"]):
+                                    raise Fault("PERMISSION_DENIED", "工具返回了范围外的证据", 403)
+                                self.check_output_secrets(output)
+                                break
+                            except Fault as exc:
+                                if attempt or not exc.retryable or tool["action_level"] != "read":
+                                    raise
+                                delay = max(0.2, getattr(exc, "retry_after", 0.2))
+                                if time.monotonic() + delay >= deadline:
+                                    raise
+                                self.trace("tool_retry", {"execution_id": execution_id, "error_code": exc.code, "delay_s": delay})
+                                await asyncio.sleep(delay)
             result = {"execution_id": execution_id, "capability_id": name, "capability_version": tool.get("version", self.catalog.scenarios[scenario_id]["version"]),
                       "status": "completed", "error": None, **output}
             if self.skill:
@@ -325,6 +443,9 @@ class Runtime:
         self.result_store = None
         if "results" in self.p2_policy:
             self.result_store = ResultStore(store, self.p2_policy["results"])
+        self.read_cache = None
+        if "read_cache" in self.p2_policy:
+            self.read_cache = ReadCache(self.p2_policy["read_cache"])
         self.store._result_store = self.result_store
         self.store.result_validator = self.validate_task_result
         self._principals, self.settings = principals, settings

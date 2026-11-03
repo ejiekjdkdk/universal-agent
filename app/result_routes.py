@@ -56,9 +56,9 @@ def authorize_result(runtime, actor, metadata, provenance):
         gateway = catalog._mcp_gateway
         if gateway is None:
             raise Fault("CAPABILITY_REVOKED", "结果来源MCP配置已停用。", 403)
-        context = MCPContext(tenant_id=actor["tenant_id"], principal_id=json.dumps([actor["org_id"], actor["user_id"]]),
+        remote_context = MCPContext(tenant_id=actor["tenant_id"], principal_id=json.dumps([actor["org_id"], actor["user_id"]]),
                              run_context_id="result-read", trace_id=task_id, authorize=lambda: None)
-        current_binding = gateway._resolve(binding["server_id"], binding["tool_id"], context)
+        current_binding = gateway._resolve(binding["server_id"], binding["tool_id"], remote_context)
         digest = hashlib.sha256(mcp_json(current_binding).encode()).hexdigest()
         if digest != binding["config_digest"]:
             raise Fault("CAPABILITY_REVOKED", "结果来源MCP映射已改变。", 403)

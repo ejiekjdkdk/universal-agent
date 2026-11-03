@@ -13,4 +13,11 @@
 - Ruling: 仅Gateway工具结果进入新加密库；旧Mock账本及任务答案/证据沿用原保留规则，不宣称整库加密。Catalog增加可选输出限额回调，在本地Schema验证前检查；MCP远端SDK边界留给Task4。
 - Ruling: 终态TTL只初始化一次，Store重启恢复后补记原finished_at，重复读取/重启不延长；缺失引用明确失败不重执行。模型投影截短时最终回答保留limitations。
 - 用户最新分享授权：P2完成并验收后，将GitHub仓库从private改为public，任何人可访问；公开前检查上传内容和历史中的凭据风险。尚未修改可见性，也未授权本轮P2自动合并main。
-- Task 3～5 pending。
+- Task 3: complete — 缺少模块先失败，基础7 passed；真实Gateway先3失败，集成后通过；扩展预算/身份/时效/能力/参数/对象范围回归45 passed，15.91秒。MCP接入后的组合回归61 passed，13.12秒。read_cache模块mypy通过。
+- Task 4: complete（本机HTTP范围）— 目录、CLI、协议拒绝、健康策略、真实MCP共享查询以及结果/Worker集成79 passed，40.98秒；日志work/v31-p2-integration.log。SDK结构化大数组先复现进入Schema校验，再增加前置限额后通过。重复已完成MCP调用绕过远端配置撤销先复现，再补实时映射检查后通过。
+- Ruling: Task3/4一起提交其余代码，因为MCP映射与共享缓存的实时授权需要同时接入；保留前两阶段提交不重写历史。
+- Ruling: SDK只保护输入Schema，目录快照虽按ttl_ms/cache_scope有界分区存储，但每次物理调用仍强制刷新完整目录。代价是保留一次目录网络请求，以免描述/输出Schema变化绕过批准。
+- Ruling: stdio按p2-design.md允许的边界保持拒绝并记录NOT_RUN；尚无Windows整个子进程树隔离/回收证据，不声称支持。2024/2025协议明确拒绝而非自动批准降级；真实企业公网HTTPS未联调。
+- Ruling: 健康状态最多256个配置/主体范围，达到上限明确限流，不驱逐活跃熔断状态以免绕过保护；代价是长期频繁配置/身份轮换后需受控重启。
+- 补充：API和独立Worker每60秒清理到期密文，停机前取消维护任务再关库；新增空闲清理测试先失败后通过。四个新增/受改模块mypy通过。
+- Task 5: in_progress — 首轮全量493 passed、12 subtests，176.29秒；该轮启动后追加的清理/CLI测试已专项通过，仍需最终全量、独立审查、上传和公开前历史扫描。日志work/v31-p2-full.log。

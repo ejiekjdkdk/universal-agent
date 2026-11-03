@@ -1,5 +1,6 @@
 """在原Store事务中加密保存完整工具结果，并提供受控、有时限的分页读取。"""
 import base64
+import asyncio
 from datetime import datetime
 import hashlib
 import hmac
@@ -126,6 +127,12 @@ class ResultStore:
                                          "WHERE t.finished_at IS NOT NULL").fetchall()
             for task in finished:
                 self.finish_task(task["task_id"], datetime.fromisoformat(task["finished_at"]).timestamp())
+
+    async def maintain(self):
+        """空闲期间也清除到期密文；读取到期时间的拒绝不依赖此定时器。"""
+        while True:
+            self.purge()
+            await asyncio.sleep(60)
 
     def put(self, task_id, result, provenance):
         raw = _bounded(result)

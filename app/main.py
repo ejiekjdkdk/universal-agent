@@ -160,7 +160,10 @@ def create_app(*, scenarios=None, database=None, token=None, model_settings=None
         rt.role_source = role_source(catalog, local_token, principals, admin_token, service_token)
         dispatcher = None
         trigger_scheduler = None
+        result_maintenance = None
         try:
+            if rt.result_store:
+                result_maintenance = asyncio.create_task(rt.result_store.maintain())
             app.state.releases = Releases(store, app.state.snapshots, evaluate=evaluate_release)
             rt.bind_releases(app.state.releases, app.state.snapshots)
             rt.triggers = TriggerGateway(rt, app.state.snapshots)
@@ -176,9 +179,13 @@ def create_app(*, scenarios=None, database=None, token=None, model_settings=None
                 workers.append(dispatcher)
             if trigger_scheduler:
                 workers.append(trigger_scheduler)
+            if result_maintenance:
+                workers.append(result_maintenance)
             for worker in workers:
                 worker.cancel()
             await asyncio.gather(*workers, return_exceptions=True)
+            if rt.read_cache:
+                await rt.read_cache.close()
             store.close()
 
     app = FastAPI(title="Universal Agent", version="3.0.0", lifespan=lifespan)

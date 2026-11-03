@@ -19,6 +19,9 @@ def create_server():
             return {"data": {"summary": 123}, "evidence": []}
         if text == "oversized":
             return {"data": {"summary": "x" * 300000}, "evidence": []}
+        if text == "many_nodes":
+            from mcp import types
+            return types.CallToolResult(content=[], structured_content={"data": {"summary": "结构上限测试"}, "evidence": [0] * 10001})
         if text == "tenant":
             text = (ctx.headers or {}).get("x-agent-tenant", "missing")
         if text == "credential":

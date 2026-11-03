@@ -8,6 +8,7 @@ import ipaddress
 import json
 import os
 from dataclasses import dataclass
+from collections import OrderedDict, deque
 from pathlib import Path
 import re
 import time
@@ -39,6 +40,8 @@ def _json(data):
 
 
 def _schema(schema):
+    from .result_store import _bounded
+    _bounded(schema)
     Draft202012Validator.check_schema(schema)
     def walk(value):
         if isinstance(value, dict):
@@ -57,6 +60,8 @@ def _schema(schema):
 
 def _validate(value, schema, code):
     try:
+        from .result_store import _bounded
+        _bounded(value)
         invalid = next(Draft202012Validator(schema).iter_errors(value), None)
         if invalid or len(_json(value).encode()) > MAX_RESPONSE:
             raise ValueError("invalid bounded value")
@@ -94,10 +99,42 @@ def _leaves(exc):
     return leaves
 
 
+def catalog_digest(tools):
+    """摘要仅包含操作者审核的目录字段，不接受远端提供的摘要替代计算。"""
+    selected = []
+    for tool in tools:
+        selected.append({key: tool.get(key) for key in ("name", "description", "inputSchema", "outputSchema")})
+    selected.sort(key=lambda item: item["name"])
+    return hashlib.sha256(_json(selected).encode()).hexdigest()
+
+
+def _policy(server):
+    policy = server.get("p2")
+    if policy is None:
+        return None
+    limits = {"failure_threshold": (3, 1, 20), "cooldown_s": (10, 0.01, 300),
+              "max_concurrency": (4, 1, 32), "rate_per_minute": (120, 1, 6000),
+              "cache_ttl_s": (30, 0, 300)}
+    if not isinstance(policy, dict) or set(policy) - {*limits, "catalog_digest"}:
+        raise ValueError("MCP P2策略字段无效")
+    if not isinstance(policy.get("catalog_digest"), str) or not re.fullmatch(r"[0-9a-f]{64}", policy["catalog_digest"]):
+        raise ValueError("MCP P2需要操作者批准的目录摘要")
+    checked = {"catalog_digest": policy["catalog_digest"]}
+    for name, (default, low, high) in limits.items():
+        value = policy.get(name, default)
+        numeric = name in {"cooldown_s", "cache_ttl_s"}
+        if type(value) not in ((int, float) if numeric else (int,)) or not low <= value <= high:
+            raise ValueError("MCP P2策略数值超限")
+        checked[name] = value
+    return checked
+
+
 class MCPGateway:
     def __init__(self, config_path):
         self.config_path = Path(config_path).resolve()
         self._read()
+        self.health = OrderedDict()
+        self.directories = OrderedDict()
 
     @classmethod
     def from_env(cls):
@@ -116,8 +153,9 @@ class MCPGateway:
         for endpoint in config["endpoints"].values():
             _endpoint(endpoint)
         for server in config["servers"].values():
-            if set(server) != {"endpoint_ref", "enabled", "approved_protocol_versions", "tenants", "tools"}:
+            if set(server) - {"p2"} != {"endpoint_ref", "enabled", "approved_protocol_versions", "tenants", "tools"}:
                 raise ValueError("unknown or missing MCP server settings")
+            _policy(server)
             if server["endpoint_ref"] not in config["endpoints"] or type(server["enabled"]) is not bool:
                 raise ValueError("unknown endpoint or invalid enabled state")
             if (not server["approved_protocol_versions"] or
@@ -168,15 +206,114 @@ class MCPGateway:
         except (ValueError, OSError, KeyError, TypeError) as exc:
             raise Fault("CAPABILITY_REVOKED", "MCP 配置不可用", 403) from exc
 
+    def _scope_key(self, endpoint, server, context):
+        credential = server["tenants"][context.tenant_id]["credential_env"]
+        credential_digest = hashlib.sha256((os.getenv(credential, "") if credential else "").encode()).hexdigest()
+        value = [endpoint, server, context.tenant_id, context.principal_id, credential_digest]
+        return hashlib.sha256(_json(value).encode()).hexdigest()
+
     async def execute(self, server_id, tool_id, arguments, *, context, action_level, input_schema, output_schema,
                       capability_id=None, capability_version=None):
+        endpoint, server, _ = self._resolve(server_id, tool_id, context)
+        policy = _policy(server)
+        options = {"context": context, "action_level": action_level, "input_schema": input_schema,
+                   "output_schema": output_schema, "capability_id": capability_id, "capability_version": capability_version}
+        if policy is None:
+            return await self._execute(server_id, tool_id, arguments, **options)
+        key = self._scope_key(endpoint, server, context)
+        state = self.health.get(key)
+        if state is None:
+            if len(self.health) >= 256:
+                # 不驱逐活跃或熔断状态，避免通过身份轮换重置保护窗口。
+                raise Fault("RATE_LIMITED", "MCP健康记录容量已满，请重启或收敛配置范围", 429)
+            state = {"state": "healthy", "failures": 0, "until": 0, "inflight": 0, "requests": deque()}
+            self.health[key] = state
+        now = time.monotonic()
+        if state["state"] == "incompatible":
+            raise Fault("MCP_PROTOCOL_INCOMPATIBLE", "MCP配置需操作者重新审核", 502)
+        if state["state"] == "half_open" or (state["state"] == "open" and now < state["until"]):
+            raise Fault("MCP_CIRCUIT_OPEN", "MCP服务熔断中", 503)
+        while state["requests"] and state["requests"][0] <= now - 60:
+            state["requests"].popleft()
+        if len(state["requests"]) >= policy["rate_per_minute"] or state["inflight"] >= policy["max_concurrency"]:
+            raise Fault("RATE_LIMITED", "MCP请求频率或并发已达上限", 429)
+        probe = state["state"] == "open"
+        if probe:
+            state["state"] = "half_open"
+        state["inflight"] += 1
+        state["requests"].append(now)
+        try:
+            result = await self._execute(server_id, tool_id, arguments, **options)
+            if state["state"] in {"healthy", "degraded"} or (probe and state["state"] == "half_open"):
+                state.update(state="healthy", failures=0, until=0)
+            return result
+        except Fault as exc:
+            if exc.code in {"MCP_PROTOCOL_INCOMPATIBLE", "MCP_CATALOG_DRIFT"}:
+                state["state"] = "incompatible"
+            elif state["state"] != "incompatible" and exc.code in {"UPSTREAM_UNAVAILABLE", "TOOL_TIMEOUT", "RATE_LIMITED", "OUTCOME_UNKNOWN"}:
+                state["failures"] += 1
+                if probe or state["failures"] >= policy["failure_threshold"]:
+                    state.update(state="open", until=time.monotonic() + policy["cooldown_s"])
+                else:
+                    state["state"] = "degraded"
+            raise
+        finally:
+            state["inflight"] -= 1
+            if state["state"] == "half_open":
+                # 取消或权限拒绝不是成功探测，也不计作新的上游故障。
+                state.update(state="open", until=time.monotonic() + policy["cooldown_s"])
+            context.trace("mcp_health", {"server_id": server_id, "state": state["state"], "failures": state["failures"]})
+
+    async def inspect_catalog(self, server_id, tool_id, *, context):
+        _, _, tool = self._resolve(server_id, tool_id, context)
+        return await self._execute(server_id, tool_id, {}, context=context, action_level=tool["action_level"],
+                                   input_schema=tool["input_schema"], output_schema=tool["output_schema"], inspect_only=True)
+
+    def _approve_listing(self, listing, endpoint, server, context, server_id, inspect_only):
+        tools = []
+        for item in listing.tools:
+            tools.append({"name": item.name, "description": item.description,
+                          "inputSchema": item.input_schema, "outputSchema": item.output_schema})
+        digest = catalog_digest(tools)
+        candidate = {"catalog_digest": digest, "tools": tools}
+        if inspect_only:
+            return candidate
+        policy = _policy(server)
+        if policy is None:
+            return candidate
+        if digest != policy["catalog_digest"]:
+            context.trace("mcp_catalog_drift", {"server_id": server_id, "approved_digest": policy["catalog_digest"],
+                                               "observed_digest": digest})
+            raise Fault("MCP_CATALOG_DRIFT", "MCP目录或Schema发生变化，需操作者重新审核", 502)
+        # SDK只保护输入Schema；完整目录仍每次刷新。缓存用于已审核目录快照，不跳过线上比对。
+        ttl_ms = getattr(listing, "ttl_ms", 0)
+        cache_scope = getattr(listing, "cache_scope", None)
+        key = self._scope_key(endpoint, server, context)
+        now = time.monotonic()
+        for expired in list(self.directories):
+            if self.directories[expired]["expires_at"] <= now:
+                del self.directories[expired]
+        if type(ttl_ms) is int and ttl_ms > 0 and cache_scope in {"private", "public"}:
+            ttl = min(ttl_ms / 1000, policy["cache_ttl_s"])
+            if ttl > 0:
+                self.directories[key] = {**candidate, "expires_at": now + ttl, "scope": "private"}
+                self.directories.move_to_end(key)
+                while len(self.directories) > 128:
+                    self.directories.popitem(last=False)
+        else:
+            self.directories.pop(key, None)
+        return candidate
+
+    async def _execute(self, server_id, tool_id, arguments, *, context, action_level, input_schema, output_schema,
+                      capability_id=None, capability_version=None, inspect_only=False):
         endpoint, server, tool = self._resolve(server_id, tool_id, context)
         if (tool["action_level"] != action_level or tool["input_schema"] != input_schema
                 or tool["output_schema"] != output_schema
                 or (capability_id is not None and tool["capability_id"] != capability_id)
                 or (capability_version is not None and tool["version"] != capability_version)):
             raise Fault("MCP_PROTOCOL_INCOMPATIBLE", "MCP 本地能力声明与批准映射不符", 502)
-        _validate(arguments, input_schema, "SCHEMA_VALIDATION_FAILED")
+        if not inspect_only:
+            _validate(arguments, input_schema, "SCHEMA_VALIDATION_FAILED")
         expected = _json([endpoint, server, tool])
         # 同一任务首次使用时固定配置摘要，后续调用不能悄然切换端点或工具映射。
         context.pin_configuration(f"{server_id}/{tool_id}", hashlib.sha256(expected.encode()).hexdigest())
@@ -301,6 +438,10 @@ class MCPGateway:
                         names = [item.name for item in listing.tools]
                         if len(names) != len(set(names)):
                             raise Fault("MCP_PROTOCOL_INCOMPATIBLE", "MCP 工具名称冲突", 502)
+                        candidate = self._approve_listing(listing, endpoint, server, context, server_id, inspect_only)
+                        if inspect_only:
+                            guard()
+                            return candidate
                         remote = None
                         for listed_tool in listing.tools:
                             if listed_tool.name == tool["remote_tool_name"]:
@@ -313,6 +454,14 @@ class MCPGateway:
                             if schema is not None:
                                 _schema(schema)
                         _validate(arguments, remote.input_schema, "SCHEMA_VALIDATION_FAILED")
+                        validate_result = client.session.validate_tool_result
+                        async def validate_bounded_result(name, result):
+                            # SDK会先验证远端Schema，必须在这一步之前拒绝过深或过大的结构。
+                            from .result_store import _bounded
+                            if result.structured_content is not None:
+                                _bounded(result.structured_content)
+                            await validate_result(name, result)
+                        client.session.validate_tool_result = validate_bounded_result
                         guard()
                         sent = True
                         # 低层调用避免自动重发和补充输入循环，只读重试统一由 Runtime 控制。

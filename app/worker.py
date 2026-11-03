@@ -105,6 +105,8 @@ async def main():
     database = Path(os.getenv("AGENT_DATABASE") or ROOT / "var" / "agent.db")
     catalog = Catalog(Path(os.getenv("AGENT_SCENARIOS") or ROOT / "scenarios"))
     store = Store(database, recover_reactive=False)
+    rt = None
+    result_maintenance = None
     try:
         actors = local_principals(catalog, "local-worker-identity")
         check_credentials(actors, os.getenv("AGENT_ADMIN_TOKEN"), os.getenv("AGENT_SERVICE_TOKEN"))
@@ -115,8 +117,15 @@ async def main():
         rt.bind_releases(Releases(store, snapshots), snapshots)
         rt.skills = SkillRegistry(Path(os.getenv("AGENT_SKILL_ROOT") or database.parent / "skills"))
         rt.triggers = TriggerGateway(rt, snapshots)
+        if rt.result_store:
+            result_maintenance = asyncio.create_task(rt.result_store.maintain())
         await PlanWorker(rt, snapshots).run()
     finally:
+        if result_maintenance:
+            result_maintenance.cancel()
+            await asyncio.gather(result_maintenance, return_exceptions=True)
+        if rt and rt.read_cache:
+            await rt.read_cache.close()
         store.close()
 
 

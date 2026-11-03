@@ -29,6 +29,22 @@ def test_old_default_has_no_result_routes(tmp_path):
     assert not any("/results" in path for path in app.openapi()["paths"])
 
 
+def test_idle_result_store_purges_expired_rows_without_new_calls(tmp_path, monkeypatch):
+    app = configured_app(tmp_path, monkeypatch)
+    with TestClient(app, base_url="http://localhost", headers=AUTH) as client:
+        client.post(API + "/chat", json=BODY)
+        store = app.state.runtime.store
+        with store._transaction():
+            store._db.execute("UPDATE tool_results SET expires_at=?", (time.time() - 1,))
+        async def run():
+            maintenance = asyncio.create_task(app.state.runtime.result_store.maintain())
+            await asyncio.sleep(0.02)
+            maintenance.cancel()
+            await asyncio.gather(maintenance, return_exceptions=True)
+        asyncio.run(run())
+        assert store._db.execute("SELECT COUNT(*) FROM tool_results").fetchone()[0] == 0
+
+
 def test_completed_task_has_authorized_pages_and_unchanged_response(tmp_path, monkeypatch):
     app = configured_app(tmp_path, monkeypatch)
     with TestClient(app, base_url="http://localhost", headers=AUTH) as client:
