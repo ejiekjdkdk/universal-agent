@@ -157,6 +157,8 @@ class Snapshots:
         if key not in self.cache:
             try:
                 self.cache[key] = bundle.load_catalog(scene_id)
+                # 快照固定本地能力声明；远端配置与已知熔断/漂移状态由同一进程网关管理。
+                self.cache[key]._mcp_gateway = self.live._mcp_gateway
             except (OSError, ValueError, KeyError, TypeError) as exc:
                 raise Fault("RELEASE_SNAPSHOT_INVALID", "场景快照无法加载", 409) from exc
         return self.cache[key]

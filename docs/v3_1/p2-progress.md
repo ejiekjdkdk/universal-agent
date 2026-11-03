@@ -21,3 +21,11 @@
 - Ruling: 健康状态最多256个配置/主体范围，达到上限明确限流，不驱逐活跃熔断状态以免绕过保护；代价是长期频繁配置/身份轮换后需受控重启。
 - 补充：API和独立Worker每60秒清理到期密文，停机前取消维护任务再关库；新增空闲清理测试先失败后通过。四个新增/受改模块mypy通过。
 - Task 5: in_progress — 首轮全量493 passed、12 subtests，176.29秒；该轮启动后追加的清理/CLI测试已专项通过，仍需最终全量、独立审查、上传和公开前历史扫描。日志work/v31-p2-full.log。
+
+- Final: fixed 加密引用删除后步骤回退明文 — test_result_removed_between_call_and_settlement_never_falls_back_to_plaintext两场景RED→GREEN；completed call内部引用为权威，缺失/停用不回退。
+- Final: fixed MCP凭据撤销/轮换后仍复用结果 — test_all_reuse_paths_recheck_credentials_and_known_drift移除/异常/轮换RED→GREEN；P2固定摘要含凭据范围，原值不持久化。
+- Final: fixed 已知目录漂移仍命中共享缓存 — 同测试drift RED→GREEN；真实发布快照路径补验先失败再共享Runtime网关状态；缓存、幂等、metadata/pages统一门禁。
+- Final: Ruling: 接受审查3个Important并全部修复；没有再次派全分支审查员，原审查Ready No仅评价d3dd1cd，修复结论依据复现及最终回归。审查未评价的明确排除范围继续按p2-acceptance.md列明，公开扫描/上传由执行者另行核验。
+- Final: Ruling: MCP健康观察与目录缓存是进程内状态，快照共用当前进程网关；跨进程持续撤销由操作者修改可信enabled/批准配置，代价是不提供分布式健康一致性，实际调用仍每次刷新目录。凭据轮换使P2旧结果失效是安全边界而非静默换身份。
+- Final: minor (deferred): 无。
+- Task 5 local acceptance: complete — 505 passed、12 subtests，186.28秒；四模块mypy、compileall、node --check（app/review）、pip check、差异检查通过。日志work/v31-p2-after-review.log。最终上传与公开待执行，main仍af952ae。

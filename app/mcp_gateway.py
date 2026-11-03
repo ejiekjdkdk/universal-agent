@@ -202,6 +202,10 @@ class MCPGateway:
                 raise Fault("PERMISSION_DENIED", "当前租户不能使用此 MCP 服务", 403)
             if PROTOCOL not in server["approved_protocol_versions"]:
                 raise Fault("MCP_PROTOCOL_INCOMPATIBLE", "MCP 协议版本未经批准", 502)
+            credential_name = server["tenants"][context.tenant_id]["credential_env"]
+            credential = os.getenv(credential_name) if credential_name else None
+            if credential_name and (not credential or "\r" in credential or "\n" in credential):
+                raise Fault("PERMISSION_DENIED", "MCP服务凭据不可用", 403)
             return config["endpoints"][server["endpoint_ref"]], server, tool
         except (ValueError, OSError, KeyError, TypeError) as exc:
             raise Fault("CAPABILITY_REVOKED", "MCP 配置不可用", 403) from exc
@@ -211,6 +215,20 @@ class MCPGateway:
         credential_digest = hashlib.sha256((os.getenv(credential, "") if credential else "").encode()).hexdigest()
         value = [endpoint, server, context.tenant_id, context.principal_id, credential_digest]
         return hashlib.sha256(_json(value).encode()).hexdigest()
+
+    def binding_digest(self, endpoint, server, tool, context):
+        value = [endpoint, server, tool]
+        if "p2" in server:
+            # P2固定凭据范围；轮换后旧任务和持久结果不能继承新的远端身份。
+            value.append(self._scope_key(endpoint, server, context))
+        return hashlib.sha256(_json(value).encode()).hexdigest()
+
+    def authorize_reuse(self, server_id, tool_id, context):
+        endpoint, server, tool = self._resolve(server_id, tool_id, context)
+        state = self.health.get(self._scope_key(endpoint, server, context))
+        if state and state["state"] == "incompatible":
+            raise Fault("MCP_PROTOCOL_INCOMPATIBLE", "已发现MCP目录或协议不兼容，禁止复用旧结果", 502)
+        return endpoint, server, tool
 
     async def execute(self, server_id, tool_id, arguments, *, context, action_level, input_schema, output_schema,
                       capability_id=None, capability_version=None):
@@ -315,10 +333,13 @@ class MCPGateway:
         if not inspect_only:
             _validate(arguments, input_schema, "SCHEMA_VALIDATION_FAILED")
         expected = _json([endpoint, server, tool])
+        expected_binding = self.binding_digest(endpoint, server, tool, context)
         # 同一任务首次使用时固定配置摘要，后续调用不能悄然切换端点或工具映射。
-        context.pin_configuration(f"{server_id}/{tool_id}", hashlib.sha256(expected.encode()).hexdigest())
+        context.pin_configuration(f"{server_id}/{tool_id}", expected_binding)
         def guard():
-            if _json(self._resolve(server_id, tool_id, context)) != expected:
+            current_endpoint, current_server, current_tool = self._resolve(server_id, tool_id, context)
+            current = [current_endpoint, current_server, current_tool]
+            if _json(current) != expected or self.binding_digest(current_endpoint, current_server, current_tool, context) != expected_binding:
                 raise Fault("CAPABILITY_REVOKED", "MCP 配置在调用期间发生变更", 403)
 
         from mcp import Client, types

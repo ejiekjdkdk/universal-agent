@@ -606,8 +606,20 @@ class Store(ApprovalStore, PlanStore):
 
     def _persist_tool_result(self, task_id, result):
         """已由Gateway封存的工具结果只保存内部引用，旧模拟账本路径保持原样。"""
+        if not isinstance(result, dict) or not result.get("execution_id"):
+            return result
+        call = self._db.execute("SELECT result FROM calls WHERE task_id=? AND execution_id=? AND status='completed'",
+                                (task_id, result["execution_id"])).fetchone()
+        if call and call[0]:
+            saved = json.loads(call[0])
+            if isinstance(saved, dict) and set(saved) == {"_encrypted_result"}:
+                # 调用完成和步骤落库之间可能删除引用；已封存过的结果不能回退为明文。
+                restored = self._restore_tool_result(saved, task_id, result["execution_id"])
+                if restored != result:
+                    raise Fault("RESULT_CONFLICT", "步骤结果与已完成调用不一致。", 409)
+                return saved
         results = getattr(self, "_result_store", None)
-        if results and isinstance(result, dict) and result.get("execution_id"):
+        if results:
             row = self._db.execute("SELECT result_ref FROM tool_results WHERE task_id=? AND execution_id=?",
                                    (task_id, result["execution_id"])).fetchone()
             if row:

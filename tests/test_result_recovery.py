@@ -87,3 +87,23 @@ def test_completed_call_recovery_requires_original_result_and_lease(setup):
     with pytest.raises(Fault) as unavailable:
         store.begin_call(task_id, "plan.first", "read", "1", {}, lease=claim)
     assert unavailable.value.code == "RESULT_NOT_FOUND"
+
+
+@pytest.mark.parametrize("failure", ["deleted", "disabled"])
+def test_result_removed_between_call_and_settlement_never_falls_back_to_plaintext(setup, failure):
+    store, results, task_id = setup
+    claim = store.claim_step("worker", 10)
+    result, ref = complete(store, results, claim, "待保存步骤")
+    if failure == "deleted":
+        results.revoke(ref, ACTOR, lambda *args: None)
+    else:
+        store._result_store = None
+    with pytest.raises(Fault) as unavailable:
+        store.settle_step(claim, result=result)
+    assert unavailable.value.code in {"RESULT_NOT_FOUND", "RESULT_STORE_DISABLED"}
+    assert store.settle_step(claim, error=unavailable.value.as_dict())
+    output = store._db.execute("SELECT output FROM plan_steps WHERE task_id=? AND step_id='first'", (task_id,)).fetchone()[0]
+    assert output is None or "details" not in output
+    assert store.claim_step("next-worker", 10) is None
+    assert store.task(ACTOR, task_id)["status"] == "failed"
+    assert len(store.task(ACTOR, task_id)["tool_calls"]) == 1

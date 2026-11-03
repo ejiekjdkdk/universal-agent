@@ -1,12 +1,11 @@
 """结果句柄使用任务所有权与实时能力授权，不能复用已撤销的运行上下文。"""
-import hashlib
 import json
 
 from fastapi import Depends
 from fastapi.responses import JSONResponse
 
 from .errors import Fault
-from .mcp_gateway import MCPContext, _json as mcp_json
+from .mcp_gateway import MCPContext
 
 
 API = "/api/v1/agent"
@@ -58,8 +57,8 @@ def authorize_result(runtime, actor, metadata, provenance):
             raise Fault("CAPABILITY_REVOKED", "结果来源MCP配置已停用。", 403)
         remote_context = MCPContext(tenant_id=actor["tenant_id"], principal_id=json.dumps([actor["org_id"], actor["user_id"]]),
                              run_context_id="result-read", trace_id=task_id, authorize=lambda: None)
-        current_binding = gateway._resolve(binding["server_id"], binding["tool_id"], remote_context)
-        digest = hashlib.sha256(mcp_json(current_binding).encode()).hexdigest()
+        endpoint, server, tool = gateway.authorize_reuse(binding["server_id"], binding["tool_id"], remote_context)
+        digest = gateway.binding_digest(endpoint, server, tool, remote_context)
         if digest != binding["config_digest"]:
             raise Fault("CAPABILITY_REVOKED", "结果来源MCP映射已改变。", 403)
 

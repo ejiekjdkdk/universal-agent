@@ -193,15 +193,14 @@ class Gateway:
             principal_id=json.dumps([context["org_id"], context["user_id"]]), run_context_id=self.run_id,
             trace_id=self.task_id, authorize=lambda: self.authorize_tool(tool, arguments))
         remote_gateway = self.catalog._mcp_gateway
-        endpoint, server, mapped = remote_gateway._resolve(adapter["server_id"], adapter["tool_id"], remote_context)
+        endpoint, server, mapped = remote_gateway.authorize_reuse(adapter["server_id"], adapter["tool_id"], remote_context)
         for field in ("action_level", "input_schema", "output_schema"):
             if mapped[field] != tool[field]:
                 raise Fault("MCP_PROTOCOL_INCOMPATIBLE", "MCP缓存映射与本地声明不符", 502)
         version = tool.get("version", self.catalog.scenarios[scenario]["version"])
         if mapped["capability_id"] != tool["name"] or mapped["version"] != version:
             raise Fault("MCP_PROTOCOL_INCOMPATIBLE", "MCP缓存映射与本地版本不符", 502)
-        from .mcp_gateway import _json
-        digest = hashlib.sha256(_json([endpoint, server, mapped]).encode()).hexdigest()
+        digest = remote_gateway.binding_digest(endpoint, server, mapped, remote_context)
         self.store.pin_mcp_configuration(self.task_id, adapter["server_id"] + "/" + adapter["tool_id"], digest)
         return remote_gateway._scope_key(endpoint, server, remote_context), "p2" in server
 
