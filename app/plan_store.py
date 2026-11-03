@@ -57,7 +57,7 @@ def _error(code, message):
     return {"code": code, "message": message, "retryable": False, "details": {}}
 
 
-def _predecessor_outputs(step, rows):
+def _predecessor_outputs(step, rows, restore):
     by_name = {r["step_id"]: r for r in rows}
     remaining = list(step["depends_on"])
     outputs = {}
@@ -65,7 +65,7 @@ def _predecessor_outputs(step, rows):
         name = remaining.pop()
         if name not in outputs:
             row = by_name[name]
-            outputs[name] = json.loads(row["output"])
+            outputs[name] = restore(json.loads(row["output"]))
             remaining.extend(json.loads(row["definition"])["depends_on"])
     return outputs
 
@@ -136,6 +136,8 @@ class PlanStore:
                     "result_contract": p["result_contract"], "steps": steps}
 
     def _change_step(self, task_id, step_id, status, error=None, result=None):
+        if result is not None:
+            result = self._persist_tool_result(task_id, result)
         if status == "failed":
             self._db.execute("""UPDATE approvals SET commit_status='failed' WHERE task_id=? AND step_id=?
                                 AND status='approved' AND commit_status='not_started'""", (task_id, step_id))
@@ -173,7 +175,11 @@ class PlanStore:
         summaries = []
         evidence, seen = [], set()
         for r in successful:
-            result = json.loads(r["output"])
+            try:
+                result = self._restore_tool_result(json.loads(r["output"]), task_id)
+            except Fault as exc:
+                self._finish(task_id, "failed", {}, exc.as_dict())
+                return
             if r in (sinks or successful):
                 summary = result.get("data", {}).get("summary")
                 if not isinstance(summary, str) or not summary.strip():
@@ -307,10 +313,15 @@ class PlanStore:
                         })
                     attempt = _attempt_metrics(step_row, token)
                     self._event(task_id, "step_leased", {"step_id": step_id, **attempt})
+                    try:
+                        outputs = _predecessor_outputs(step, rows, lambda value: self._restore_tool_result(value, task_id))
+                    except Fault as exc:
+                        self._finish(task_id, "failed", {}, exc.as_dict())
+                        break
                     return {"task_id": task_id, "step_id": step_id, "token": token, **attempt,
                             "worker_id": worker_id, "business_id": self._task_row(task_id)["business_id"],
                             "run_context_id": self.context_id(task_id), "snapshot_id": plan["snapshot_id"],
-                            "step": step, "outputs": _predecessor_outputs(step, rows),
+                            "step": step, "outputs": outputs,
                             "max_tool_calls": plan["call_limit"], "deadline": plan["deadline"]}
             return None
 

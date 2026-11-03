@@ -13,6 +13,7 @@ from .errors import Fault
 from .providers import run_provider
 from .skills import SkillError, SkillRegistry
 from .mcp_gateway import MCPContext
+from .result_store import ResultStore, load_p2_policy
 
 
 def preview(value, depth=0):
@@ -67,6 +68,18 @@ class Gateway:
         if self.skill and name not in self.skill["tools"]:
             self.store.audit("skill.capability", "deny", ctx, self.task_id, name, "PERMISSION_DENIED")
             raise Fault("PERMISSION_DENIED", "能力超出已选技能范围", 403)
+
+    def _read_result_page(self, ref, cursor):
+        context = self.context()
+        if self.runtime.result_store is None:
+            raise Fault("PERMISSION_DENIED", "当前任务未启用持久结果引用。", 403)
+        from .result_routes import authorize_result
+        def authorize(metadata, provenance):
+            if metadata["task_id"] != self.task_id:
+                raise Fault("PERMISSION_DENIED", "模型只能读取当前任务的结果。", 403)
+            self.context()
+            authorize_result(self.runtime, context, metadata, provenance)
+        return self.runtime.result_store.page(ref, cursor, context, authorize)
 
     def read_skill_reference(self, path):
         ctx = self.context()
@@ -217,6 +230,8 @@ class Gateway:
                         return ctx["object_ids"]
 
                     options = {"authorize_retrieval": authorize_retrieval}
+                    if self.runtime.result_store:
+                        options["validate_output"] = self.runtime.result_store.validate_output
                     if adapter["type"] == "agent":
                         async def delegate(target, payload):
                             self.authorize_tool(tool, arguments)
@@ -268,7 +283,22 @@ class Gateway:
             if self.skill:
                 # 此标记仅表示网关已取得并校验适配器返回值。
                 result.update(result_schema_version="1", verified=True, verification_scope="adapter_output_schema")
-            self.store.complete_call(self.task_id, call_id, result, lease=self.lease)
+            if self.runtime.result_store:
+                provenance = {"capability_id": name, "capability_version": version, "snapshot_id": self.snapshot_id,
+                              "permission": tool["permission"], "action_level": tool["action_level"],
+                              "arguments": arguments, "skill": self.pin}
+                if adapter["type"] == "mcp":
+                    binding = self.store._db.execute("SELECT digest FROM task_mcp_bindings WHERE task_id=? AND capability_key=?",
+                                                    (self.task_id, adapter["server_id"] + "/" + adapter["tool_id"])).fetchone()
+                    provenance["mcp"] = {"server_id": adapter["server_id"], "tool_id": adapter["tool_id"],
+                                         "config_digest": binding[0] if binding else None}
+                with self.store._transaction():
+                    self.store._guard_lease(self.task_id, self.lease, call_id)
+                    self.context()
+                    self.runtime.result_store.put(self.task_id, result, provenance)
+                    self.store.complete_call(self.task_id, call_id, result, lease=self.lease)
+            else:
+                self.store.complete_call(self.task_id, call_id, result, lease=self.lease)
             self.remember(result["evidence"])
             self.trace("tool_result", {"execution_id": execution_id, "tool": name, "output": preview(result["data"]),
                                        "capability_version": version, "verification_scope": "adapter_output_schema",
@@ -291,6 +321,11 @@ class Gateway:
 class Runtime:
     def __init__(self, catalog, store, principals, settings):
         self.catalog, self.store = catalog, store
+        self.p2_policy = load_p2_policy(settings)
+        self.result_store = None
+        if "results" in self.p2_policy:
+            self.result_store = ResultStore(store, self.p2_policy["results"])
+        self.store._result_store = self.result_store
         self.store.result_validator = self.validate_task_result
         self._principals, self.settings = principals, settings
         self.role_source = None

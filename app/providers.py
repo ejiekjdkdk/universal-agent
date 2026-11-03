@@ -55,6 +55,8 @@ READ_REFERENCE = _tool("read_skill_reference", "Read one published reference fro
                        {"path": {"type": "string", "maxLength": 256}}, ["path"])
 READ_CONTEXT = _tool("read_context_reference", "Read original data from a current task context reference.",
                      {"ref": {"type": "string", "maxLength": 64}}, ["ref"])
+READ_RESULT = _tool("read_result_page", "按受控引用读取当前任务完整结果的一页；仍受原工具调用预算约束。",
+                    {"ref": {"type": "string", "maxLength": 64}, "cursor": {"type": "string", "maxLength": 1024}}, ["ref"])
 
 
 def _invalid_reply():
@@ -184,6 +186,10 @@ def _parse_call(call, seen):
             valid = set(args) == {"path"} and isinstance(args["path"], str) and 0 < len(args["path"]) <= 256
         elif name == "read_context_reference":
             valid = set(args) == {"ref"} and isinstance(args["ref"], str) and bool(re.fullmatch(r"ctx_[a-f0-9]{32}", args["ref"]))
+        elif name == "read_result_page":
+            valid = (set(args) <= {"ref", "cursor"} and isinstance(args.get("ref"), str)
+                     and bool(re.fullmatch(r"res_[a-f0-9]{48}", args["ref"]))
+                     and ("cursor" not in args or isinstance(args["cursor"], str) and 0 < len(args["cursor"]) <= 1024))
         else:
             valid = False
         if not valid:
@@ -210,10 +216,27 @@ async def _tool_result(gateway, name, args, call_id, sources):
         result = await gateway.discover()
     elif name == "execute_capability":
         result = await gateway.execute(args["name"], args["arguments"], call_id)
+        execution_id = result["execution_id"] if "execution_id" in result else None
         result = {"data": result["data"], "evidence": _label_evidence(result["evidence"], sources)}
+        result_store = getattr(getattr(gateway, "runtime", None), "result_store", None)
+        if result_store and len(json.dumps(result, ensure_ascii=False).encode()) > 16384:
+            # 只投影模型输入，Gateway及内部恢复仍使用完整原结果。
+            row = gateway.store._db.execute("SELECT result_ref FROM tool_results WHERE task_id=? AND execution_id=?",
+                                            (gateway.task_id, execution_id)).fetchone()
+            if row is None:
+                raise Fault("RESULT_NOT_FOUND", "完整工具结果不可用。", 502)
+            saved = result_store.load(row[0])
+            summary = result["data"].get("summary", "")
+            if not isinstance(summary, str):
+                summary = ""
+            result = {"data": {"summary": summary[:2048]}, "evidence": result["evidence"], "result_ref": row[0],
+                      "result_digest": saved["metadata"]["digest"], "truncated": True,
+                      "limitations": ["模型输入只含结果摘要；完整JSON可通过read_result_page分段读取。"]}
     elif name == "retrieve_knowledge":
         items = await gateway.retrieve(args["query"], args.get("top_k", 5))
         result = {"evidence": _label_evidence(items, sources)}
+    elif name == "read_result_page":
+        result = gateway._read_result_page(args["ref"], args.get("cursor"))
     else:
         result = {"reference": gateway.read_skill_reference(args["path"])}
     content = json.dumps(result, ensure_ascii=False)
@@ -303,6 +326,7 @@ async def _model_loop(complete, messages, gateway, max_rounds, max_calls, rates,
     seen: set[str] = set()
     sources: dict[tuple, int] = {}
     observed_summaries: list[str] = []
+    projection_limitations: list[str] = []
     completed_read = False
     for round_no in range(1, max_rounds + 1):
         # 本轮仍会发送历史和前序工具结果，发送前复核这些数据依赖的当前授权。
@@ -335,6 +359,10 @@ async def _model_loop(complete, messages, gateway, max_rounds, max_calls, rates,
                 result["limitations"].append("本次任务只执行读取，未执行写入。")
                 if context_session is not None:
                     result["limitations"].extend(context_session.limitations)
+            if projection_limitations:
+                if isinstance(result, str):
+                    result = {"answer": result, "limitations": []}
+                result["limitations"].extend(projection_limitations)
             return result
         if len(seen) + len(calls) > max_calls or round_no == max_rounds:
             if structured:
@@ -357,6 +385,12 @@ async def _model_loop(complete, messages, gateway, max_rounds, max_calls, rates,
                          "content": context_session.read(args["ref"])}
             else:
                 entry = await _tool_result(gateway, name, args, clean["id"], sources)
+            if name == "execute_capability":
+                projection = json.loads(entry["content"])
+                if "result_ref" in projection:
+                    for limitation in projection["limitations"]:
+                        if limitation not in projection_limitations:
+                            projection_limitations.append(limitation)
             messages.append(entry)
             if context_session is not None:
                 capability = None
@@ -458,6 +492,8 @@ async def run_provider(
             messages.append({"role": entry["role"], "content": content})
     messages.append({"role": "user", "content": message})
     offered = [*TOOLS, READ_REFERENCE] if skill and skill["references"] else list(TOOLS)
+    if getattr(getattr(gateway, "runtime", None), "result_store", None):
+        offered.append(READ_RESULT)
     context_session = None
     if compiler_enabled:
         offered.append(READ_CONTEXT)

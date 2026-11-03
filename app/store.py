@@ -469,6 +469,12 @@ class Store(ApprovalStore, PlanStore):
             raise Fault("TASK_STATE_CONFLICT", "Invalid terminal state.", 409)
         if self._task_row(task_id)["status"] in TERMINAL_EVENTS:
             return False
+        if getattr(self, "_result_store", None):
+            try:
+                self._result_store.finish_task(task_id)
+            except Fault as exc:
+                # 结果损坏不能阻止任务收敛到终态，也不能退回明文或重新执行。
+                status, result, error = "failed", {}, exc.as_dict()
         if status in {"completed", "partial"} and getattr(self, "result_validator", None):
             try:
                 self.result_validator(task_id, result)
@@ -525,7 +531,7 @@ class Store(ApprovalStore, PlanStore):
                 if (row["capability_id"], row["capability_version"], row["arguments_digest"]) != (cap_id, version, digest):
                     raise Fault("IDEMPOTENCY_CONFLICT", "Call ID already used for a different operation.", 409)
                 if row["status"] == "completed":
-                    return row["execution_id"], json.loads(row["result"])
+                    return row["execution_id"], self._restore_tool_result(json.loads(row["result"]), task_id, row["execution_id"])
                 if row["status"] == "failed":
                     error = json.loads(row["error"])
                     raise Fault(error["code"], error["message"], error.get("status", 424), error.get("retryable", False))
@@ -585,6 +591,8 @@ class Store(ApprovalStore, PlanStore):
                 return
             duration = max(0, round((time.time() - row["started"]) * 1000))
             status = "failed" if error is not None else "completed"
+            if error is None:
+                result = self._persist_tool_result(task_id, result)
             self._db.execute("""UPDATE calls SET status=?,duration_ms=?,result=?,error=?
                 WHERE task_id=? AND call_id=?""", (status, duration, _json(result) if error is None else None,
                                                    _json(error), task_id, call_id))
@@ -595,3 +603,28 @@ class Store(ApprovalStore, PlanStore):
             if step:
                 detail["step_id"] = step["step_id"]
             self._event(task_id, ("tool_call_" if step else "step_") + status, detail)
+
+    def _persist_tool_result(self, task_id, result):
+        """已由Gateway封存的工具结果只保存内部引用，旧模拟账本路径保持原样。"""
+        results = getattr(self, "_result_store", None)
+        if results and isinstance(result, dict) and result.get("execution_id"):
+            row = self._db.execute("SELECT result_ref FROM tool_results WHERE task_id=? AND execution_id=?",
+                                   (task_id, result["execution_id"])).fetchone()
+            if row:
+                record = results.load(row[0])
+                if record["result"] != result:
+                    raise Fault("RESULT_CONFLICT", "持久化结果与已验证结果不一致。", 409)
+                return {"_encrypted_result": row[0]}
+        return result
+
+    def _restore_tool_result(self, value, task_id, execution_id=None):
+        if not isinstance(value, dict) or set(value) != {"_encrypted_result"}:
+            return value
+        results = getattr(self, "_result_store", None)
+        if results is None:
+            raise Fault("RESULT_STORE_DISABLED", "恢复此结果需要原加密配置，禁止重新执行工具。", 503)
+        record = results.load(value["_encrypted_result"])
+        metadata = record["metadata"]
+        if metadata["task_id"] != task_id or (execution_id is not None and metadata["execution_id"] != execution_id):
+            raise Fault("RESULT_INTEGRITY_ERROR", "结果引用不属于当前执行。", 502)
+        return record["result"]

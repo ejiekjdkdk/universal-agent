@@ -149,6 +149,10 @@ class ContextSession:
                     compact_data["summary"] = result["data"]["summary"]
                 compact = {"data": compact_data, "evidence": result.get("evidence", []),
                            "context_ref": ref, "limitations": ["工具明细未全部进入上下文，可按引用读取。"]}
+                if "result_ref" in result:
+                    compact["result_ref"] = result["result_ref"]
+                    compact["result_digest"] = result["result_digest"]
+                    compact["truncated"] = True
                 summary = _json({**message, "content": _json(compact)})
         self.items.append(ContextItem(ref, self.scope, self.snapshot_id, source_kind, tier, raw, pinned,
                                       self.expires_at, summary))

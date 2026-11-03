@@ -378,7 +378,8 @@ class Catalog:
         ranked.sort(key=lambda item: (-item[0], item[1]["source_id"]))
         return [doc.copy() for _, doc in ranked[:top_k]]
 
-    async def execute(self, scenario_id, name, arguments, *, authorize_retrieval=None, mcp_context=None, delegate=None):
+    async def execute(self, scenario_id, name, arguments, *, authorize_retrieval=None, mcp_context=None, delegate=None,
+                      validate_output=None):
         self._scene(scenario_id)
         tool = self._tools[scenario_id].get(name)
         if tool is None:
@@ -412,6 +413,8 @@ class Catalog:
                 result = await handler(arguments, retrieve)
             else:
                 result = await _call_sync(handler, arguments, retrieve)
+        if validate_output is not None:
+            validate_output(result)
         try:
             _check(result, ENVELOPE)
             _check(result["data"], tool["output_schema"])

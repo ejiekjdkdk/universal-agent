@@ -31,10 +31,10 @@ Files: app/result_store.py；tests/test_result_store.py。
 
 Interfaces: ResultStore(store, settings)共享原SQLite连接；put(task_id,result,provenance)→随机ref；load(ref)→内部已验证记录；metadata(ref,actor,authorize)；page(ref,cursor,actor,authorize)；revoke(ref,actor,authorize)；purge()。所有外部读取先检查owner并调用可信授权回调，解密只在内部授权后。私有内部解码供原Store恢复使用，不注册为模型工具。
 
-- [ ] 写AES-GCM密文、跨行AAD篡改、跨主体、TTL、游标篡改、删除、配额、重启与key轮换测试，运行观察缺失功能失败。
-- [ ] 在新模块内创建增量表，使用现有事务/锁；密钥环境引用、默认86400秒、单结果1MiB/深度32/节点65536/数组10000/文本256KiB，页32KiB、库64MiB；检查后写入，不静默截断。
-- [ ] metadata/page返回no raw storage URL、固定digest、UTF-8片段与签名游标；到期与删除无明文返回，清理不保证介质物理擦除。
-- [ ] 专项通过，提交。
+- [x] 写AES-GCM密文、跨行AAD篡改、跨主体、TTL、游标篡改、删除、配额、重启与key轮换测试，运行观察缺失功能失败。
+- [x] 在新模块内创建增量表，使用现有事务/锁；密钥环境引用、默认86400秒、单结果1MiB/深度32/节点65536/数组10000/文本256KiB，页32KiB、库64MiB；检查后写入，不静默截断。
+- [x] metadata/page返回no raw storage URL、固定digest、UTF-8片段与签名游标；到期与删除无明文返回，清理不保证介质物理擦除。
+- [x] 专项通过，提交。
 
 ## Task 2：原执行链和受控结果API
 
@@ -42,11 +42,11 @@ Files: app/runtime.py、store.py、plan_store.py、main.py、providers.py、cont
 
 Interfaces: Runtime沿用原构造签名，从settings.p2或AGENT_P2_POLICY可信JSON加载；Store通过私有_persist_tool_result/_restore_tool_result接入，不改已有公共方法参数。新增路由由独立install_result_routes(app,runtime,identify)注册；默认关闭时旧OpenAPI快照不变。
 
-- [ ] 先写旧execute完整data、完成后owner分页、工具/技能/触发撤销、与live run失效分离、重启读取和默认关闭API回归。
-- [ ] 写Durable成功调用恢复、前驱结果解析、聚合、旧明文步骤兼容、丢key或过期不重执行、失租不落结果测试。
-- [ ] ResultStore写入与complete_call同事务；调用缓存和步骤output仅存内部引用，原路径读取还原完整结果；终态按已确认TTL保留加密行，旧calls.result仍清理。新引用缺失时明确失败，不解释为无缓存。
-- [ ] 新GET任务结果清单/摘要/分页及DELETE原owner删除，逐页重验权限与版本；不改变旧Task响应。P1模型投影保留完整证据及受控分页入口。
-- [ ] 专项和原Worker/权限/API/P1回归通过，提交。
+- [x] 先写旧execute完整data、完成后owner分页、工具/技能/触发撤销、与live run失效分离、重启读取和默认关闭API回归。
+- [x] 写Durable成功调用恢复、前驱结果解析、聚合、旧明文步骤兼容、丢key或过期不重执行、失租不落结果测试。
+- [x] ResultStore写入与complete_call同事务；调用缓存和步骤output仅存内部引用，原路径读取还原完整结果；终态按已确认TTL保留加密行，旧calls.result仍清理。新引用缺失时明确失败，不解释为无缓存。
+- [x] 新GET任务结果清单/摘要/分页及DELETE原owner删除，逐页重验权限与版本；不改变旧Task响应。P1模型投影保留完整证据及受控分页入口。
+- [x] 专项和原Worker/权限/API/P1回归通过，提交。
 
 ## Task 3：有时效的只读缓存与single-flight
 

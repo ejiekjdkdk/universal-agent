@@ -34,6 +34,8 @@ from .skill_routes import install_skill_routes
 from .triggers import TriggerGateway
 from .trigger_routes import build_trigger_router
 from .evaluations import evaluate_release
+from .result_store import load_p2_policy
+from .result_routes import install_result_routes
 
 ROOT = Path(__file__).resolve().parents[1]
 API = "/api/v1/agent"
@@ -125,6 +127,9 @@ def create_app(*, scenarios=None, database=None, token=None, model_settings=None
         "model": os.getenv("AGENT_MODEL_NAME", "").strip(),
         "api_key": os.getenv("AGENT_MODEL_API_KEY", ""),
     }
+    p2_policy = load_p2_policy(model)
+    if p2_policy:
+        model = {**model, "p2": p2_policy}
     configured_token = token or os.getenv("AGENT_ACCESS_TOKEN")
     local_token = configured_token or secrets.token_urlsafe(32)
     service_token = os.getenv("AGENT_SERVICE_TOKEN")
@@ -224,6 +229,8 @@ def create_app(*, scenarios=None, database=None, token=None, model_settings=None
     install_observability_routes(app, runtime, admin)
     install_skill_routes(app, runtime, admin)
     app.include_router(build_trigger_router(lambda: runtime().triggers))
+    if "results" in p2_policy:
+        install_result_routes(app, runtime, identify)
 
     def allowed_task(actor, task_id):
         task = runtime().store.task(actor, task_id)

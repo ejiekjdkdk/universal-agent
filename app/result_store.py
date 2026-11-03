@@ -1,9 +1,11 @@
 """在原Store事务中加密保存完整工具结果，并提供受控、有时限的分页读取。"""
 import base64
+from datetime import datetime
 import hashlib
 import hmac
 import json
 import os
+from pathlib import Path
 import re
 import secrets
 import time
@@ -29,6 +31,24 @@ CREATE INDEX IF NOT EXISTS tool_results_expiry ON tool_results(expires_at);
 
 def _json(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def load_p2_policy(settings):
+    """只接受部署者提供的配置，用户请求和技能不能打开结果保留或共享缓存。"""
+    policy = settings.get("p2")
+    if policy is None:
+        path = os.getenv("AGENT_P2_POLICY")
+        if not path:
+            return {}
+        with Path(path).open("rb") as stream:
+            raw = stream.read(1048577)
+        if len(raw) > 1048576:
+            raise ValueError("P2配置超过大小上限")
+        from .catalog import _reject_duplicate_keys
+        policy = json.loads(raw, object_pairs_hook=_reject_duplicate_keys)
+    if not isinstance(policy, dict) or set(policy) - {"results", "read_cache"}:
+        raise ValueError("P2配置格式无效或存在未知字段")
+    return policy
 
 
 def _bounded(value):
@@ -80,9 +100,10 @@ class ResultStore:
             if not re.fullmatch(r"[a-fA-F0-9]{64}", encoded):
                 raise ValueError("结果密钥缺失或不是256位十六进制值")
             self.keys[key_id] = bytes.fromhex(encoded)
-        self.active_key = settings.get("active_key")
-        if not isinstance(self.active_key, str) or self.active_key not in self.keys:
+        active_key = settings.get("active_key")
+        if not isinstance(active_key, str) or active_key not in self.keys:
             raise ValueError("当前结果密钥未配置")
+        self.active_key: str = active_key
         limits = {}
         for name, default, low, high in (
             ("ttl_seconds", 86400, 60, 604800), ("max_bytes", 1048576, 1024, 4194304),
@@ -101,6 +122,10 @@ class ResultStore:
             for statement in SCHEMA.split(";"):
                 if statement.strip():
                     store._db.execute(statement)
+            finished = store._db.execute("SELECT DISTINCT t.task_id,t.finished_at FROM tasks t JOIN tool_results r USING(task_id) "
+                                         "WHERE t.finished_at IS NOT NULL").fetchall()
+            for task in finished:
+                self.finish_task(task["task_id"], datetime.fromisoformat(task["finished_at"]).timestamp())
 
     def put(self, task_id, result, provenance):
         raw = _bounded(result)
@@ -122,9 +147,8 @@ class ResultStore:
                     raise Fault("RESULT_CONFLICT", "已保存的执行结果不能被替换。", 409)
                 return existing[0]
             self.purge()
-            used = self.store._db.execute("SELECT COALESCE(SUM(byte_count),0) FROM tool_results").fetchone()[0]
-            if used + len(payload) > self.quota_bytes:
-                raise Fault("RESULT_QUOTA_EXCEEDED", "结果存储已达容量上限。", 503)
+            used = self.store._db.execute("SELECT COALESCE(SUM(length(ciphertext)+length(nonce)+length(CAST(metadata AS BLOB))),0) "
+                                          "FROM tool_results").fetchone()[0]
             now = time.time()
             ref = "res_" + secrets.token_hex(24)
             metadata = {"result_ref": ref, "task_id": task_id, "execution_id": execution_id,
@@ -133,12 +157,19 @@ class ResultStore:
                         "key_id": self.active_key,
                         "owner": {key: task[key] for key in ("tenant_id", "org_id", "user_id", "business_id")}}
             encoded = _json(metadata)
+            if used + len(payload) + 28 + len(encoded.encode()) > self.quota_bytes:
+                raise Fault("RESULT_QUOTA_EXCEEDED", "结果存储已达容量上限。", 503)
             nonce = secrets.token_bytes(12)
             ciphertext = AESGCM(self.keys[self.active_key]).encrypt(nonce, payload, encoded.encode())
             self.store._db.execute("INSERT INTO tool_results VALUES(?,?,?,?,?,?,?,?)",
                                    (ref, task_id, execution_id, metadata["expires_at"], len(payload), encoded, nonce, ciphertext))
             self.store._audit("result.store", "allow", dict(task), task_id, ref, None)
             return ref
+
+    def validate_output(self, output):
+        """在能力Schema处理前检查原输出结构，避免先遍历无限规模数据。"""
+        if len(_bounded(output)) > self.max_bytes:
+            raise Fault("RESULT_TOO_LARGE", "完整结果超过批准存储上限。", 502)
 
     def _row(self, ref):
         if not isinstance(ref, str) or not re.fullmatch(r"res_[a-f0-9]{48}", ref):
@@ -252,16 +283,23 @@ class ResultStore:
         with self.store._transaction():
             return self.store._db.execute("DELETE FROM tool_results WHERE expires_at<=?", (time.time(),)).rowcount
 
-    def finish_task(self, task_id):
+    def finish_task(self, task_id, completed_at=None):
         """终态保留期从完成时起算；重新认证元数据，不复活已过期或已删除的结果。"""
         with self.store._transaction():
             now = time.time()
             rows = self.store._db.execute("SELECT * FROM tool_results WHERE task_id=? AND expires_at>?",
                                           (task_id, now)).fetchall()
             for row in rows:
+                try:
+                    if "finished_at" in json.loads(row["metadata"]):
+                        continue
+                except (ValueError, TypeError):
+                    raise Fault("RESULT_INTEGRITY_ERROR", "结果元数据无效。", 502) from None
                 record = self._decode(row)
                 metadata = record["metadata"]
-                metadata["expires_at"] = now + self.ttl_seconds
+                finished_at = now if completed_at is None else completed_at
+                metadata["finished_at"] = finished_at
+                metadata["expires_at"] = finished_at + self.ttl_seconds
                 encoded = _json(metadata)
                 payload = _json({"result": record["result"], "provenance": record["provenance"]}).encode()
                 nonce = secrets.token_bytes(12)

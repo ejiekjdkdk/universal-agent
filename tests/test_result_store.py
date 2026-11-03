@@ -1,6 +1,7 @@
 """验证完整结果的加密、所有权、有效期、分页与持久化边界。"""
 import importlib
 import json
+from datetime import datetime
 
 import pytest
 
@@ -174,6 +175,9 @@ def test_retention_starts_at_task_completion(result_store, monkeypatch):
     record = results.load(ref)
     assert record["metadata"]["expires_at"] == created + 120 + 86400
     assert record["result"] == RESULT
+    monkeypatch.setattr(module().time, "time", lambda: created + 500)
+    results.finish_task(task_id)
+    assert results.load(ref)["metadata"]["expires_at"] == created + 120 + 86400
 
 
 def test_quota_rejection_keeps_existing_result(result_store):
@@ -185,6 +189,19 @@ def test_quota_rejection_keeps_existing_result(result_store):
         bounded.put(task_id, small, PROVENANCE)
     assert full.value.code == "RESULT_QUOTA_EXCEEDED"
     assert results.load(ref)["result"] == RESULT
+
+
+def test_startup_sets_retention_for_recovered_terminal_task(result_store, monkeypatch):
+    results, store, task_id, settings = result_store
+    clock = module().time.time
+    monkeypatch.setattr(module().time, "time", lambda: clock() - 3600)
+    ref = results.put(task_id, RESULT, PROVENANCE)
+    monkeypatch.setattr(module().time, "time", clock)
+    # 模拟Store启动恢复先完成任务、Runtime随后才加载结果库。
+    store.finish(task_id, "failed", {}, {"code": "TASK_INTERRUPTED"})
+    finished = datetime.fromisoformat(store.task(ACTOR, task_id)["finished_at"]).timestamp()
+    reopened = module().ResultStore(store, settings)
+    assert reopened.load(ref)["metadata"]["expires_at"] == finished + 86400
 
 
 def test_limits_and_idempotent_storage(result_store):
