@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import secrets
+import shutil
 import socket
 import subprocess
 import sys
@@ -64,6 +65,20 @@ def require(condition, message):
         raise RuntimeError(message)
 
 
+def remove_workspace(folder):
+    # Windows 虚拟环境启动器退出后，实际子进程可能仍在释放数据库文件。
+    deadline = time.monotonic() + 5
+    while True:
+        try:
+            shutil.rmtree(folder)
+            return
+        except PermissionError as error:
+            # 仅等待文件共享冲突；其他清理错误或持续占用必须报告给调用者。
+            if getattr(error, "winerror", None) != 32 or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.05)
+
+
 def verify(agent_root):
     require((agent_root / "run.py").is_file(), "--agent-root must contain run.py")
     require(not PROJECT.is_relative_to(agent_root) and not agent_root.is_relative_to(PROJECT),
@@ -74,7 +89,9 @@ def verify(agent_root):
     agent_url = f"http://127.0.0.1:{agent_port}"
     project_auth = {"Authorization": "Bearer " + project_token}
     agent_auth = {"Authorization": "Bearer " + agent_token}
-    with tempfile.TemporaryDirectory() as folder, ExitStack() as stack:
+    with ExitStack() as stack:
+        folder = tempfile.mkdtemp()
+        stack.callback(remove_workspace, folder)
         scratch = Path(folder)
         env = {**os.environ, "PROJECT_API_PORT": str(project_port), "AGENT_PORT": str(agent_port),
                "PROJECT_API_TOKEN": project_token, "AGENT_ACCESS_TOKEN": agent_token,
