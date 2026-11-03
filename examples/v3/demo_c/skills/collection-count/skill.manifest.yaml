@@ -1,0 +1,13 @@
+schema_version: "3.1"
+skill_id: collection-count
+version: "1.0.0"
+status: draft
+business_scopes: [demo_collections]
+required_capabilities: [demo.collection.count@1.0.0]
+input_schema_ref: schemas/input.schema.json
+output_schema_ref: schemas/output.schema.json
+resources: [references/usage.md]
+execution:
+  trust_level: instructions_only
+  allow_scripts: false
+  max_tool_calls: 4

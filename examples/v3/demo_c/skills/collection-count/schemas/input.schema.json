@@ -1,0 +1,1 @@
+{"additionalProperties":false,"properties":{"context":{"type":"object"},"message":{"minLength":1,"type":"string"}},"required":["message","context"],"type":"object"}

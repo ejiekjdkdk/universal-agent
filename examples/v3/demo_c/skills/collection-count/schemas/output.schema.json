@@ -1,0 +1,1 @@
+{"properties":{"answer":{"minLength":1,"type":"string"},"evidence":{"type":"array"}},"required":["answer","evidence"],"type":"object"}

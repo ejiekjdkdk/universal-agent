@@ -1,0 +1,30 @@
+{
+  "id": "demo_collections",
+  "version": "1.0.0",
+  "name": "虚构集合计数",
+  "description": "汇总授权集合中的虚构物品件数。",
+  "example": "统计授权集合的件数",
+  "offline_tool": "count_items",
+  "snapshot_files": ["collections.json"],
+  "tools": [{
+    "name": "count_items",
+    "description": "只汇总本次获准查看的集合，保留逐集合来源。",
+    "permission": "collections.read",
+    "action_level": "read",
+    "object_ids_field": "collection_ids",
+    "input_schema": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "text": {"type": "string", "minLength": 1, "maxLength": 16000},
+        "collection_ids": {"type": "array", "minItems": 1, "maxItems": 64, "uniqueItems": true, "items": {"type": "string"}}
+      },
+      "required": ["text", "collection_ids"]
+    },
+    "output_schema": {
+      "type": "object", "additionalProperties": false,
+      "properties": {"summary": {"type": "string"}, "total": {"type": "integer", "minimum": 0}},
+      "required": ["summary", "total"]
+    },
+    "adapter": {"type": "python", "handler": "count_items"}
+  }]
+}

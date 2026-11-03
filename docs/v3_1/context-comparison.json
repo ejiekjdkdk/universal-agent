@@ -1,0 +1,22 @@
+{
+  "status": "PASS",
+  "measurement": "synthetic_utf8_bytes_plus_envelope",
+  "before_estimate": 49155,
+  "after_estimate": 1165,
+  "omitted_item_ids": [
+    "history"
+  ],
+  "summary_refs": [
+    "demo-result"
+  ],
+  "evidence_before": 2,
+  "evidence_after": 2,
+  "source_result_sha256": "42f71450c343f04a0aa7d9d890911cc158fad9a192e9dcaec2fa5310a874aee9",
+  "source_result_unchanged": true,
+  "real_model_tokens": "NOT_RUN",
+  "latency_comparison": "NOT_RUN",
+  "limitations": [
+    "部分历史或过期内容未进入本轮模型输入。",
+    "部分工具明细以受控引用代替，证据与摘要已保留。"
+  ]
+}

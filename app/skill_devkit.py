@@ -3,6 +3,7 @@ import hashlib
 import hmac
 from importlib import metadata
 import json
+import multiprocessing
 import os
 from pathlib import Path
 import re
@@ -21,6 +22,7 @@ from .skills import SkillError, _dependencies, _identifier, _local, _mapping, _p
 MAX_FILE = 65536
 MAX_TOTAL = 2 * 1024 * 1024
 MAX_FILES = 128
+TEST_TIMEOUT_SECONDS = 10
 
 
 def _encode(value: object) -> bytes:
@@ -182,7 +184,46 @@ def validate_skill(directory: Path, capabilities: Iterable[str]) -> dict:
 def test_skill(directory: Path, capabilities: Iterable[str]) -> dict:
     directory = Path(directory)
     files = _files(directory)
-    package, manifest = _validate_bytes(directory.name, files, capabilities)
+    # Schema 的正则与引用可能耗时；隔离整个校验过程，超时后回收进程。
+    context = multiprocessing.get_context("spawn")
+    receiver, sender = context.Pipe(duplex=False)
+    worker = context.Process(target=_contract_worker, args=(directory.name, files, list(capabilities), sender), daemon=True)
+    try:
+        worker.start()
+        sender.close()
+        if not receiver.poll(TEST_TIMEOUT_SECONDS):
+            return {"status": "FAIL", "test_level": "contract", "cases": [],
+                    "semantic_quality": "NOT_RUN", "error": "VALIDATION_TIMEOUT"}
+        try:
+            return receiver.recv()
+        except EOFError:
+            return {"status": "FAIL", "test_level": "contract", "cases": [],
+                    "semantic_quality": "NOT_RUN", "error": "VALIDATION_WORKER_FAILED"}
+    finally:
+        if worker.pid is not None:
+            if worker.is_alive():
+                worker.terminate()
+            worker.join()
+        worker.close()
+        receiver.close()
+        sender.close()
+
+
+def _contract_worker(name: str, files: dict[str, bytes], capabilities: list[str], connection) -> None:
+    """只解析已捕获的包内容；结果通过私有管道返回，不执行技能脚本。"""
+    try:
+        report = _contract_report(name, files, capabilities)
+    except (ValueError, OSError, RecursionError):
+        report = {"status": "FAIL", "test_level": "contract", "cases": [],
+                  "semantic_quality": "NOT_RUN", "error": "VALIDATION_INVALID"}
+    try:
+        connection.send(report)
+    finally:
+        connection.close()
+
+
+def _contract_report(name: str, files: dict[str, bytes], capabilities: list[str]) -> dict:
+    package, manifest = _validate_bytes(name, files, capabilities)
     results = []
     seen = set()
     for path, raw in sorted(files.items()):

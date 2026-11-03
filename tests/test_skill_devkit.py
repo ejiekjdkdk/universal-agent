@@ -62,6 +62,21 @@ def test_contract_tests_report_failure_and_missing_cases_honestly(tmp_path):
     assert module.test_skill(path, [])["status"] == "NOT_RUN"
 
 
+def test_cli_contract_validation_has_bounded_runtime(tmp_path):
+    _, path = package(tmp_path)
+    schema = {"type": "string", "pattern": "^(a+)+$"}
+    (path / "schemas" / "input.schema.json").write_text(json.dumps(schema), encoding="utf-8")
+    for fixture in (path / "tests").glob("*.json"):
+        fixture.unlink()
+    case = [{"id": "slow-validation", "target": "input", "value": "a" * 40 + "!", "valid": False}]
+    (path / "tests" / "bounded.json").write_text(json.dumps(case), encoding="utf-8")
+    completed = subprocess.run([sys.executable, str(ROOT / "scripts" / "agent.py"), "skill", "test",
+                                str(path), "--offline"], capture_output=True, text=True, encoding="utf-8", timeout=20)
+    report = json.loads(completed.stdout)
+    assert completed.returncode == 1 and report["status"] == "FAIL"
+    assert report["error"] == "VALIDATION_TIMEOUT" and report["cases"] == []
+
+
 @pytest.mark.parametrize("name,content", [("scripts/run.py", "raise RuntimeError('不要执行')"),
                                           (".env", "PRIVATE=secret"),
                                           ("references/key.txt", "api_key: fictional-secret-value-123456"),

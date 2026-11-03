@@ -111,6 +111,7 @@ class ContextSession:
         self.snapshot_id = gateway.snapshot_id
         self.expires_at = context["expires_at"]
         self.items: list[ContextItem] = []
+        self.sources: list[tuple[str, str]] = []
         self.bytes_stored = 0
         self.limitations: list[str] = []
         values = []
@@ -125,7 +126,8 @@ class ContextSession:
             raise Fault("MODEL_NOT_CONFIGURED", "上下文预留超过本地窗口预算。", 503)
         self.tool_tokens = len(_json(tools).encode("utf-8")) + 128
 
-    def add(self, message: dict, source_kind: str, pinned: bool, *, summarize: bool = False) -> str:
+    def add(self, message: dict, source_kind: str, pinned: bool, *, summarize: bool = False,
+            capability: str | None = None, arguments: dict | None = None) -> str:
         raw = _json(message)
         self.bytes_stored += len(raw.encode("utf-8"))
         if self.bytes_stored > 4 * 1024 * 1024 or len(self.items) >= 128:
@@ -150,13 +152,32 @@ class ContextSession:
                 summary = _json({**message, "content": _json(compact)})
         self.items.append(ContextItem(ref, self.scope, self.snapshot_id, source_kind, tier, raw, pinned,
                                       self.expires_at, summary))
+        if capability is not None:
+            self.sources.append((capability, _json(arguments or {})))
         return ref
 
-    def read(self, ref: str) -> str:
+    def _authorized_context(self) -> dict:
+        """缓存不能延长原工具授权；同时复核固定版本、当前版本与对象范围。"""
         current = self.gateway.context()
         scope = tuple(current[key] for key in ("tenant_id", "org_id", "user_id", "business_id", "task_id"))
         if scope != self.scope or self.gateway.snapshot_id != self.snapshot_id:
             raise Fault("PERMISSION_DENIED", "上下文引用不属于当前任务。", 403)
+        for name, arguments in self.sources:
+            if name == "retrieve_knowledge":
+                self.gateway.check_skill_tool(current, name)
+                self.gateway.check(current, "knowledge.read", name)
+                if self.gateway.runtime.releases:
+                    self.gateway.runtime.releases.guard(self.snapshot_id, current["business_id"], name)
+                continue
+            tool = next((tool for tool in self.gateway.catalog.discover(current["business_id"])
+                         if tool["name"] == name), None)
+            if tool is None:
+                raise Fault("CAPABILITY_REVOKED", "上下文来源工具已不可用。", 403)
+            self.gateway.authorize_tool(tool, json.loads(arguments))
+        return current
+
+    def read(self, ref: str) -> str:
+        self._authorized_context()
         for entry in self.items:
             if entry.item_id != ref:
                 continue
@@ -167,7 +188,7 @@ class ContextSession:
         raise Fault("PERMISSION_DENIED", "上下文引用不可用。", 403)
 
     def compile(self) -> CompiledContext:
-        current = self.gateway.context()
+        current = self._authorized_context()
         scope = tuple(current[key] for key in ("tenant_id", "org_id", "user_id", "business_id", "task_id"))
         result = compile_context(self.items, scope=scope, snapshot_id=self.gateway.snapshot_id,
                                  input_budget=self.input_budget, tool_tokens=self.tool_tokens, now=time.time())

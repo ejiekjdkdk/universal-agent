@@ -359,7 +359,15 @@ async def _model_loop(complete, messages, gateway, max_rounds, max_calls, rates,
                 entry = await _tool_result(gateway, name, args, clean["id"], sources)
             messages.append(entry)
             if context_session is not None:
-                context_session.add(entry, "tool_result", True, summarize=name == "execute_capability")
+                capability = None
+                arguments = None
+                if name == "execute_capability":
+                    capability = args["name"]
+                    arguments = args["arguments"]
+                elif name == "retrieve_knowledge":
+                    capability = name
+                context_session.add(entry, "tool_result", True, summarize=name == "execute_capability",
+                                    capability=capability, arguments=arguments)
             if structured and name in ("execute_capability", "retrieve_knowledge"):
                 completed_read = True
                 data = json.loads(entry["content"])

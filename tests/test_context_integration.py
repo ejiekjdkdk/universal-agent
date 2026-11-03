@@ -79,6 +79,49 @@ def test_mock_result_matches_legacy_with_compiler_enabled(tmp_path):
     assert results[0] == results[1] and results[1]["status"] == "completed"
 
 
+@pytest.mark.parametrize("revocation", ["capability", "permission"])
+def test_cached_tool_source_rechecks_capability_and_permission(tmp_path, revocation):
+    app = create_app(database=tmp_path / "agent.db", token="reader", model_settings={})
+    with TestClient(app, base_url="http://localhost"):
+        runtime = app.state.runtime
+        actor = runtime.principals["reader"]
+        task, _ = runtime.store.start(actor, BODY, None, "1.0.0")
+        gateway = runtime.gateway(runtime.store.context_id(task["task_id"]))
+        result = asyncio.run(gateway.execute("notes_search", {"text": "会议纪要"}, "one"))
+        session = ContextSession(gateway, {}, [])
+        ref = session.add({"role": "tool", "tool_call_id": "one", "content": json.dumps(result)},
+                          "tool_result", True, capability="notes_search", arguments={"text": "会议纪要"})
+        assert session.read(ref) and session.compile().messages_json
+        if revocation == "capability":
+            runtime.releases.revoke_capability("notes", "notes_search", actor=actor)
+            expected = "CAPABILITY_REVOKED"
+        else:
+            actor["grants"]["notes"]["permissions"].remove("notes.read")
+            expected = "PERMISSION_DENIED"
+        for operation in (lambda: session.read(ref), session.compile):
+            with pytest.raises(Fault) as denied:
+                operation()
+            assert denied.value.code == expected
+
+
+def test_provider_records_result_source_before_next_compile(tmp_path, monkeypatch):
+    app = create_app(database=tmp_path / "agent.db", token="reader", model_settings={"context_compiler": True})
+    original_add = ContextSession.add
+
+    def revoke_after_result(session, *args, **kwargs):
+        ref = original_add(session, *args, **kwargs)
+        if kwargs.get("capability") == "notes_search":
+            runtime = session.gateway.runtime
+            runtime.releases.revoke_capability("notes", "notes_search", actor=runtime.principals["reader"])
+        return ref
+
+    monkeypatch.setattr(ContextSession, "add", revoke_after_result)
+    with TestClient(app, base_url="http://localhost") as client:
+        task = client.post(API + "/chat", headers=AUTH, json=BODY).json()
+        assert task["status"] == "failed" and task["error"]["code"] == "CAPABILITY_REVOKED"
+        assert len(task["tool_calls"]) == 1 and task["answer"] == ""
+
+
 @pytest.mark.parametrize("read_original", [False, True])
 def test_large_tool_input_is_referenced_without_changing_gateway_result(tmp_path, read_original, monkeypatch):
     from app.runtime import Gateway

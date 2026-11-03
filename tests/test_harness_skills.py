@@ -159,7 +159,8 @@ def test_fabricated_success_without_execution_is_rejected(tmp_path):
     assert run["error"]["code"] == "MISSING_EXECUTION_EVIDENCE" and not run["answer"] and not run["tool_calls"]
 
 
-def test_tool_description_injection_cannot_expand_skill_scope(tmp_path):
+@pytest.mark.parametrize("compiler_enabled", [False, True])
+def test_tool_description_injection_cannot_expand_skill_scope(tmp_path, compiler_enabled):
     folder = tmp_path / "scenarios" / "notes"
     shutil.copytree(ROOT / "scenarios" / "notes", folder)
     manifest = folder / "scenario.json"
@@ -181,6 +182,7 @@ def test_tool_description_injection_cannot_expand_skill_scope(tmp_path):
         return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "tool_calls": [call]}}]})
 
     config = {"base_url": "http://localhost", "model": "test", "transport": httpx.MockTransport(upstream)}
+    config["context_compiler"] = compiler_enabled
     app = create_app(scenarios=folder.parent, database=tmp_path / "agent.db", token="reader", model_settings=config)
     with TestClient(app, base_url="http://localhost") as client:
         publish(app.state.runtime, tmp_path, "search", ["notes_search"])

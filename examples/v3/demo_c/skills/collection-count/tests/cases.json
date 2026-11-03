@@ -1,0 +1,1 @@
+[{"id":"input-valid","target":"input","valid":true,"value":{"context":{},"message":"查询"}},{"id":"input-missing","target":"input","valid":false,"value":{}},{"id":"output-valid","target":"output","valid":true,"value":{"answer":"无资料","evidence":[]}}]
