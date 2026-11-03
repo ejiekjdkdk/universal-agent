@@ -1,0 +1,73 @@
+{
+  "id": "change_requests",
+  "name": "草案变更",
+  "description": "为个人模拟账本提交变更申请，由另一位本地用户复核。",
+  "version": "1.0.0",
+  "example": "将草案送交团队复核",
+  "tools": [
+    {
+      "name": "record_change",
+      "description": "审批后，在本地账本登记草案变更。",
+      "permission": "draft.propose",
+      "action_level": "commit_write",
+      "adapter": {
+        "type": "mock_ledger"
+      },
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "object_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "expected_version": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "value": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          }
+        },
+        "required": [
+          "object_id",
+          "value"
+        ],
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "summary": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          },
+          "object_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          },
+          "version": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "receipt_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          }
+        },
+        "required": [
+          "summary",
+          "object_id",
+          "version",
+          "receipt_id"
+        ],
+        "additionalProperties": false
+      }
+    }
+  ]
+}

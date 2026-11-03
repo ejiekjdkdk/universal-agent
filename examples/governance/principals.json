@@ -1,0 +1,34 @@
+[
+  {
+    "token_env": "AGENT_ACCESS_TOKEN",
+    "tenant_id": "personal",
+    "org_id": "local",
+    "user_id": "owner",
+    "grants": {
+      "change_requests": {
+        "permissions": [
+          "draft.propose"
+        ],
+        "objects": [
+          "draft-1"
+        ]
+      }
+    }
+  },
+  {
+    "token_env": "AGENT_APPROVER_TOKEN",
+    "tenant_id": "personal",
+    "org_id": "local",
+    "user_id": "reviewer",
+    "grants": {
+      "change_requests": {
+        "permissions": [
+          "approval.decide"
+        ],
+        "objects": [
+          "draft-1"
+        ]
+      }
+    }
+  }
+]
