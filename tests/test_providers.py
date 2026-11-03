@@ -151,3 +151,25 @@ def test_valid_citation_cannot_link_to_fabricated_source():
     with pytest.raises(Fault) as error:
         run(Gateway(), lambda _: next(replies))
     assert error.value.code == "MODEL_INVALID_RESPONSE"
+
+
+@pytest.mark.parametrize("usage,valid", [
+    ({"prompt_tokens": 100, "completion_tokens": 25, "total_tokens": 125, "diagnostics": "private-upstream"}, True),
+    (None, False), ({"prompt_tokens": True, "completion_tokens": 3}, False),
+    ({"prompt_tokens": 11, "completion_tokens": -1}, False),
+    ({"prompt_tokens": 11, "completion_tokens": 2, "total_tokens": 14}, False),
+])
+def test_model_usage_is_numeric_and_optional_without_changing_answer(usage, valid):
+    gw = Gateway()
+    response = completion("OK").json()
+    response["usage"] = usage
+    assert run(gw, lambda _: httpx.Response(200, json=response),
+               input_usd_per_million="2", output_usd_per_million="4") == "OK"
+    recorded = [data for event, data in gw.events if event == "model_usage"]
+    if valid:
+        assert len(recorded) == 1 and recorded[0]["round"] == 1
+        assert recorded[0]["prompt_tokens"] == 100 and recorded[0]["completion_tokens"] == 25
+        assert recorded[0]["estimated_cost_usd"] == pytest.approx(.0003)
+        assert "private-upstream" not in json.dumps(gw.events)
+    else:
+        assert recorded == []

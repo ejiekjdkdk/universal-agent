@@ -3,6 +3,8 @@
 import asyncio
 import ipaddress
 import json
+import math
+import os
 import re
 
 import httpx
@@ -79,7 +81,8 @@ async def _completion(client, url, model, messages):
                 raise _limit()
             raw.extend(piece)
     try:
-        choice = json.loads(raw)["choices"][0]
+        body = json.loads(raw)
+        choice = body["choices"][0]
         msg = choice["message"]
         if not isinstance(msg, dict) or msg.get("role") != "assistant":
             raise _invalid_reply()
@@ -90,7 +93,7 @@ async def _completion(client, url, model, messages):
             raise _invalid_reply()
         if choice.get("finish_reason") not in (None, "stop", "tool_calls"):
             raise _invalid_reply()
-        return msg
+        return msg, body.get("usage")
     except (ValueError, IndexError, KeyError, TypeError, RecursionError):
         raise _invalid_reply() from None
 
@@ -158,11 +161,39 @@ def _budget(settings, name, default, maximum):
     return value
 
 
-async def _model_loop(client, url, model, messages, gateway, max_rounds, max_calls):
+def _price(settings, key):
+    value = settings.get(key, os.getenv("AGENT_MODEL_" + key.upper()))
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        return None
+    try:
+        rate = float(value)
+    except (OverflowError, ValueError):
+        return None
+    return rate if math.isfinite(rate) and 0 <= rate <= 1_000_000 else None
+
+
+def _record_usage(gateway, round_no, usage, rates):
+    if not isinstance(usage, dict):
+        return
+    prompt, completion = usage.get("prompt_tokens"), usage.get("completion_tokens")
+    if any(type(n) is not int or not 0 <= n <= 2**31 - 1 for n in (prompt, completion)):
+        return
+    total = usage.get("total_tokens", prompt + completion)
+    if type(total) is not int or total != prompt + completion:
+        return
+    cost = None
+    if None not in rates:
+        cost = (prompt * rates[0] + completion * rates[1]) / 1_000_000
+    gateway.trace("model_usage", {"round": round_no, "prompt_tokens": prompt, "completion_tokens": completion,
+                                  "estimated_cost_usd": cost, "cost_basis": "operator_rates_per_million" if cost is not None else None})
+
+
+async def _model_loop(client, url, model, messages, gateway, max_rounds, max_calls, rates):
     seen, sources = set(), {}
     for round_no in range(1, max_rounds + 1):
         gateway.trace("model_round", {"round": round_no})
-        reply = await _completion(client, url, model, messages)
+        reply, usage = await _completion(client, url, model, messages)
+        _record_usage(gateway, round_no, usage, rates)
         calls = reply.get("tool_calls")
         if calls is not None and not isinstance(calls, list):
             raise _invalid_reply()
@@ -225,7 +256,8 @@ async def run_provider(mode, scenario: dict, message: str, history: list[dict], 
             headers=headers, transport=settings.get("transport"), trust_env=False,
             follow_redirects=False, timeout=httpx.Timeout(30, connect=5),
         ) as client:
-            return await _model_loop(client, url, model, messages, gateway, max_rounds, max_calls)
+            rates = (_price(settings, "input_usd_per_million"), _price(settings, "output_usd_per_million"))
+            return await _model_loop(client, url, model, messages, gateway, max_rounds, max_calls, rates)
     except (TimeoutError, httpx.TimeoutException):
         raise Fault("MODEL_TIMEOUT", "模型请求超时。", 504, True) from None
     except httpx.RequestError:

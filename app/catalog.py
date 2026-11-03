@@ -36,6 +36,7 @@ TOOL = _object({
     "object_ids_field": _string(128),
     "adapter": {"oneOf": [
         _object({"type": {"const": "python"}, "handler": ID}),
+        _object({"type": {"const": "mock_ledger"}}),
         _object({"type": {"const": "http"}, "url": _string(2048), "method": {"enum": ["POST", "GET"]}}),
     ]},
 }, ["name", "description", "action_level", "permission", "input_schema", "output_schema", "adapter"])
@@ -173,7 +174,8 @@ async def _call_http(config, arguments, transport):
 
 
 class Catalog:
-    def __init__(self, root: Path, *, http_transport=None):
+    def __init__(self, root: Path, *, http_transport=None, adapter_sources=None):
+        self._adapter_sources = adapter_sources
         self.scenarios = {}
         self.entries = self.scenarios
         self._tools = {}
@@ -228,12 +230,26 @@ class Catalog:
             config = tool["adapter"]
             if config["type"] == "http":
                 _check_url(config["url"])
+            elif config["type"] == "mock_ledger":
+                if tool["action_level"] != "commit_write":
+                    raise ValueError("mock_ledger requires commit_write")
+                for key, fields in (("input_schema", {"object_id": "string", "expected_version": "integer", "value": "string"}),
+                                    ("output_schema", {"summary": "string", "object_id": "string", "version": "integer", "receipt_id": "string"})):
+                    schema = tool[key]
+                    types = {k: v.get("type") for k, v in schema.get("properties", {}).items()}
+                    required = set(schema.get("required", []))
+                    expected = set(fields)
+                    valid_required = required == expected or (key == "input_schema" and required == expected - {"expected_version"})
+                    if types != fields or not valid_required:
+                        raise ValueError(f"mock_ledger requires its fixed {key} fields")
             else:
                 if module is None:
                     file = _local_file(directory, "adapter.py")
                     spec = importlib.util.spec_from_file_location(f"scenario_{sid}", file)
                     module = importlib.util.module_from_spec(spec)
-                    spec.loader.exec_module(module)
+                    # Execute reviewed source, never an adjacent or unchecked cached .pyc.
+                    source = file.read_bytes() if self._adapter_sources is None else self._adapter_sources[sid]
+                    exec(compile(source, str(file), "exec"), module.__dict__)
                 handler = getattr(module, config["handler"], None)
                 if not callable(handler):
                     raise ValueError(f"missing adapter handler for {name}")

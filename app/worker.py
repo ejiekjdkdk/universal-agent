@@ -10,6 +10,7 @@ from uuid import uuid4
 from dotenv import load_dotenv
 
 from .catalog import Catalog
+from .approvals import mock_tool
 from .errors import Fault
 from .plans import resolve_arguments
 from .runtime import Gateway, Runtime
@@ -18,15 +19,6 @@ from .store import Store
 
 LOG = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parents[1]
-
-
-def personal_actor(catalog):
-    grants = {}
-    for sid in catalog.scenarios:
-        permissions = {tool["permission"] for tool in catalog.discover(sid)}
-        permissions.add("knowledge.read")
-        grants[sid] = {"permissions": sorted(permissions)}
-    return {"tenant_id": "personal", "org_id": "local", "user_id": "owner", "grants": grants}
 
 
 class PlanWorker:
@@ -47,6 +39,10 @@ class PlanWorker:
                 gateway = Gateway(self.runtime, claim["run_context_id"], catalog=catalog, lease=claim)
                 step = claim["step"]
                 args = resolve_arguments(step, claim["outputs"])
+                ledger = mock_tool(catalog, claim["business_id"], step["capability_id"])
+                if ledger:
+                    self.store.process_mock_write(self.runtime, claim, ledger, args)
+                    return
                 result = await gateway.execute(step["capability_id"], args, "plan." + claim["step_id"])
                 gateway.context()
                 self.store.settle_step(claim, result=result)
@@ -101,13 +97,21 @@ class PlanWorker:
 
 
 async def main():
+    from .identities import check_credentials, local_principals, role_source
+    from .releases import Releases
     load_dotenv(ROOT / ".env")
     database = Path(os.getenv("AGENT_DATABASE") or ROOT / "var" / "agent.db")
     catalog = Catalog(Path(os.getenv("AGENT_SCENARIOS") or ROOT / "scenarios"))
     store = Store(database, recover_reactive=False)
     try:
-        rt = Runtime(catalog, store, {"worker": personal_actor(catalog)}, {})
-        await PlanWorker(rt, Snapshots(database, catalog)).run()
+        actors = local_principals(catalog, "local-worker-identity")
+        check_credentials(actors, os.getenv("AGENT_ADMIN_TOKEN"), os.getenv("AGENT_SERVICE_TOKEN"))
+        rt = Runtime(catalog, store, actors, {})
+        rt.role_source = role_source(catalog, "local-worker-identity", None,
+                                     os.getenv("AGENT_ADMIN_TOKEN"), os.getenv("AGENT_SERVICE_TOKEN"))
+        snapshots = Snapshots(database, catalog)
+        rt.bind_releases(Releases(store, snapshots), snapshots)
+        await PlanWorker(rt, snapshots).run()
     finally:
         store.close()
 

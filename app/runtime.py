@@ -26,10 +26,12 @@ class Gateway:
     def __init__(self, runtime, run_id, *, catalog=None, lease=None):
         self.runtime = runtime
         self.store = runtime.store
-        self.catalog = catalog or runtime.catalog
         self.lease = lease
         self.run_id = run_id
-        self.task_id = self.store.run(run_id)["task_id"]
+        ctx = self.store.run(run_id)
+        self.task_id = ctx["task_id"]
+        self.snapshot_id = lease["snapshot_id"] if lease else self.store.task_snapshot(self.task_id)
+        self.catalog = catalog or runtime.release_catalog(self.snapshot_id, ctx["business_id"])
         self.evidence = {}
 
     def trace(self, event, data):
@@ -40,6 +42,8 @@ class Gateway:
     def context(self):
         context = self.store.run(self.run_id)
         self.runtime.authorize_task(context, context["business_id"], self.task_id)
+        if self.runtime.releases:
+            self.runtime.releases.guard(self.snapshot_id, context["business_id"])
         return context
 
     def check(self, ctx, permission, resource):
@@ -54,8 +58,21 @@ class Gateway:
     async def discover(self):
         ctx = self.context()
         permissions = self.runtime.grant(ctx, ctx["business_id"])["permissions"]
-        tools = [tool for tool in self.catalog.discover(ctx["business_id"])
-                 if tool["permission"] in permissions and tool["action_level"] in ("read", "propose_write")]
+        tools = []
+        for tool in self.catalog.discover(ctx["business_id"]):
+            if tool["permission"] not in permissions or tool["action_level"] not in ("read", "propose_write"):
+                continue
+            if self.runtime.releases:
+                try:
+                    self.runtime.releases.guard(self.snapshot_id, ctx["business_id"], tool["name"])
+                except Fault as exc:
+                    if exc.code == "CAPABILITY_REVOKED":
+                        continue
+                    raise
+                current = self.runtime.releases.current_tool(ctx["business_id"], ctx, "", tool["name"])
+                if not current or current["permission"] not in permissions or current["action_level"] != tool["action_level"]:
+                    continue
+            tools.append(tool)
         self.trace("tools_discovered", {"tools": [tool["name"] for tool in tools]})
         return tools
 
@@ -73,25 +90,26 @@ class Gateway:
         self.trace("knowledge_retrieved", {"source_ids": [r["source_id"] for r in hits], "query": preview(query)})
         return hits
 
-    async def execute(self, name, arguments, call_id):
+    def authorize_tool(self, tool, arguments):
         ctx = self.context()
         sid = ctx["business_id"]
-        tools = self.catalog.discover(sid)
-        tool = next((item for item in tools if item["name"] == name), None)
-        if tool is None:
-            self.store.audit("execute", "deny", ctx, self.task_id, name, "CAPABILITY_NOT_FOUND")
-            raise Fault("CAPABILITY_NOT_FOUND", "场景中没有此工具", 404)
+        name = tool["name"]
         self.check(ctx, tool["permission"], name)
         if tool["action_level"] not in ("read", "propose_write"):
             raise Fault("ACTION_NOT_ALLOWED", "当前版本仅允许读取或生成草稿", 403)
         if not isinstance(arguments, dict) or len(json.dumps(arguments, ensure_ascii=False)) > 32000:
             raise Fault("SCHEMA_VALIDATION_FAILED", "工具参数无效", 422)
         live_tool = None
-        if self.lease:
+        if self.runtime.releases:
+            self.runtime.releases.guard(self.snapshot_id, sid, name)
+            live_tool = self.runtime.releases.current_tool(sid, ctx, "", name)
+        elif self.lease:
             live_tool = next((t for t in self.runtime.catalog.discover(sid) if t["name"] == name), None)
-            if not live_tool or live_tool["action_level"] != "read" or tool["action_level"] != "read":
-                raise Fault("CAPABILITY_REVOKED", "当前场景已撤销此只读能力", 403)
-            self.check(ctx, live_tool["permission"], name)
+        if self.lease or self.runtime.releases:
+            if not live_tool or live_tool["action_level"] != tool["action_level"]:
+                raise Fault("CAPABILITY_REVOKED", "当前场景已撤销此能力", 403)
+            if live_tool["permission"] != tool["permission"]:
+                self.check(ctx, live_tool["permission"], name)
         fields = {t["object_ids_field"] for t in (tool, live_tool) if t and t.get("object_ids_field")}
         for field in fields:
             ids = arguments.get(field)
@@ -100,6 +118,15 @@ class Gateway:
             if not ids or not set(ids).issubset(ctx["object_ids"]):
                 self.store.audit("object_access", "deny", ctx, self.task_id, name, "PERMISSION_DENIED")
                 raise Fault("PERMISSION_DENIED", "请求的对象超出了本次任务范围", 403)
+
+    async def execute(self, name, arguments, call_id):
+        ctx = self.context()
+        sid = ctx["business_id"]
+        tool = next((t for t in self.catalog.discover(sid) if t["name"] == name), None)
+        if tool is None:
+            self.store.audit("execute", "deny", ctx, self.task_id, name, "CAPABILITY_NOT_FOUND")
+            raise Fault("CAPABILITY_NOT_FOUND", "场景中没有此工具", 404)
+        self.authorize_tool(tool, arguments)
         version = tool.get("version", self.catalog.scenarios[sid]["version"])
         execution_id, cached = self.store.begin_call(
             self.task_id, call_id, name, version, arguments,
@@ -117,14 +144,12 @@ class Gateway:
                 async with self.runtime.slots:
                     for attempt in range(2):
                         try:
-                            self.check(self.context(), tool["permission"], name)
-                            if live_tool and live_tool["permission"] != tool["permission"]:
-                                self.check(self.context(), live_tool["permission"], name)
+                            self.authorize_tool(tool, arguments)
                             def authorize_retrieval():
                                 self.check(self.context(), "knowledge.read", "retrieve_knowledge")
                             output = await self.catalog.execute(sid, name, arguments,
                                                                 authorize_retrieval=authorize_retrieval)
-                            self.check(self.context(), tool["permission"], name)
+                            self.authorize_tool(tool, arguments)
                             break
                         except Fault as exc:
                             if attempt or not exc.retryable or tool["action_level"] != "read":
@@ -155,11 +180,26 @@ class Gateway:
 class Runtime:
     def __init__(self, catalog, store, principals, settings):
         self.catalog, self.store = catalog, store
-        self.principals, self.settings = principals, settings
+        self._principals, self.settings = principals, settings
+        self.role_source = None
         self.workers = {}
         self.gateways = {}
         self.slots = asyncio.Semaphore(8)
         self.tool_timeout = 20
+        self.releases = None
+        self.snapshots = None
+
+    def bind_releases(self, releases, snapshots):
+        self.releases = releases
+        self.snapshots = snapshots
+        self.store.release_guard = releases.guard
+
+    @property
+    def principals(self):
+        return self.role_source() if self.role_source else self._principals
+
+    def release_catalog(self, snapshot_id, scene_id):
+        return self.snapshots.open(snapshot_id, scene_id) if snapshot_id and self.snapshots else self.catalog
 
     def grant(self, identity, scenario):
         for principal in self.principals.values():
@@ -203,7 +243,7 @@ class Runtime:
             gw = Gateway(self, run_id)
             self.gateways[run_id] = gw
             mode = body["mode"]
-            scene = self.catalog.scenarios[body["business_id"]]
+            scene = gw.catalog.scenarios[body["business_id"]]
             gw.trace("planner_started", {"mode": mode, "scenario": scene["id"], "version": scene["version"]})
             scope = gw.context()
             allowed_types = [scope["object_type"]] if scope["object_type"] else self.grant(identity, body["business_id"]).get("resource_types", [])

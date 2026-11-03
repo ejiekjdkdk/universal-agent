@@ -92,6 +92,18 @@
                 "type": "object",
                 "properties": {
                   "type": {
+                    "const": "mock_ledger"
+                  }
+                },
+                "additionalProperties": false,
+                "required": [
+                  "type"
+                ]
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
                     "const": "http"
                   },
                   "url": {

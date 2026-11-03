@@ -14,7 +14,10 @@ const labels = {
   step_suspended: "步骤已挂起", step_skipped: "步骤已跳过", step_cancelled: "步骤已取消",
   task_partial: "任务部分完成", model_tool_call: "模型请求工具", provider_selected: "选择规划器"
 };
-const statuses = {completed: "已完成", failed: "失败", cancelled: "已取消", running: "运行中", partial: "部分完成"};
+Object.assign(labels, {approval_required: "等待审批", approval_decided: "已记录审批决定",
+  mock_commit_verified: "模拟账本已确认", mock_commit_unknown: "模拟提交待查证"});
+const statuses = {completed: "已完成", failed: "失败", cancelled: "已取消", running: "运行中", partial: "部分完成",
+  waiting_approval: "等待审批", outcome_unknown: "结果待查证"};
 const stepStatuses = {...statuses, blocked: "等待依赖", ready: "已就绪", leased: "已领取",
   succeeded: "已完成", skipped: "已跳过", suspended: "已挂起"};
 function element(tag, content, cls) {
@@ -77,7 +80,7 @@ function drawTrace(entry) {
 }
 function showResult(run) {
   state.task = run.task_id;
-  state.running = run.status === "running";
+  state.running = ["running", "waiting_approval"].includes(run.status);
   $("cancel").hidden = !state.running;
   state.session = run.session_id;
   $("taskid").textContent = run.task_id;
@@ -164,6 +167,8 @@ async function history() {
 async function select(scene) {
   resetView();
   state.scene = scene;
+  $("objectScope").hidden = !scene.default_object;
+  $("objectId").value = scene.default_object || "";
   $("executionOptions").hidden = !scene.durable_plan;
   $("executionMode").value = scene.durable_plan ? "durable_plan" : "reactive";
   $("title").textContent = scene.name;
@@ -224,6 +229,9 @@ $("ask").onsubmit = async e => {
   notice(); showBusy(true);
   try {
     const body = {business_id: state.scene.id, session_id: state.session, message: $("question").value, mode: $("mode").value, response_mode: "streaming"};
+    if (!$("objectScope").hidden && $("objectId").value.trim()) {
+      body.context = {object_ids: [$("objectId").value.trim()]};
+    }
     if (state.scene.durable_plan && $("executionMode").value === "durable_plan") {
       body.execution_mode = "durable_plan";
       body.mode = "offline";
@@ -237,6 +245,10 @@ $("ask").onsubmit = async e => {
       $("cancel").hidden = !state.running;
       if (body.execution_mode === "durable_plan" && entry.event === "plan_validated") loadPlan(state.task, view, true);
       if (entry.event === "message_delta") $("answer").textContent = entry.data.delta;
+      if (entry.event === "approval_required") {
+        $("status").textContent = "等待审批";
+        $("answer").textContent = "提案已提交，请审批人在独立的审批队列中复核。";
+      }
     });
     if (state.task) await openTask(state.task);
   } catch (error) {

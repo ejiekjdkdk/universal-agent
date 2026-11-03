@@ -98,6 +98,9 @@ class PlanStore:
                     "result_contract": p["result_contract"], "steps": steps}
 
     def _change_step(self, task_id, step_id, status, error=None, result=None):
+        if status == "failed":
+            self._db.execute("""UPDATE approvals SET commit_status='failed' WHERE task_id=? AND step_id=?
+                                AND status='approved' AND commit_status='not_started'""", (task_id, step_id))
         self._db.execute("""UPDATE plan_steps SET status=?,error=?,output=?,lease_owner=NULL,lease_until=NULL
                             WHERE task_id=? AND step_id=?""",
                          (status, _dump(error) if error else None, _dump(result) if result is not None else None,
@@ -116,8 +119,9 @@ class PlanStore:
         self._event(task_id, kind, payload)
 
     def _interrupt_plan(self, task_id, status):
+        self._cancel_approvals(task_id)
         for row in self._steps(task_id):
-            if row["status"] in ACTIVE | {"blocked", "ready"}:
+            if row["status"] in ACTIVE | {"blocked", "ready", "waiting_approval"}:
                 self._change_step(task_id, row["step_id"], "cancelled" if status == "cancelled" else "skipped")
         self._db.execute("UPDATE plan_steps SET output=NULL WHERE task_id=? AND output IS NOT NULL", (task_id,))
 
@@ -154,6 +158,7 @@ class PlanStore:
 
     def _advance(self, p, now):
         task_id = p["task_id"]
+        self._expire_approvals(task_id, now)
         rows = self._steps(task_id)
         states = {r["step_id"]: r["status"] for r in rows}
         for r in rows:
@@ -161,10 +166,13 @@ class PlanStore:
                 continue
             call = self._db.execute("""SELECT status,error FROM calls WHERE task_id=? AND call_id=?""",
                                     (task_id, "plan." + r["step_id"])).fetchone()
+            prior_proposal = self._db.execute("""SELECT proposal_token FROM approvals WHERE task_id=? AND step_id=?
+                AND status='approved'""", (task_id, r["step_id"])).fetchone()
+            attempt = r["token"] - (prior_proposal[0] if prior_proposal else 0)
             if call and call["status"] == "failed":
                 # A committed denial or schema error must keep its original classification after a crash.
                 error = json.loads(call["error"])
-            elif r["token"] < MAX_ATTEMPTS or (r["token"] == MAX_ATTEMPTS and call and call["status"] == "completed"):
+            elif attempt < MAX_ATTEMPTS or (attempt == MAX_ATTEMPTS and call and call["status"] == "completed"):
                 # At the attempt limit, only a committed result can receive a final cache-only lease.
                 continue
             else:
@@ -204,19 +212,23 @@ class PlanStore:
             return
         if all(r["status"] in {"succeeded", "failed", "skipped"} for r in rows):
             self._aggregate(task_id, rows)
+        elif any(r["status"] == "waiting_approval" for r in rows) and not any(r["status"] in ACTIVE | {"ready"} for r in rows):
+            self._db.execute("UPDATE tasks SET status='waiting_approval' WHERE task_id=?", (task_id,))
 
     def claim_step(self, worker_id, lease_seconds):
         if not worker_id or not lease_seconds > 0:
             raise ValueError("worker_id and positive lease duration are required")
         with self._lock:
-            active_plan = self._db.execute("""SELECT 1 FROM plans JOIN tasks USING(task_id)
-                WHERE tasks.status='running' LIMIT 1""").fetchone()
+            active_plan = self._db.execute("""SELECT 1 FROM plans p JOIN tasks t USING(task_id)
+                WHERE t.status='running' OR (t.status='waiting_approval' AND
+                (p.deadline<=? OR EXISTS(SELECT 1 FROM approvals a WHERE a.task_id=p.task_id
+                AND a.status='requested' AND a.expires<=?))) LIMIT 1""", (time.time(), time.time())).fetchone()
         if not active_plan:
             return None
         with self._transaction():
             now = time.time()
             plans = self._db.execute("""SELECT p.* FROM plans p JOIN tasks t USING(task_id)
-                WHERE t.status='running' ORDER BY t.rowid""").fetchall()
+                WHERE t.status IN ('running','waiting_approval') ORDER BY t.rowid""").fetchall()
             for p in plans:
                 tid = p["task_id"]
                 self._advance(p, now)
@@ -233,11 +245,14 @@ class PlanStore:
                     key = (tid, r["step_id"])
                     self._db.execute("""UPDATE plan_steps SET status='leased',token=?,lease_owner=?,lease_until=?
                         WHERE task_id=? AND step_id=?""", (token, worker_id, min(now + lease_seconds, p["deadline"]), *key))
-                    if token > 1:
+                    if r["status"] in ACTIVE:
                         self._event(tid, "step_retrying", {"step_id": r["step_id"], "attempt": min(token, MAX_ATTEMPTS),
                                                           "error_code": "LEASE_EXPIRED"})
-                    recovery_only = token > MAX_ATTEMPTS
-                    attempt = min(token, MAX_ATTEMPTS)
+                    proposal = self._db.execute("""SELECT proposal_token FROM approvals WHERE task_id=? AND step_id=?
+                        AND status='approved'""", key).fetchone()
+                    operation_attempt = token - (proposal[0] if proposal else 0)
+                    recovery_only = operation_attempt > MAX_ATTEMPTS
+                    attempt = min(operation_attempt, MAX_ATTEMPTS)
                     self._event(tid, "step_leased", {"step_id": r["step_id"], "attempt_no": attempt,
                                                       "recovery_only": recovery_only})
                     return {"task_id": tid, "step_id": r["step_id"], "token": token, "attempt_no": attempt,

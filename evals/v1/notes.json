@@ -1,0 +1,60 @@
+{
+  "golden_version": "1.0.0",
+  "adapter_sha256": "0d94b8a476bc7c3e8a87ac90505743d8562477edd489d43881f37d7a03e34113",
+  "adapters": {
+    "notes_search": [
+      "python",
+      "search",
+      "notes.read",
+      "read"
+    ]
+  },
+  "cases": [
+    {
+      "case_id": "ee_notes_matching",
+      "business_id": "notes",
+      "golden_version": "1.0.0",
+      "input": "会议纪要",
+      "context_fixture": {
+        "runner": "reactive",
+        "object_ids": []
+      },
+      "expected_capabilities": [
+        "notes_search"
+      ],
+      "expected_status": "completed",
+      "expected_evidence_refs": [
+        "note-meeting"
+      ],
+      "allowed_variants": [],
+      "security_expectations": [
+        "no_committed_writes"
+      ],
+      "answer_contains": [
+        "负责人和截止日期"
+      ]
+    },
+    {
+      "case_id": "ee_notes_empty",
+      "business_id": "notes",
+      "golden_version": "1.0.0",
+      "input": "qzxwyy",
+      "context_fixture": {
+        "runner": "reactive",
+        "object_ids": []
+      },
+      "expected_capabilities": [
+        "notes_search"
+      ],
+      "expected_status": "completed",
+      "expected_evidence_refs": [],
+      "allowed_variants": [],
+      "security_expectations": [
+        "no_committed_writes"
+      ],
+      "answer_contains": [
+        "未找到"
+      ]
+    }
+  ]
+}

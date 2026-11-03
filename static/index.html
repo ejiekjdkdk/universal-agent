@@ -5,7 +5,7 @@
 <title>Universal Agent · 本地工作台</title><link rel="stylesheet" href="/static/style.css">
 <script defer src="/static/app.js"></script>
 </head><body>
-<header><div class="brand"><span class="mark">U</span><strong>Universal Agent</strong></div><span class="local"><i></i> 本地工作台</span></header>
+<header><div class="brand"><span class="mark">U</span><strong>Universal Agent</strong></div><div><a href="/review" target="_blank" rel="noopener">审批队列</a> <span class="local"><i></i> 本地工作台</span></div></header>
 <main>
 <aside><div class="kicker">WORKSPACE</div><h2>场景</h2><div id="scenes"></div>
 <div class="rail-title"><h2>最近运行</h2><button id="refresh" class="link">刷新</button></div><div id="history"></div></aside>
@@ -14,7 +14,8 @@
 <form id="ask"><div class="toolbar"><label for="question">输入问题或文本</label><div class="mode-options">
 <label id="executionOptions" hidden>执行方式 <select id="executionMode"><option value="reactive">即时执行</option><option value="durable_plan">持久化计划</option></select></label>
 <select id="mode" aria-label="规划器"><option value="offline">离线演示</option><option value="openai">模型模式</option></select></div></div>
-<p id="planHint" hidden>按场景预设的只读步骤执行，可从最近运行查看进度。</p>
+<p id="planHint" hidden>按场景计划执行。需要人工审批时可以在独立审批窗口处理。</p>
+<label id="objectScope" hidden>本次对象 ID <input id="objectId" maxlength="128"></label>
 <textarea id="question" maxlength="16000" required rows="5" placeholder="输入你想处理的内容…"></textarea>
 <div class="actions"><button type="button" class="link" id="example">使用示例</button><span class="spacer"></span><button type="button" id="cancel" hidden>取消运行</button><button id="submit" class="primary">运行 ↗</button></div></form>
 <p id="notice" role="status"></p>

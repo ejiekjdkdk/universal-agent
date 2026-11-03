@@ -23,7 +23,13 @@ from .runtime import Runtime
 from .store import Store
 from .plans import prepare_plan
 from .snapshots import Snapshots
-from .worker import PlanWorker, personal_actor
+from .worker import PlanWorker
+from .identities import check_credentials, local_principals, role_source
+from .releases import Releases
+from .release_routes import install_release_routes
+from .approval_routes import install_approval_routes
+from .observability import install_observability_routes
+from .evaluations import evaluate_release
 
 ROOT = Path(__file__).resolve().parents[1]
 API = "/api/v1/agent"
@@ -116,6 +122,7 @@ def create_app(*, scenarios=None, database=None, token=None, model_settings=None
     configured_token = token or os.getenv("AGENT_ACCESS_TOKEN")
     local_token = configured_token or secrets.token_urlsafe(32)
     service_token = os.getenv("AGENT_SERVICE_TOKEN")
+    admin_token = os.getenv("AGENT_ADMIN_TOKEN")
     model_ready = bool(model.get("base_url") and model.get("model"))
     bursts = defaultdict(deque)
 
@@ -130,12 +137,18 @@ def create_app(*, scenarios=None, database=None, token=None, model_settings=None
         run_here = worker_mode == "embedded" if embedded_worker is None else embedded_worker
         if principals is not None and not run_here:
             raise ValueError("Use the embedded worker for custom in-process principals.")
+        actors = local_principals(catalog, local_token, principals)
+        check_credentials(actors, admin_token, service_token)
+        if os.getenv("AGENT_REAL_WRITES", "0") != "0":
+            raise ValueError("This release supports only the local mock ledger")
         app.state.snapshots = Snapshots(db_path, catalog)
         store = Store(db_path)
-        actors = principals if principals is not None else {local_token: personal_actor(catalog)}
-        app.state.runtime = Runtime(catalog, store, actors, model)
+        rt = app.state.runtime = Runtime(catalog, store, actors, model)
+        rt.role_source = role_source(catalog, local_token, principals, admin_token, service_token)
         dispatcher = None
         try:
+            app.state.releases = Releases(store, app.state.snapshots, evaluate=evaluate_release)
+            rt.bind_releases(app.state.releases, app.state.snapshots)
             if run_here:
                 worker = PlanWorker(app.state.runtime, app.state.snapshots)
                 dispatcher = asyncio.create_task(worker.run())
@@ -149,7 +162,7 @@ def create_app(*, scenarios=None, database=None, token=None, model_settings=None
             await asyncio.gather(*workers, return_exceptions=True)
             store.close()
 
-    app = FastAPI(title="Universal Agent", version="0.2.0", lifespan=lifespan)
+    app = FastAPI(title="Universal Agent", version="2.0.0", lifespan=lifespan)
     app.add_middleware(RequestLimits)
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=["localhost", "127.0.0.1"])
 
@@ -159,6 +172,12 @@ def create_app(*, scenarios=None, database=None, token=None, model_settings=None
 
     @app.exception_handler(RequestValidationError)
     async def malformed(request, error):
+        if request.url.path.startswith(API + "/approvals/") and request.url.path.endswith("/decision"):
+            try:
+                actor = identify(request)
+            except Fault:
+                actor = None
+            runtime().store.audit("approval.input", "deny", actor, code="INVALID_REQUEST")
         return fail(uuid4().hex, Fault("INVALID_REQUEST", "请求字段、类型或长度无效"))
 
     def runtime():
@@ -179,23 +198,39 @@ def create_app(*, scenarios=None, database=None, token=None, model_settings=None
         if not service_token or not hmac.compare_digest(service_token.encode(), bearer(request).encode()):
             raise Fault("UNAUTHORIZED", "需要服务身份", 401)
 
+    def admin(request: Request):
+        if not admin_token or not hmac.compare_digest(admin_token.encode(), bearer(request).encode()):
+            raise Fault("UNAUTHORIZED", "需要独立的管理令牌", 401)
+        return {"tenant_id": "personal", "org_id": "local", "user_id": "release-admin"}
+
+    install_approval_routes(app, runtime, identify)
+    install_release_routes(app, runtime, admin)
+    install_observability_routes(app, runtime, admin)
+
     def allowed_task(actor, task_id):
         task = runtime().store.task(actor, task_id)
         runtime().authorize_task(actor, task["business_id"], task_id)
         return task
 
-    @app.get("/", include_in_schema=False)
-    async def home():
-        return FileResponse(ROOT / "static" / "index.html", headers={
+    def page(filename):
+        return FileResponse(ROOT / "static" / filename, headers={
             "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
             "Content-Security-Policy": "default-src 'self'; style-src 'self'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'",
         })
+
+    @app.get("/", include_in_schema=False)
+    async def home():
+        return page("index.html")
+
+    @app.get("/review", include_in_schema=False)
+    async def review():
+        return page("review.html")
 
     app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
 
     @app.post("/local/access", include_in_schema=False)
     async def access(request: Request):
-        if (configured_token or principals is not None or not request.client
+        if (configured_token or principals is not None or os.getenv("AGENT_PRINCIPALS_FILE") or not request.client
                 or request.client.host not in ("127.0.0.1", "::1")
                 or request.headers.get("X-Local-UI") != "1"
                 or request.headers.get("Origin", str(request.base_url).rstrip("/")) != str(request.base_url).rstrip("/")):
@@ -205,10 +240,24 @@ def create_app(*, scenarios=None, database=None, token=None, model_settings=None
     @app.get(API + "/scenarios")
     async def scene_list(actor=Depends(identify)):
         rt = runtime()
-        return {"scenarios": [{**{k: scene.get(k) for k in ("id", "name", "description", "version", "example")},
-                               "durable_plan": sid in app.state.snapshots.current}
-                              for sid, scene in rt.catalog.scenarios.items() if rt.grant(actor, sid)],
-                "model_available": model_ready, "model_name": model.get("model", "")}
+        scenes = []
+        for sid in rt.catalog.scenarios:
+            grant = rt.grant(actor, sid)
+            if not grant:
+                continue
+            try:
+                selected = rt.releases.select(sid, actor, "")
+            except Fault as exc:
+                if exc.code == "CAPABILITY_REVOKED":
+                    continue
+                raise
+            scene = rt.release_catalog(selected, sid).scenarios[sid]
+            objects = grant.get("objects", [])
+            scenes.append({**{k: scene.get(k) for k in ("id", "name", "description", "version", "example")},
+                           "durable_plan": (rt.release_catalog(selected, sid).root / sid / "plan.json").is_file(),
+                           "default_object": objects[0] if len(objects) == 1 else None})
+        return {"scenarios": scenes, "model_available": model_ready, "model_name": model.get("model", ""),
+                "can_review": any("approval.decide" in g["permissions"] for g in actor["grants"].values())}
 
     @app.post(API + "/sessions", status_code=201)
     async def create_session(body: SessionInput, actor=Depends(identify)):
@@ -266,12 +315,16 @@ def create_app(*, scenarios=None, database=None, token=None, model_settings=None
             raise Fault("RATE_LIMITED", "请求过多，请稍后再试", 429, True)
         window.append(now)
         options = {}
-        task = rt.store.find_replay(actor, data, key) if key and durable else None
+        task = rt.store.find_replay(actor, data, key) if key else None
         created = False
         if task is None:
+            sid = body.business_id
+            selected = rt.releases.select(sid, actor, "")
+            snapshot_id = selected
+            catalog = rt.release_catalog(selected, sid)
             if durable:
                 snapshots = app.state.snapshots
-                snapshot_id = snapshots.current.get(body.business_id)
+                snapshot_id = selected or snapshots.current.get(sid)
                 if not snapshot_id:
                     raise Fault("PLAN_NOT_FOUND", "此场景没有已注册的计划模板", 404)
                 try:
@@ -283,7 +336,10 @@ def create_app(*, scenarios=None, database=None, token=None, model_settings=None
                     rt.store.audit("plan.validate", "deny", actor, resource=body.business_id, code=exc.code)
                     raise
                 options = {"plan": plan, "budget": budget, "snapshot_id": snapshot_id}
-            task, created = rt.store.start(actor, data, key, rt.catalog.scenarios[body.business_id]["version"],
+            elif selected:
+                options["snapshot_id"] = selected
+            task, created = rt.store.start(actor, data, key, catalog.scenarios[sid]["version"],
+                                          admit=lambda: rt.releases.guard_selection(selected, sid, actor, ""),
                                           **options)
         if created and not durable:
             rt.launch(actor, data, task)
@@ -326,9 +382,13 @@ def create_app(*, scenarios=None, database=None, token=None, model_settings=None
         task = allowed_task(actor, task_id)
         rt = runtime()
         plan = rt.store.plan_view(task_id)
-        visible = {t["name"] for t in rt.catalog.discover(task["business_id"])
-                   if t["permission"] in rt.grant(actor, task["business_id"])["permissions"]
-                   and t["action_level"] == "read"}
+        sid = task["business_id"]
+        permissions = rt.grant(actor, sid)["permissions"]
+        visible = set()
+        for step in plan["steps"]:
+            t = rt.releases.current_tool(sid, actor, "", step["capability_id"])
+            if t and t["permission"] in permissions:
+                visible.add(t["name"])
         if any(step["capability_id"] not in visible for step in plan["steps"]):
             rt.store.audit("plan.read", "deny", actor, task_id, code="PERMISSION_DENIED")
             raise Fault("PERMISSION_DENIED", "没有查看此计划所需的能力权限", 403)

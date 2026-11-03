@@ -9,6 +9,7 @@ from jsonschema import Draft202012Validator
 
 from .catalog import ID, _object, _reject_duplicate_keys
 from .errors import Fault
+from .approvals import enabled, mock_tool, validate_write
 
 
 BUDGET_LIMITS = {"max_steps": 12, "max_parallel_steps": 3, "max_tool_calls": 12,
@@ -174,7 +175,7 @@ def _check_size(arguments):
     return size
 
 
-def prepare_plan(catalog, scene_id, message, permissions, context, *, budget=None):
+def prepare_plan(catalog, scene_id, message, permissions, context, *, budget=None, mock_writes=None):
     budget = _budget(budget)
     tools = {tool["name"]: tool for tool in catalog.discover(scene_id)}
     plan = MockPlanProvider().propose_plan(catalog, scene_id)
@@ -196,9 +197,12 @@ def prepare_plan(catalog, scene_id, message, permissions, context, *, budget=Non
             raise _invalid("计划引用了场景之外的能力。")
         if tool["permission"] not in permissions:
             raise Fault("PERMISSION_DENIED", "当前身份没有计划所需的能力权限。", 403)
-        if tool["action_level"] != "read":
+        mock = mock_tool(catalog, scene_id, step["capability_id"])
+        if tool["action_level"] != "read" and not (enabled(mock_writes) and mock):
             raise Fault("ACTION_NOT_ALLOWED", "持久化计划仅支持只读能力。", 403)
         args = _prepare_arguments(step, tools, ancestors[sid], step_tools, message)
+        if mock:
+            validate_write(args, context)
         field = tool.get("object_ids_field")
         if field and (not args.get(field) or not set(args[field]).issubset(context.get("object_ids", []))):
             raise Fault("PERMISSION_DENIED", "请求的对象超出了任务授权范围。", 403)

@@ -10,6 +10,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from .errors import Fault
+from .approvals import APPROVAL_SCHEMA, ApprovalStore
 from .plan_store import MAX_ATTEMPTS, PLAN_SCHEMA, PlanStore
 
 
@@ -34,6 +35,9 @@ CREATE TABLE IF NOT EXISTS tasks (
 );
 CREATE INDEX IF NOT EXISTS task_session ON tasks(session_id);
 CREATE INDEX IF NOT EXISTS task_status ON tasks(status);
+CREATE TABLE IF NOT EXISTS task_snapshots (
+    task_id TEXT PRIMARY KEY REFERENCES tasks(task_id), snapshot_id TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS task_permissions (
     task_id TEXT NOT NULL REFERENCES tasks(task_id), permission TEXT NOT NULL,
     PRIMARY KEY(task_id,permission)
@@ -101,7 +105,7 @@ def _scope(session, requested):
     return scope
 
 
-class Store(PlanStore):
+class Store(ApprovalStore, PlanStore):
     def __init__(self, path, run_ttl_seconds=900, *, recover_reactive=True):
         if str(path) != ":memory:":
             Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -111,7 +115,7 @@ class Store(PlanStore):
         self._ttl = run_ttl_seconds
         self._db.execute("PRAGMA foreign_keys=ON")
         self._db.execute("PRAGMA journal_mode=WAL")
-        self._db.executescript(SCHEMA + PLAN_SCHEMA)
+        self._db.executescript(SCHEMA + PLAN_SCHEMA + APPROVAL_SCHEMA)
         if recover_reactive:
             with self._transaction():
                 running = self._db.execute("""SELECT task_id FROM tasks t WHERE finished_at IS NULL
@@ -192,12 +196,16 @@ class Store(PlanStore):
         with self._transaction(identity, "task.replay", body["business_id"], write=False):
             return self._replay(identity, body, key)
 
-    def start(self, identity, body, key, business_version, *, plan=None, snapshot_id=None, budget=None):
+    def start(self, identity, body, key, business_version, *, plan=None, snapshot_id=None, budget=None, admit=None):
         business_id = body["business_id"]
         with self._transaction(identity, "task.start", business_id):
             existing = self._replay(identity, body, key)
             if existing is not None:
                 return existing, False
+            if admit:
+                admit()
+            if getattr(self, "release_guard", None):
+                self.release_guard(snapshot_id, business_id)
             if body.get("session_id"):
                 session = self._session(identity, body["session_id"], business_id)
             else:
@@ -208,6 +216,8 @@ class Store(PlanStore):
                 mode,message,status,created_at) VALUES(?,?,?,?,?,?,?,'running',?)""",
                 (task_id, session["session_id"], _id("req"), audit_id, business_version,
                  body.get("mode", "offline"), body["message"], _now()))
+            if snapshot_id:
+                self._db.execute("INSERT INTO task_snapshots VALUES(?,?)", (task_id, snapshot_id))
             self._db.execute("INSERT INTO runs(context_id,task_id,context,expires_at) VALUES(?,?,?,?)",
                              (_id("ctx"), task_id, _json(context), time.time() + self._ttl))
             if key is not None:
@@ -222,6 +232,12 @@ class Store(PlanStore):
             self._audit("task.start", "allow", identity, task_id, business_id, None, audit_id)
             return self._task(task_id), True
 
+    def task_snapshot(self, task_id):
+        with self._lock:
+            row = self._db.execute("""SELECT snapshot_id FROM task_snapshots WHERE task_id=?
+                UNION ALL SELECT snapshot_id FROM plans WHERE task_id=? LIMIT 1""", (task_id, task_id)).fetchone()
+            return row[0] if row else None
+
     def _task_row(self, task_id, identity=None):
         row = self._db.execute(TASK_QUERY + " WHERE t.task_id=?", (task_id,)).fetchone()
         if not row or (identity is not None and _owner(row) != _owner(identity)):
@@ -235,9 +251,12 @@ class Store(PlanStore):
                                     FROM calls WHERE task_id=? ORDER BY rowid""", (task_id,))
         summary = {k: row[k] for k in ("task_id", "session_id", "business_id", "business_version",
                    "audit_id", "request_id", "mode", "status", "message", "created_at", "finished_at")}
+        pin = self.task_snapshot(task_id)
+        if pin:
+            summary["snapshot_id"] = pin
         if self.is_durable(task_id):
             summary["execution_mode"] = "durable_plan"
-            for key in ("failed_steps", "missing_outputs", "limitations"):
+            for key in ("failed_steps", "missing_outputs", "limitations", "mock_commits"):
                 if key in result:
                     summary[key] = result[key]
         return {**summary, "answer": result.get("answer", ""), "artifacts": result.get("artifacts", []),
@@ -357,6 +376,10 @@ class Store(PlanStore):
             return False
         if self.is_durable(task_id):
             self._interrupt_plan(task_id, status)
+            if status in {"cancelled", "failed"}:
+                receipts = self._mock_commits(task_id)
+                if receipts:
+                    result = {**result, "mock_commits": receipts}
         finished = _now()
         self._db.execute("UPDATE tasks SET status=?,result=?,error=?,finished_at=? WHERE task_id=?",
                          (status, _json(result), _json(error), finished, task_id))
@@ -366,6 +389,8 @@ class Store(PlanStore):
         # Completed contexts cannot replay tools. Keep only the public answer and call metadata.
         self._db.execute("UPDATE calls SET result=NULL WHERE task_id=? AND result IS NOT NULL", (task_id,))
         data = {"status": status}
+        if "mock_commits" in result:
+            data["mock_commits"] = result["mock_commits"]
         if status == "failed":
             data["error"] = error
         elif status in ("completed", "partial"):
