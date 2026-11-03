@@ -69,6 +69,13 @@ CREATE TABLE IF NOT EXISTS audit_logs (
     resource TEXT, code TEXT
 );
 CREATE INDEX IF NOT EXISTS audit_task ON audit_logs(task_id,timestamp);
+CREATE TABLE IF NOT EXISTS task_tool_attempts (
+    task_id TEXT PRIMARY KEY REFERENCES tasks(task_id), count INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS task_mcp_bindings (
+    task_id TEXT NOT NULL REFERENCES tasks(task_id), capability_key TEXT NOT NULL, digest TEXT NOT NULL,
+    PRIMARY KEY(task_id,capability_key)
+);
 """
 
 TASK_QUERY = """SELECT t.*,s.business_id,s.tenant_id,s.org_id,s.user_id
@@ -178,6 +185,18 @@ class Store(ApprovalStore, PlanStore):
     def _transaction(self, identity=None, action=None, resource=None, *, write=True):
         # 状态推进需先取得写锁再读取旧状态，避免两个进程同时依据过期状态作决定。
         with self._lock:
+            if self._db.in_transaction:
+                # 事件登记与任务创建必须同成同败，内部审计不得提前提交外层事务。
+                savepoint = "nested_" + uuid4().hex
+                self._db.execute("SAVEPOINT " + savepoint)
+                try:
+                    yield
+                except BaseException:
+                    self._db.execute("ROLLBACK TO " + savepoint)
+                    raise
+                finally:
+                    self._db.execute("RELEASE " + savepoint)
+                return
             try:
                 with self._db:
                     self._db.execute("BEGIN IMMEDIATE" if write else "BEGIN")
@@ -399,6 +418,14 @@ class Store(ApprovalStore, PlanStore):
                 raise Fault("TASK_NOT_FOUND", "Task is unavailable.", 404)
             return row["context_id"]
 
+    def skill_pin(self, task_id):
+        """内部读取冻结技能，任务结束后仍可校验输出合同。"""
+        with self._lock:
+            row = self._db.execute("SELECT context FROM runs WHERE task_id=?", (task_id,)).fetchone()
+            if row is None:
+                raise Fault("TASK_NOT_FOUND", "Task is unavailable.", 404)
+            return json.loads(row[0]).get("skill")
+
     def run(self, run_context_id):
         with self._lock:
             row = self._db.execute("""SELECT r.*,t.session_id,t.status,t.mode,s.business_id,s.tenant_id,s.org_id,s.user_id
@@ -442,6 +469,11 @@ class Store(ApprovalStore, PlanStore):
             raise Fault("TASK_STATE_CONFLICT", "Invalid terminal state.", 409)
         if self._task_row(task_id)["status"] in TERMINAL_EVENTS:
             return False
+        if status in {"completed", "partial"} and getattr(self, "result_validator", None):
+            try:
+                self.result_validator(task_id, result)
+            except Fault as exc:
+                status, result, error = "failed", {}, exc.as_dict()
         if self.is_durable(task_id):
             self._interrupt_plan(task_id, status)
             if status in {"cancelled", "failed"}:
@@ -514,6 +546,28 @@ class Store(ApprovalStore, PlanStore):
                 detail["step_id"] = step["step_id"]
             self._event(task_id, "step_started", detail)
             return execution, None
+
+    def consume_tool_attempt(self, task_id, limit, *, lease=None):
+        """实际派发和重试共用持久化预算，竞争时只能在剩余额度内执行。"""
+        with self._transaction():
+            self._guard_lease(task_id, lease)
+            self.run(self.context_id(task_id))
+            row = self._db.execute("SELECT count FROM task_tool_attempts WHERE task_id=?", (task_id,)).fetchone()
+            count = row[0] if row else 0
+            if count >= limit:
+                raise Fault("BUDGET_EXCEEDED", "工具实际调用与重试预算已耗尽", 422)
+            self._db.execute("INSERT INTO task_tool_attempts VALUES(?,?) ON CONFLICT(task_id) DO UPDATE SET count=?",
+                             (task_id, count + 1, count + 1))
+
+    def pin_mcp_configuration(self, task_id, key, digest):
+        """同一任务首次使用的 MCP 绑定不可在重试或恢复中悄然替换。"""
+        with self._transaction():
+            self.run(self.context_id(task_id))
+            row = self._db.execute("SELECT digest FROM task_mcp_bindings WHERE task_id=? AND capability_key=?",
+                                   (task_id, key)).fetchone()
+            if row and row[0] != digest:
+                raise Fault("CAPABILITY_REVOKED", "本次任务的 MCP 配置已变更", 403)
+            self._db.execute("INSERT OR IGNORE INTO task_mcp_bindings VALUES(?,?,?)", (task_id, key, digest))
 
     def _mark_call_started(self, step):
         self._db.execute("""UPDATE plan_steps SET call_token=token,status='running' WHERE task_id=? AND step_id=?""",

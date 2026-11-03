@@ -99,6 +99,8 @@ class PlanWorker:
 async def main():
     from .identities import check_credentials, local_principals, role_source
     from .releases import Releases
+    from .skills import SkillRegistry
+    from .triggers import TriggerGateway
     load_dotenv(ROOT / ".env")
     database = Path(os.getenv("AGENT_DATABASE") or ROOT / "var" / "agent.db")
     catalog = Catalog(Path(os.getenv("AGENT_SCENARIOS") or ROOT / "scenarios"))
@@ -111,6 +113,8 @@ async def main():
                                      os.getenv("AGENT_ADMIN_TOKEN"), os.getenv("AGENT_SERVICE_TOKEN"))
         snapshots = Snapshots(database, catalog)
         rt.bind_releases(Releases(store, snapshots), snapshots)
+        rt.skills = SkillRegistry(Path(os.getenv("AGENT_SKILL_ROOT") or database.parent / "skills"))
+        rt.triggers = TriggerGateway(rt, snapshots)
         await PlanWorker(rt, snapshots).run()
     finally:
         store.close()

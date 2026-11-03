@@ -124,6 +124,51 @@
                   "url",
                   "method"
                 ]
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "const": "mcp"
+                  },
+                  "server_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 64,
+                    "pattern": "^[a-z][a-z0-9_]*$"
+                  },
+                  "tool_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 64,
+                    "pattern": "^[a-z][a-z0-9_]*$"
+                  }
+                },
+                "additionalProperties": false,
+                "required": [
+                  "type",
+                  "server_id",
+                  "tool_id"
+                ]
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "const": "agent"
+                  },
+                  "target": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 64,
+                    "pattern": "^[a-z][a-z0-9_]*$"
+                  }
+                },
+                "additionalProperties": false,
+                "required": [
+                  "type",
+                  "target"
+                ]
               }
             ]
           }

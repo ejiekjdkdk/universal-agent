@@ -5,11 +5,14 @@ import json
 import os
 import re
 import time
+from jsonschema import Draft202012Validator
+from referencing.exceptions import Unresolvable
 
 from .catalog import tool_slot
 from .errors import Fault
 from .providers import run_provider
 from .skills import SkillError, SkillRegistry
+from .mcp_gateway import MCPContext
 
 
 def preview(value, depth=0):
@@ -121,6 +124,9 @@ class Gateway:
         self.check(ctx, "knowledge.read", "retrieve_knowledge")
         if not isinstance(query, str) or not 0 < len(query.strip()) <= 16000 or type(top_k) is not int or not 1 <= top_k <= 10:
             raise Fault("INVALID_REQUEST", "检索参数无效")
+        if self.read_only:
+            self.store.consume_tool_attempt(self.task_id, self.skill.get("max_tool_calls", 16) if self.skill else 16,
+                                           lease=self.lease)
         hits = self.catalog.retrieve(ctx["business_id"], query, top_k, object_ids=ctx["object_ids"])
         self.check_output_secrets(hits)
         self.remember(hits)
@@ -173,8 +179,14 @@ class Gateway:
             self.store.audit("execute", "deny", context, self.task_id, name, "CAPABILITY_NOT_FOUND")
             raise Fault("CAPABILITY_NOT_FOUND", "场景中没有此工具", 404)
         self.authorize_tool(tool, arguments)
+        adapter = self.catalog._tools[scenario_id][name]["adapter"]
+        if adapter["type"] == "agent":
+            if not self.runtime.agents_enabled or self.lease:
+                raise Fault("ACTION_NOT_ALLOWED", "专业 Agent 仅在显式启用的交互任务中可用", 403)
         version = tool.get("version", self.catalog.scenarios[scenario_id]["version"])
         call_budget = self.lease["max_tool_calls"] if self.lease else 8
+        if self.skill:
+            call_budget = min(call_budget, self.skill.get("max_tool_calls", 8))
         execution_id, cached = self.store.begin_call(
             self.task_id, call_id, name, version, arguments, max_calls=call_budget, lease=self.lease
         )
@@ -189,11 +201,15 @@ class Gateway:
             deadline = min(deadline, started + self.lease["deadline"] - time.time())
         try:
             async with asyncio.timeout(self.runtime.tool_timeout):
-                async with tool_slot(self.runtime.slots):
+                slots = self.runtime.delegate_slots if adapter["type"] == "agent" else self.runtime.slots
+                async with tool_slot(slots):
                     for attempt in range(2):
                         try:
                             # 排队或退避期间可能撤权，每次发出请求前都要复查。
                             self.authorize_tool(tool, arguments)
+                            if self.read_only and adapter["type"] != "agent":
+                                self.store.consume_tool_attempt(self.task_id,
+                                    self.skill.get("max_tool_calls", 16) if self.skill else 16, lease=self.lease)
 
                             def authorize_retrieval():
                                 ctx = self.context()
@@ -201,9 +217,28 @@ class Gateway:
                                 self.check(ctx, "knowledge.read", "retrieve_knowledge")
                                 return ctx["object_ids"]
 
-                            output = await self.catalog.execute(
-                                scenario_id, name, arguments, authorize_retrieval=authorize_retrieval
-                            )
+                            options = {"authorize_retrieval": authorize_retrieval}
+                            if adapter["type"] == "agent":
+                                async def delegate(target, payload):
+                                    self.authorize_tool(tool, arguments)
+                                    self.trace("agent_delegated", {"execution_id": execution_id, "capability_id": name})
+                                    child_id = "agent." + hashlib.sha256((call_id + "/" + target).encode()).hexdigest()[:32]
+                                    child = await self.execute(target, payload, child_id)
+                                    self.trace("agent_returned", {"execution_id": execution_id,
+                                               "child_execution_id": child["execution_id"]})
+                                    return {"data": child["data"], "evidence": child["evidence"]}
+                                options["delegate"] = delegate
+                            if adapter["type"] == "mcp":
+                                options["mcp_context"] = MCPContext(
+                                    tenant_id=context["tenant_id"],
+                                    principal_id=json.dumps([context["org_id"], context["user_id"]]),
+                                    run_context_id=self.run_id,
+                                    trace_id=self.task_id,
+                                    authorize=lambda: self.authorize_tool(tool, arguments),
+                                    trace=lambda event, data: self.trace(event, {**data, "execution_id": execution_id}),
+                                    pin_configuration=lambda key, digest: self.store.pin_mcp_configuration(self.task_id, key, digest),
+                                )
+                            output = await self.catalog.execute(scenario_id, name, arguments, **options)
                             self.authorize_tool(tool, arguments)
                             if any("object_id" in item and item["object_id"] not in context["object_ids"]
                                    for item in output["evidence"]):
@@ -246,11 +281,14 @@ class Gateway:
 class Runtime:
     def __init__(self, catalog, store, principals, settings):
         self.catalog, self.store = catalog, store
+        self.store.result_validator = self.validate_task_result
         self._principals, self.settings = principals, settings
         self.role_source = None
         self.workers = {}
         self.gateways = {}
         self.slots = asyncio.Semaphore(8)
+        self.delegate_slots = asyncio.Semaphore(3)
+        self.agents_enabled = os.getenv("AGENT_SPECIALISTS", "0") == "1"
         self.tool_timeout = 20
         self.releases = None
         self.snapshots = None
@@ -260,6 +298,36 @@ class Runtime:
         self.releases = releases
         self.snapshots = snapshots
         self.store.release_guard = releases.guard
+
+    def validate_skill_input(self, business, pin, message, context):
+        if not pin:
+            return
+        if self.skills is None:
+            raise Fault("SKILL_UNAVAILABLE", "技能注册表不可用", 403)
+        try:
+            skill = self.skills.load(business, pin["name"], pin["version"])
+        except SkillError:
+            raise Fault("SKILL_UNAVAILABLE", "技能版本不可用", 403) from None
+        self._validate_skill_value(skill.get("input_schema"), {"message": message, "context": context})
+
+    def validate_task_result(self, task_id, result):
+        pin = self.store.skill_pin(task_id)
+        if not pin:
+            return
+        row = self.store._task_row(task_id)
+        skill = self.load_skill(dict(row), pin)
+        self._validate_skill_value(skill.get("output_schema"), result)
+
+    @staticmethod
+    def _validate_skill_value(schema, value):
+        if schema is None:
+            return
+        try:
+            if Draft202012Validator(schema).is_valid(value):
+                return
+        except (ValueError, TypeError, RecursionError, Unresolvable):
+            pass
+        raise Fault("SKILL_SCHEMA_INVALID", "技能输入或结果不符合已发布的结构", 422)
 
     @property
     def principals(self):
@@ -314,7 +382,7 @@ class Runtime:
         if self.skills is None:
             return []
         available = self.skill_capabilities(actor, scenario, tools, snapshot_id)
-        return [entry for entry in self.skills.active(scenario) if set(entry["tools"]) <= available]
+        return [entry for entry in self.skills.active_for(actor, scenario) if set(entry["tools"]) <= available]
 
     def select_skill(self, actor, scenario, requested, catalog, snapshot_id):
         if not requested and (self.skills is None or not self.skills.has_bindings(scenario)):
@@ -361,6 +429,8 @@ class Runtime:
         return self.gateways.get(run_id) or Gateway(self, run_id)
 
     def authorize_task(self, actor, scenario, task_id):
+        if getattr(self, "triggers", None):
+            self.triggers.guard_task(task_id)
         grant = self.authorize(actor, scenario, self.store.scope(task_id))
         if (not self.store.permissions(task_id).issubset(grant.get("permissions", []))
                 or not self.store.history_types(task_id).issubset(grant.get("resource_types", []))):
@@ -406,8 +476,10 @@ class Runtime:
             gateway.context()
             evidence = list(gateway.evidence.values())
             gateway.check_output_secrets(result)
+            result = {**result, "evidence": evidence, "artifacts": []}
+            self.validate_task_result(task_id, result)
             gateway.trace("message_delta", {"delta": answer})
-            self.store.finish(task_id, "completed", {**result, "evidence": evidence, "artifacts": []})
+            self.store.finish(task_id, "completed", result)
         except asyncio.CancelledError:
             self.store.finish(task_id, "cancelled", {})
             raise

@@ -1,0 +1,29 @@
+{
+  "id": "demo",
+  "name": "MCP 本机演示",
+  "description": "通过批准的 MCP 映射读取虚构数据",
+  "example": "读取一条虚构记录",
+  "version": "1.0.0",
+  "offline_tool": "lookup",
+  "tools": [
+    {
+      "name": "lookup",
+      "description": "读取批准的演示数据",
+      "action_level": "read",
+      "permission": "demo.read",
+      "input_schema": {
+        "type": "object",
+        "properties": {"text": {"type": "string"}},
+        "required": ["text"],
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {"summary": {"type": "string"}},
+        "required": ["summary"],
+        "additionalProperties": false
+      },
+      "adapter": {"type": "mcp", "server_id": "demo", "tool_id": "lookup"}
+    }
+  ]
+}

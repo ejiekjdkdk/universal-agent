@@ -85,6 +85,8 @@ TOOL = _object({
         _object({"type": {"const": "python"}, "handler": ID}),
         _object({"type": {"const": "mock_ledger"}}),
         _object({"type": {"const": "http"}, "url": _string(2048), "method": {"enum": ["POST", "GET"]}}),
+        _object({"type": {"const": "mcp"}, "server_id": ID, "tool_id": ID}),
+        _object({"type": {"const": "agent"}, "target": ID}),
     ]},
 }, ["name", "description", "action_level", "permission", "input_schema", "output_schema", "adapter"])
 MANIFEST = _object({
@@ -234,7 +236,9 @@ async def _call_http(config, arguments, transport):
 
 
 class Catalog:
-    def __init__(self, root: Path, *, http_transport=None, adapter_sources=None):
+    def __init__(self, root: Path, *, http_transport=None, adapter_sources=None, mcp_gateway=None):
+        from .mcp_gateway import MCPGateway
+        self._mcp_gateway = mcp_gateway if mcp_gateway is not None else MCPGateway.from_env()
         self._adapter_sources = adapter_sources
         self.scenarios = {}
         self.entries = self.scenarios
@@ -288,6 +292,12 @@ class Catalog:
             config = tool["adapter"]
             if config["type"] == "http":
                 _check_url(config["url"])
+            elif config["type"] == "agent":
+                if tool["action_level"] != "read":
+                    raise ValueError("专业 Agent 适配器只允许读取")
+            elif config["type"] == "mcp":
+                if tool["action_level"] == "commit_write":
+                    raise ValueError("MCP direct commits are disabled")
             elif config["type"] == "mock_ledger":
                 if tool["action_level"] != "commit_write":
                     raise ValueError("mock_ledger requires commit_write")
@@ -316,6 +326,16 @@ class Catalog:
                     raise ValueError(f"missing adapter handler for {name}")
                 self._handlers[(sid, name)] = handler
             tools[name] = tool
+        for tool in tools.values():
+            if tool["adapter"]["type"] != "agent":
+                continue
+            target = tools.get(tool["adapter"]["target"])
+            if not target or target["adapter"]["type"] == "agent" or target["action_level"] != "read":
+                raise ValueError("专业 Agent 必须绑定同场景的只读叶子能力，禁止递归委派")
+            if any(tool[key] != target[key] for key in ("input_schema", "output_schema")):
+                raise ValueError("专业 Agent 的输入输出必须与绑定能力一致")
+            if tool.get("object_ids_field") != target.get("object_ids_field"):
+                raise ValueError("专业 Agent 必须保留绑定能力的对象范围")
         if scene.get("offline_tool"):
             offline = tools.get(scene["offline_tool"])
             if offline is None:
@@ -358,7 +378,7 @@ class Catalog:
         ranked.sort(key=lambda item: (-item[0], item[1]["source_id"]))
         return [doc.copy() for _, doc in ranked[:top_k]]
 
-    async def execute(self, scenario_id, name, arguments, *, authorize_retrieval=None):
+    async def execute(self, scenario_id, name, arguments, *, authorize_retrieval=None, mcp_context=None, delegate=None):
         self._scene(scenario_id)
         tool = self._tools[scenario_id].get(name)
         if tool is None:
@@ -372,6 +392,17 @@ class Catalog:
         config = tool["adapter"]
         if config["type"] == "http":
             result = await _call_http(config, arguments, self._http_transport)
+        elif config["type"] == "agent":
+            if delegate is None:
+                raise Fault("ACTION_NOT_ALLOWED", "专业 Agent 必须经任务网关执行", 403)
+            result = await delegate(config["target"], arguments)
+        elif config["type"] == "mcp":
+            if self._mcp_gateway is None:
+                raise Fault("CAPABILITY_NOT_FOUND", "MCP 服务未配置", 404)
+            result = await self._mcp_gateway.execute(config["server_id"], config["tool_id"], arguments,
+                context=mcp_context, action_level=tool["action_level"],
+                capability_id=name, capability_version=tool.get("version", self.scenarios[scenario_id]["version"]),
+                input_schema=tool["input_schema"], output_schema=tool["output_schema"])
         else:
             def retrieve(query, top_k=5):
                 object_ids = authorize_retrieval() if authorize_retrieval is not None else ()

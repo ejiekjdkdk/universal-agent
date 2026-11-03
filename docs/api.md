@@ -35,9 +35,9 @@ Trace 的事件 ID 在任务内递增。前端可实时订阅，或稍后通过 
 默认 SQLite 文件为 `var/agent.db`，可通过 `AGENT_DATABASE` 指定。原有 reactive 任务由一个 API 进程运行，重启时中断任务记为失败，历史仍可查询。显式选择 `execution_mode=durable_plan` 的任务保存计划和步骤，可由嵌入式或独立 Worker 恢复。JSON 提交返回 202 和查询地址，流式提交返回 200 SSE。每次任务的调用、并发与耗时均受限，取消或超时不能撤回已发出的远程请求。[可恢复计划协议](v2/durable-plans.md)
 
 离线模式可用来开发和验收扩展。接入企业环境时，由项目提供 SSO 身份、资源授权与服务端凭据管理。
-# V3 P1 技能扩展
+# V3 技能与触发扩展
 
-业务接口沿用 `/api/v1/agent` 和原 Bearer 身份。交互请求可使用 `skill_id` 及 `mode: "mock"`。对已绑定技能的场景，只有一个可用技能时可由服务端选择，多个时须明确指定。技能绑定场景本阶段使用 reactive 只读运行。直接返回 SSE 的旧客户端仍可使用 `response_mode: "streaming"`。
+业务接口沿用 `/api/v1/agent` 和原 Bearer 身份。交互请求可使用 `skill_id` 及 `mode: "mock"`。对已绑定技能的场景，只有一个可用技能时可由服务端选择，多个时须明确指定。技能绑定支持 reactive 只读运行及 `execution_mode: "durable_plan"`，后者要求场景已有合法计划，全部步骤均在技能授权工具范围内，并满足技能输入 Schema 和预算。直接返回 SSE 的旧客户端仍可使用 `response_mode: "streaming"`。
 
 | 接口或事件 | 约定 |
 | --- | --- |
@@ -47,4 +47,8 @@ Trace 的事件 ID 在任务内递增。前端可实时订阅，或稍后通过 
 | GET `/tasks/{id}/events` | `skill_selected` 记录技能名、版本和发布快照；工具调用事件通过执行 ID 与结果关联。用 `Last-Event-ID` 续读。 |
 | 错误 | `SKILL_REQUIRED` 表示需要选择技能；`SKILL_UNAVAILABLE` 表示技能不可用或依赖未授权；`MISSING_EXECUTION_EVIDENCE` 表示缺少实际执行记录；`SENSITIVE_OUTPUT` 表示输出含凭据并已中止。 |
 
-导入、绑定、撤销通过受信任的本机 CLI 完成。可执行的 PowerShell 示例见[双项目运行指南](../examples/v3/README.md)。
+导入通过受信任的本机 CLI 完成；发布治理可用 CLI 或独立管理员接口 `/api/v1/agent-admin/skills`。校验、暂存、激活、回滚、吊销及灰度参数见 [SkillOps](v3/skillops.md)。`SKILL_SCHEMA_INVALID` 表示已发布技能的输入或最终结果契约不满足，`BUDGET_EXCEEDED` 表示调用预算耗尽。物理重试同样消耗 V3 技能预算。
+
+签名事件入口为 `POST /internal/agent/triggers/events`，使用单独的 HMAC 签名协议，不接受客户端指定身份或计划。默认关闭，配置与错误约定见[触发协议](v3/triggers.md)。
+
+新增 Trace 事件包括 `skill_reference_read`、`mcp_execution`、`agent_delegated` 和 `agent_returned`。MCP 事件包含批准服务、能力、实际协议及耗时；委派事件关联父子执行。OTLP 根 Span 关联固定的技能名、版本和发布快照。可执行的 PowerShell 示例见[双项目运行指南](../examples/v3/README.md)。

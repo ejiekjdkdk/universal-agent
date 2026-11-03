@@ -1,0 +1,86 @@
+{
+  "id": "counter_agent",
+  "version": "1.0.0",
+  "name": "文本分析 Agent",
+  "description": "本地专业 Agent 路由演示，父子调用共用任务与权限。",
+  "example": "今天完成两项本地验证。",
+  "tools": [
+    {
+      "name": "count_text",
+      "description": "文本分析 Agent的已审核叶子能力",
+      "action_level": "read",
+      "permission": "content.read",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 8192
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "summary": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 8192
+          }
+        },
+        "required": [
+          "summary"
+        ],
+        "additionalProperties": false
+      },
+      "adapter": {
+        "type": "python",
+        "handler": "count"
+      }
+    },
+    {
+      "name": "counter",
+      "description": "文本分析 Agent，委派至已注册只读能力",
+      "action_level": "read",
+      "permission": "agent.delegate",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 8192
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "summary": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 8192
+          }
+        },
+        "required": [
+          "summary"
+        ],
+        "additionalProperties": false
+      },
+      "adapter": {
+        "type": "agent",
+        "target": "count_text"
+      }
+    }
+  ],
+  "offline_tool": "counter"
+}

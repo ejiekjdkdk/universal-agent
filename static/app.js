@@ -17,6 +17,11 @@ const state = {
 const labels = {
   task_started: "任务开始",
   skill_selected: "载入已发布技能",
+  skill_reference_read: "读取技能引用",
+  agent_delegated: "委派专业 Agent",
+  agent_returned: "专业 Agent 返回",
+  mcp_result: "MCP 协议调用完成",
+  mcp_execution: "MCP 协议调用完成",
   planner_started: "启动规划器",
   tools_discovered: "发现可用工具",
   authorization: "权限校验",
@@ -110,8 +115,8 @@ function showBusy(value) {
   $("mode").disabled = value || planned;
   $("mode").hidden = Boolean(planned);
   $("planHint").hidden = !planned;
-  $("skillPicker").hidden = planned || !$("skill").options.length;
-  $("skill").disabled = value || planned;
+  $("skillPicker").hidden = !$("skill").options.length;
+  $("skill").disabled = value;
   $("new").disabled = value;
   $("cancel").hidden = !state.running || !state.task;
   document.querySelectorAll(".scene,.past").forEach(node => {
@@ -411,7 +416,8 @@ $("ask").onsubmit = async e => {
     if (state.scene.durable_plan && $("executionMode").value === "durable_plan") {
       body.execution_mode = "durable_plan";
       body.mode = "offline";
-    } else if ($("skill").value) {
+    }
+    if ($("skill").value) {
       body.skill_id = $("skill").value;
     }
     const response = await request(api + "/chat", {

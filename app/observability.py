@@ -20,6 +20,12 @@ ERRORS = {"TOOL_TIMEOUT", "TASK_TIMEOUT", "PERMISSION_DENIED", "ACTION_NOT_ALLOW
           "SCHEMA_VALIDATION_FAILED", "CAPABILITY_OUTPUT_INVALID", "EXECUTION_BUDGET_EXCEEDED",
           "APPROVAL_EXPIRED", "APPROVAL_REJECTED", "COMMIT_OUTCOME_UNKNOWN", "RELEASE_REVOKED"}
 EVENT_SPANS = {
+    "skill_selected": "agent.skill",
+    "skill_reference_read": "agent.skill.reference",
+    "agent_delegated": "agent.delegate",
+    "agent_returned": "agent.delegate",
+    "mcp_result": "agent.mcp",
+    "mcp_execution": "agent.mcp",
     "planner_started": "agent.plan", "plan_validated": "agent.plan", "provider_selected": "agent.planner",
     "step_leased": "agent.step", "step_completed": "agent.step", "step_failed": "agent.step",
     "step_queued": "agent.step", "step_cancelled": "agent.step", "step_skipped": "agent.step",
@@ -177,8 +183,11 @@ def _trace(store, tid, settings, page):
     # 不写入导出的 span。
     with store._transaction(write=False):
         row = store._db.execute("""SELECT t.request_id,t.status,t.created_at,t.finished_at,t.mode,
-            json_extract(t.error,'$.code') AS error_code,s.business_id
-            FROM tasks t JOIN sessions s USING(session_id)
+            json_extract(t.error,'$.code') AS error_code,s.business_id,
+            json_extract(r.context,'$.skill.name') AS skill_name,
+            json_extract(r.context,'$.skill.version') AS skill_version,
+            json_extract(r.context,'$.skill.release_snapshot_id') AS skill_release
+            FROM tasks t JOIN sessions s USING(session_id) JOIN runs r USING(task_id)
             WHERE t.task_id=?""", (tid,)).fetchone()
         if not row:
             raise HTTPException(404, "Task not found")
@@ -222,7 +231,9 @@ def _trace(store, tid, settings, page):
         return data
     root = span("root", "agent.request", start, end, {"request_id": row["request_id"], "task_id": tid,
                 "business_id": row["business_id"], "release_id": release_id,
-                "planner_id": row["mode"] if row["mode"] in {"offline", "openai"} else None,
+                "planner_id": row["mode"] if row["mode"] in {"offline", "openai", "mock"} else None,
+                "skill_id": _safe(row["skill_name"]), "skill_version": _safe(row["skill_version"]),
+                "skill_release_id": _safe(row["skill_release"]),
                 "outcome": row["status"] if row["status"] in OUTCOMES else None, "error_code": _error(row["error_code"])},
                 row["status"] == "failed", bool(row["finished_at"]), parent=None)
     root["kind"] = 2

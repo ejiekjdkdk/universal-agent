@@ -1,0 +1,87 @@
+{
+  "id": "reader_agent",
+  "version": "1.0.0",
+  "name": "资料检索 Agent",
+  "description": "本地专业 Agent 路由演示，父子调用共用任务与权限。",
+  "example": "查找观察记录要求",
+  "tools": [
+    {
+      "name": "read_notes",
+      "description": "资料检索 Agent的已审核叶子能力",
+      "action_level": "read",
+      "permission": "content.read",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 8192
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "summary": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 8192
+          }
+        },
+        "required": [
+          "summary"
+        ],
+        "additionalProperties": false
+      },
+      "adapter": {
+        "type": "python",
+        "handler": "search"
+      }
+    },
+    {
+      "name": "reader",
+      "description": "资料检索 Agent，委派至已注册只读能力",
+      "action_level": "read",
+      "permission": "agent.delegate",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 8192
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "summary": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 8192
+          }
+        },
+        "required": [
+          "summary"
+        ],
+        "additionalProperties": false
+      },
+      "adapter": {
+        "type": "agent",
+        "target": "read_notes"
+      }
+    }
+  ],
+  "offline_tool": "reader",
+  "documents": "notes.json"
+}

@@ -1,0 +1,16 @@
+{
+  "sources": [
+    {
+      "source_id": "local-demo",
+      "token_env": "AGENT_TRIGGER_ACTOR_TOKEN",
+      "signing_key_env": "AGENT_TRIGGER_SIGNING_KEY",
+      "enabled": true,
+      "businesses": {
+        "project_brief": {"object_types": [], "object_ids": []}
+      },
+      "max_active": 4,
+      "max_per_minute": 30
+    }
+  ],
+  "schedules": []
+}

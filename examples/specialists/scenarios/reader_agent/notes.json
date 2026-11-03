@@ -1,0 +1,10 @@
+[
+  {
+    "source_id": "demo-note-01",
+    "title": "观察记录要求",
+    "snippet": "记录观察时间、观察地点和现象，保留可核对来源。",
+    "version": "1.0",
+    "source_ref": "demo://specialists/notes/01",
+    "data_as_of": "2026-11-03"
+  }
+]

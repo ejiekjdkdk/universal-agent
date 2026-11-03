@@ -88,6 +88,29 @@ def test_multiple_skills_and_internal_gateway_respect_pin(setup, tmp_path):
     assert revoked.value.code == "SKILL_UNAVAILABLE"
 
 
+def test_unpublished_skill_does_not_change_existing_business_route(setup, tmp_path):
+    client, runtime = setup
+    folder = tmp_path / "pending"
+    folder.mkdir()
+    (folder / "SKILL.md").write_text(
+        "---\nname: pending\ndescription: 待发布检索\n---\n检查来源。", encoding="utf-8")
+    runtime.skills.import_package(folder)
+    tools = ["notes_search", "retrieve_knowledge"]
+    runtime.skills.validate("notes", "pending", "1.0.0", tools, available_tools=tools)
+    for stage in (False, True):
+        if stage:
+            runtime.skills.stage("notes", "pending", "1.0.0")
+        task = client.post(API + "/chat", json=BODY, headers=AUTH).json()
+        assert task["status"] == "completed"
+        assert runtime.store.skill_pin(task["task_id"]) is None
+    runtime.skills.activate("notes", "pending", "1.0.0")
+    task = client.post(API + "/chat", json=BODY, headers=AUTH).json()
+    assert task["status"] == "completed"
+    assert runtime.store.skill_pin(task["task_id"])["name"] == "pending"
+    runtime.skills.revoke("notes", "pending", "1.0.0")
+    assert client.post(API + "/chat", json=BODY, headers=AUTH).status_code == 403
+
+
 @pytest.mark.parametrize("budget_key", ["max_calls", "max_context_bytes"])
 def test_budget_is_checked_in_mock_loop(setup, tmp_path, budget_key):
     client, rt = setup

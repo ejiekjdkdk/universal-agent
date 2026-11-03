@@ -101,12 +101,17 @@ def test_worker_killed_during_join_resumes_only_uncommitted_read_and_pins_releas
                AGENT_DATABASE=str(tmp_path / "data.db"), AGENT_PLAN_WORKER="external",
                AGENT_PLAN_LEASE_SECONDS="2", RECOVERY_TEST_PROBE=str(probe),
                PYTHONIOENCODING="utf-8", PYTHONDONTWRITEBYTECODE="1")
+    executable = sys.executable
+    if os.name == "nt" and sys.prefix != sys.base_prefix:
+        # Windows venv 启动器另建子进程。故障注入必须杀掉真正执行步骤的解释器。
+        executable = sys._base_executable
+        env["PYTHONPATH"] = os.pathsep.join([str(ROOT), str(Path(sys.prefix) / "Lib/site-packages")])
 
     with ExitStack() as stack:
         def launch(label, *args):
             log = tmp_path / (label + ".log")
             output = stack.enter_context(log.open("wb"))
-            proc = subprocess.Popen([sys.executable, *args], cwd=ROOT, env=env,
+            proc = subprocess.Popen([executable, *args], cwd=ROOT, env=env,
                                     stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT,
                                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             stack.callback(kill, proc)

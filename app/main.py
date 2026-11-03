@@ -30,6 +30,9 @@ from .releases import Releases
 from .release_routes import install_release_routes
 from .approval_routes import install_approval_routes
 from .observability import install_observability_routes
+from .skill_routes import install_skill_routes
+from .triggers import TriggerGateway
+from .trigger_routes import build_trigger_router
 from .evaluations import evaluate_release
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -151,9 +154,12 @@ def create_app(*, scenarios=None, database=None, token=None, model_settings=None
         app.state.runtime = rt
         rt.role_source = role_source(catalog, local_token, principals, admin_token, service_token)
         dispatcher = None
+        trigger_scheduler = None
         try:
             app.state.releases = Releases(store, app.state.snapshots, evaluate=evaluate_release)
             rt.bind_releases(app.state.releases, app.state.snapshots)
+            rt.triggers = TriggerGateway(rt, app.state.snapshots)
+            trigger_scheduler = asyncio.create_task(rt.triggers.run())
             if run_here:
                 worker = PlanWorker(app.state.runtime, app.state.snapshots)
                 dispatcher = asyncio.create_task(worker.run())
@@ -163,12 +169,14 @@ def create_app(*, scenarios=None, database=None, token=None, model_settings=None
             workers = list(app.state.runtime.workers.values())
             if dispatcher:
                 workers.append(dispatcher)
+            if trigger_scheduler:
+                workers.append(trigger_scheduler)
             for worker in workers:
                 worker.cancel()
             await asyncio.gather(*workers, return_exceptions=True)
             store.close()
 
-    app = FastAPI(title="Universal Agent", version="3.0.0-p1", lifespan=lifespan)
+    app = FastAPI(title="Universal Agent", version="3.0.0", lifespan=lifespan)
     app.add_middleware(RequestLimits)
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=["localhost", "127.0.0.1"])
 
@@ -214,6 +222,8 @@ def create_app(*, scenarios=None, database=None, token=None, model_settings=None
     install_approval_routes(app, runtime, identify)
     install_release_routes(app, runtime, admin)
     install_observability_routes(app, runtime, admin)
+    install_skill_routes(app, runtime, admin)
+    app.include_router(build_trigger_router(lambda: runtime().triggers))
 
     def allowed_task(actor, task_id):
         task = runtime().store.task(actor, task_id)
@@ -335,8 +345,6 @@ def create_app(*, scenarios=None, database=None, token=None, model_settings=None
             request_data.pop("execution_mode")
             if body.budget is not None:
                 raise Fault("INVALID_REQUEST", "budget 只适用于 durable_plan")
-        elif body.skill_id is not None:
-            raise Fault("INVALID_REQUEST", "skill_id 仅适用于 reactive")
         elif body.mode != "offline":
             raise Fault("INVALID_REQUEST", "当前持久计划使用离线场景规划器")
         agent_runtime.authorize(actor, body.business_id, request_data["context"])
@@ -366,9 +374,9 @@ def create_app(*, scenarios=None, database=None, token=None, model_settings=None
             selected_release = agent_runtime.releases.select(scenario_id, actor, "")
             catalog = agent_runtime.release_catalog(selected_release, scenario_id)
             task_options = {}
+            selected_skill = agent_runtime.select_skill(actor, scenario_id, body.skill_id, catalog, selected_release)
+            agent_runtime.validate_skill_input(scenario_id, selected_skill, body.message, request_data["context"])
             if is_durable:
-                if agent_runtime.skills.has_bindings(scenario_id):
-                    raise Fault("ACTION_NOT_ALLOWED", "已绑定技能的场景仅支持只读交互任务", 403)
                 snapshots = app.state.snapshots
                 snapshot_id = selected_release or snapshots.current.get(scenario_id)
                 if not snapshot_id:
@@ -379,6 +387,13 @@ def create_app(*, scenarios=None, database=None, token=None, model_settings=None
                     plan, budget = prepare_plan(
                         pinned_catalog, scenario_id, body.message, permissions, request_data["context"], budget=body.budget
                     )
+                    if selected_skill:
+                        skill = agent_runtime.skills.load(scenario_id, selected_skill["name"], selected_skill["version"])
+                        if any(step["capability_id"] not in skill["tools"] for step in plan["steps"]):
+                            raise Fault("PERMISSION_DENIED", "计划需要的能力超出技能发布范围", 403)
+                        if len(plan["steps"]) > skill["max_tool_calls"]:
+                            raise Fault("BUDGET_EXCEEDED", "计划步骤数超过技能调用预算", 422)
+                        budget["max_tool_calls"] = min(budget["max_tool_calls"], skill["max_tool_calls"])
                 except Fault as exc:
                     agent_runtime.store.audit("plan.validate", "deny", actor, resource=body.business_id, code=exc.code)
                     raise
@@ -386,10 +401,12 @@ def create_app(*, scenarios=None, database=None, token=None, model_settings=None
             elif selected_release:
                 task_options["snapshot_id"] = selected_release
             if not is_durable:
-                task_options["skill"] = agent_runtime.select_skill(actor, scenario_id, body.skill_id, catalog, selected_release)
+                task_options["skill"] = selected_skill
                 if task_options["skill"] and not selected_release:
                     # 普通场景同样有启动快照，技能任务固定适配器及数据版本。
                     task_options["snapshot_id"] = app.state.snapshots.baseline(scenario_id)
+            elif selected_skill:
+                task_options["skill"] = selected_skill
 
             # 入库时再核对一次发布绑定，防止准备计划期间恰好切换版本。
             def check_release_at_admission():

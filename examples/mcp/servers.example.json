@@ -1,0 +1,59 @@
+{
+  "endpoints": {
+    "local": {
+      "url": "http://127.0.0.1:8123/mcp",
+      "allow_loopback": true
+    }
+  },
+  "servers": {
+    "demo": {
+      "endpoint_ref": "local",
+      "enabled": false,
+      "approved_protocol_versions": [
+        "2026-07-28"
+      ],
+      "tenants": {
+        "tenant_a": {
+          "credential_env": null
+        },
+        "tenant_b": {
+          "credential_env": null
+        }
+      },
+      "tools": {
+        "lookup": {
+          "remote_tool_name": "private_lookup",
+          "enabled": true,
+          "capability_id": "lookup",
+          "version": "1.0.0",
+          "action_level": "read",
+          "input_schema": {
+            "type": "object",
+            "properties": {
+              "text": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "text"
+            ],
+            "additionalProperties": false
+          },
+          "output_schema": {
+            "type": "object",
+            "properties": {
+              "summary": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "summary"
+            ],
+            "additionalProperties": false
+          },
+          "timeout_ms": 2000
+        }
+      }
+    }
+  }
+}

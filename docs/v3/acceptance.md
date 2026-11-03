@@ -1,5 +1,7 @@
 # V3 P0＋P1 本机验收
 
+本页保留 P1 历史验收记录；当前 P2–P5 的实现、测试和边界见[完整验收](completion-acceptance.md)。以下“未验证”列表描述当时状态，不代表当前 MCP 与 SkillOps 的交付情况。
+
 环境、依赖与执行器选择见 [P0 审计](../p0-environment-audit.md)。[双项目启动与 HTTP 示例](../../examples/v3/README.md)使用和测试一致的两个项目包。项目 A 查询虚构展品，项目 B 只汇总当前身份可读的手册片段。
 
 | 设计用例 | 验收路径 |

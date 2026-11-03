@@ -7,6 +7,7 @@ class Fault(Exception):
         self.message = message
         self.status = status
         self.retryable = retryable
+        self.retry_after: float = 0.0
 
     def as_dict(self):
         return {"code": self.code, "message": self.message,

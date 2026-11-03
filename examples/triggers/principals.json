@@ -1,0 +1,11 @@
+[
+  {
+    "token_env": "AGENT_TRIGGER_ACTOR_TOKEN",
+    "tenant_id": "personal",
+    "org_id": "local",
+    "user_id": "trigger-demo",
+    "grants": {
+      "project_brief": {"permissions": ["brief.read", "knowledge.read"]}
+    }
+  }
+]
