@@ -1,0 +1,2158 @@
+{
+  "database_definitions": {
+    "approvals": [
+      "CREATE TABLE IF NOT EXISTS approvals ( approval_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES plans(task_id), step_id TEXT NOT NULL, tenant_id TEXT NOT NULL, org_id TEXT NOT NULL, user_id TEXT NOT NULL, business_id TEXT NOT NULL, capability_id TEXT NOT NULL, capability_version TEXT NOT NULL, permission TEXT NOT NULL, object_id TEXT NOT NULL, expected_version INTEGER NOT NULL, payload_digest TEXT NOT NULL, plan_digest TEXT NOT NULL, snapshot_id TEXT NOT NULL, proposal_digest TEXT NOT NULL, expires REAL NOT NULL, created REAL NOT NULL, proposal_token INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'requested', commit_status TEXT NOT NULL DEFAULT 'not_started', decided_by TEXT, decided_at REAL, decision_key TEXT, decision_hash TEXT, receipt_id TEXT, UNIQUE(task_id,step_id) ); CREATE INDEX IF NOT EXISTS approval_queue ON approvals(tenant_id,org_id,status,created); CREATE TABLE IF NOT EXISTS mock_ledger ( tenant_id TEXT NOT NULL, org_id TEXT NOT NULL, business_id TEXT NOT NULL, object_id TEXT NOT NULL, version INTEGER NOT NULL, value TEXT NOT NULL, PRIMARY KEY(tenant_id,org_id,business_id,object_id) ); CREATE TABLE IF NOT EXISTS mock_receipts ( receipt_id TEXT PRIMARY KEY, approval_id TEXT NOT NULL UNIQUE REFERENCES approvals(approval_id), payload_digest TEXT NOT NULL, object_version INTEGER NOT NULL, recorded_at REAL NOT NULL );"
+    ],
+    "main": [],
+    "plan_store": [
+      "CREATE TABLE IF NOT EXISTS plans ( task_id TEXT PRIMARY KEY REFERENCES tasks(task_id), plan_id TEXT NOT NULL UNIQUE, schema_version TEXT NOT NULL, result_contract TEXT NOT NULL, digest TEXT NOT NULL, snapshot_id TEXT NOT NULL, deadline REAL NOT NULL, parallel_limit INTEGER NOT NULL, call_limit INTEGER NOT NULL ); CREATE TABLE IF NOT EXISTS plan_steps ( task_id TEXT NOT NULL REFERENCES plans(task_id), step_id TEXT NOT NULL, ordinal INTEGER NOT NULL, definition TEXT NOT NULL, status TEXT NOT NULL, token INTEGER NOT NULL DEFAULT 0, lease_owner TEXT, lease_until REAL, call_token INTEGER, output TEXT, error TEXT, PRIMARY KEY(task_id,step_id), UNIQUE(task_id,ordinal) ); CREATE INDEX IF NOT EXISTS plan_step_claim ON plan_steps(task_id,status,lease_until);"
+    ],
+    "providers": [],
+    "runtime": [],
+    "skills": [
+      "CREATE TABLE IF NOT EXISTS packages( name TEXT, version TEXT, description TEXT, digest TEXT, body TEXT, PRIMARY KEY(name,version)); CREATE TABLE IF NOT EXISTS refs( name TEXT, version TEXT, path TEXT, content TEXT, PRIMARY KEY(name,version,path)); CREATE TABLE IF NOT EXISTS releases( business TEXT, name TEXT, version TEXT, tools TEXT, release_snapshot_id TEXT, status TEXT, PRIMARY KEY(business,name,version)); CREATE TABLE IF NOT EXISTS package_details( name TEXT, version TEXT, manifest_yaml TEXT, schemas TEXT, dependencies TEXT, PRIMARY KEY(name,version)); CREATE TABLE IF NOT EXISTS release_details( release_snapshot_id TEXT PRIMARY KEY, capability_bindings TEXT); CREATE TABLE IF NOT EXISTS package_auth( name TEXT, version TEXT, author TEXT, content_seal TEXT, PRIMARY KEY(name,version)); CREATE TABLE IF NOT EXISTS skill_governance( release_snapshot_id TEXT PRIMARY KEY, payload TEXT, signature TEXT, evaluation_run_id TEXT, report TEXT); CREATE TABLE IF NOT EXISTS skill_evaluations( evaluation_run_id TEXT PRIMARY KEY, release_snapshot_id TEXT, report TEXT); CREATE TABLE IF NOT EXISTS skill_rollouts( business TEXT, name TEXT, stable_version TEXT, canary_version TEXT, percent INTEGER, PRIMARY KEY(business,name)); CREATE TABLE IF NOT EXISTS skill_audit( sequence INTEGER PRIMARY KEY AUTOINCREMENT, occurred_at TEXT, action TEXT, business TEXT, name TEXT, version TEXT, actor TEXT, details TEXT); CREATE TABLE IF NOT EXISTS skill_legacy( business TEXT, name TEXT, version TEXT, previous_status TEXT, PRIMARY KEY(business,name,version));"
+    ],
+    "store": [
+      "CREATE TABLE IF NOT EXISTS sessions ( session_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, org_id TEXT NOT NULL, user_id TEXT NOT NULL, business_id TEXT NOT NULL, context TEXT NOT NULL, created_at TEXT NOT NULL ); CREATE INDEX IF NOT EXISTS session_owner ON sessions(tenant_id,org_id,user_id,business_id); CREATE TABLE IF NOT EXISTS tasks ( task_id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(session_id), request_id TEXT UNIQUE NOT NULL, audit_id TEXT NOT NULL, business_version TEXT NOT NULL, mode TEXT NOT NULL, message TEXT NOT NULL, status TEXT NOT NULL, result TEXT NOT NULL DEFAULT '{}', error TEXT, created_at TEXT NOT NULL, finished_at TEXT ); CREATE INDEX IF NOT EXISTS task_session ON tasks(session_id); CREATE INDEX IF NOT EXISTS task_status ON tasks(status); CREATE TABLE IF NOT EXISTS task_snapshots ( task_id TEXT PRIMARY KEY REFERENCES tasks(task_id), snapshot_id TEXT NOT NULL ); CREATE TABLE IF NOT EXISTS task_permissions ( task_id TEXT NOT NULL REFERENCES tasks(task_id), permission TEXT NOT NULL, PRIMARY KEY(task_id,permission) ); CREATE TABLE IF NOT EXISTS idempotency ( tenant_id TEXT NOT NULL, org_id TEXT NOT NULL, user_id TEXT NOT NULL, business_id TEXT NOT NULL, key TEXT NOT NULL, request_hash TEXT NOT NULL, task_id TEXT NOT NULL REFERENCES tasks(task_id), PRIMARY KEY(tenant_id,org_id,user_id,business_id,key) ); CREATE TABLE IF NOT EXISTS runs ( context_id TEXT PRIMARY KEY, task_id TEXT UNIQUE NOT NULL REFERENCES tasks(task_id), context TEXT NOT NULL, expires_at REAL NOT NULL, revoked_at TEXT ); CREATE TABLE IF NOT EXISTS events ( task_id TEXT NOT NULL REFERENCES tasks(task_id), event_id INTEGER NOT NULL, event TEXT NOT NULL, payload TEXT NOT NULL, timestamp TEXT NOT NULL, PRIMARY KEY(task_id,event_id) ); CREATE TABLE IF NOT EXISTS calls ( task_id TEXT NOT NULL REFERENCES tasks(task_id), call_id TEXT NOT NULL, execution_id TEXT UNIQUE NOT NULL, capability_id TEXT NOT NULL, capability_version TEXT NOT NULL, arguments_digest TEXT NOT NULL, status TEXT NOT NULL, started REAL NOT NULL, duration_ms INTEGER, result TEXT, error TEXT, PRIMARY KEY(task_id,call_id) ); CREATE TABLE IF NOT EXISTS audit_logs ( audit_id TEXT PRIMARY KEY, timestamp TEXT NOT NULL, tenant_id TEXT, org_id TEXT, user_id TEXT, request_id TEXT, session_id TEXT, task_id TEXT, action TEXT NOT NULL, decision TEXT NOT NULL, resource TEXT, code TEXT ); CREATE INDEX IF NOT EXISTS audit_task ON audit_logs(task_id,timestamp); CREATE TABLE IF NOT EXISTS task_tool_attempts ( task_id TEXT PRIMARY KEY REFERENCES tasks(task_id), count INTEGER NOT NULL ); CREATE TABLE IF NOT EXISTS task_mcp_bindings ( task_id TEXT NOT NULL REFERENCES tasks(task_id), capability_key TEXT NOT NULL, digest TEXT NOT NULL, PRIMARY KEY(task_id,capability_key) );",
+      "CREATE TABLE task_history_types ( task_id TEXT NOT NULL REFERENCES tasks(task_id), resource_type TEXT NOT NULL, PRIMARY KEY(task_id,resource_type))"
+    ],
+    "triggers": [
+      "CREATE TABLE IF NOT EXISTS trigger_events ( source_id TEXT NOT NULL, event_id TEXT NOT NULL, payload_hash TEXT NOT NULL, task_id TEXT UNIQUE NOT NULL REFERENCES tasks(task_id), received_at REAL NOT NULL, PRIMARY KEY(source_id,event_id)); CREATE TABLE IF NOT EXISTS trigger_nonces ( source_id TEXT NOT NULL, nonce TEXT NOT NULL, event_id TEXT NOT NULL, signature_hash TEXT NOT NULL, PRIMARY KEY(source_id,nonce)); CREATE TABLE IF NOT EXISTS trigger_schedules ( schedule_id TEXT PRIMARY KEY, definition_hash TEXT NOT NULL, next_due INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS trigger_received ON trigger_events(source_id,received_at);"
+    ]
+  },
+  "openapi": {
+    "components": {
+      "schemas": {
+        "ChatInput": {
+          "additionalProperties": false,
+          "properties": {
+            "budget": {
+              "anyOf": [
+                {
+                  "additionalProperties": {
+                    "type": "integer"
+                  },
+                  "type": "object"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Budget"
+            },
+            "business_id": {
+              "pattern": "^[A-Za-z0-9_.-]{1,128}$",
+              "title": "Business Id",
+              "type": "string"
+            },
+            "context": {
+              "$ref": "#/components/schemas/Context"
+            },
+            "execution_mode": {
+              "default": "reactive",
+              "enum": [
+                "reactive",
+                "durable_plan"
+              ],
+              "title": "Execution Mode",
+              "type": "string"
+            },
+            "message": {
+              "maxLength": 16000,
+              "minLength": 1,
+              "title": "Message",
+              "type": "string"
+            },
+            "mode": {
+              "default": "offline",
+              "enum": [
+                "offline",
+                "mock",
+                "openai"
+              ],
+              "title": "Mode",
+              "type": "string"
+            },
+            "response_mode": {
+              "default": "blocking",
+              "enum": [
+                "blocking",
+                "streaming"
+              ],
+              "title": "Response Mode",
+              "type": "string"
+            },
+            "session_id": {
+              "anyOf": [
+                {
+                  "pattern": "^[A-Za-z0-9_.-]{1,128}$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Session Id"
+            },
+            "skill_id": {
+              "anyOf": [
+                {
+                  "pattern": "^[A-Za-z0-9_.-]{1,128}$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Skill Id"
+            }
+          },
+          "required": [
+            "business_id",
+            "message"
+          ],
+          "title": "ChatInput",
+          "type": "object"
+        },
+        "Context": {
+          "additionalProperties": false,
+          "properties": {
+            "object_ids": {
+              "items": {
+                "pattern": "^[A-Za-z0-9_.-]{1,128}$",
+                "type": "string"
+              },
+              "maxItems": 64,
+              "title": "Object Ids",
+              "type": "array"
+            },
+            "object_type": {
+              "anyOf": [
+                {
+                  "pattern": "^[A-Za-z0-9_.-]{1,128}$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Object Type"
+            }
+          },
+          "title": "Context",
+          "type": "object"
+        },
+        "Decision": {
+          "additionalProperties": false,
+          "properties": {
+            "comment": {
+              "default": "",
+              "maxLength": 500,
+              "title": "Comment",
+              "type": "string"
+            },
+            "decision": {
+              "enum": [
+                "approve",
+                "reject"
+              ],
+              "title": "Decision",
+              "type": "string"
+            },
+            "proposal_digest": {
+              "pattern": "^sha256:[0-9a-f]{64}$",
+              "title": "Proposal Digest",
+              "type": "string"
+            }
+          },
+          "required": [
+            "decision",
+            "proposal_digest"
+          ],
+          "title": "Decision",
+          "type": "object"
+        },
+        "DiscoverInput": {
+          "additionalProperties": false,
+          "properties": {
+            "intent": {
+              "default": "",
+              "maxLength": 2000,
+              "title": "Intent",
+              "type": "string"
+            },
+            "run_context_id": {
+              "pattern": "^[A-Za-z0-9_.-]{1,128}$",
+              "title": "Run Context Id",
+              "type": "string"
+            }
+          },
+          "required": [
+            "run_context_id"
+          ],
+          "title": "DiscoverInput",
+          "type": "object"
+        },
+        "ExecuteInput": {
+          "additionalProperties": false,
+          "properties": {
+            "arguments": {
+              "additionalProperties": true,
+              "title": "Arguments",
+              "type": "object"
+            },
+            "call_id": {
+              "pattern": "^[A-Za-z0-9_.-]{1,128}$",
+              "title": "Call Id",
+              "type": "string"
+            },
+            "capability_id": {
+              "pattern": "^[A-Za-z0-9_.-]{1,128}$",
+              "title": "Capability Id",
+              "type": "string"
+            },
+            "run_context_id": {
+              "pattern": "^[A-Za-z0-9_.-]{1,128}$",
+              "title": "Run Context Id",
+              "type": "string"
+            }
+          },
+          "required": [
+            "run_context_id",
+            "capability_id",
+            "arguments",
+            "call_id"
+          ],
+          "title": "ExecuteInput",
+          "type": "object"
+        },
+        "HTTPValidationError": {
+          "properties": {
+            "detail": {
+              "items": {
+                "$ref": "#/components/schemas/ValidationError"
+              },
+              "title": "Detail",
+              "type": "array"
+            }
+          },
+          "title": "HTTPValidationError",
+          "type": "object"
+        },
+        "RetrieveInput": {
+          "additionalProperties": false,
+          "properties": {
+            "knowledge_scope": {
+              "anyOf": [
+                {
+                  "pattern": "^[A-Za-z0-9_.-]{1,128}$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Knowledge Scope"
+            },
+            "query": {
+              "maxLength": 16000,
+              "minLength": 1,
+              "title": "Query",
+              "type": "string"
+            },
+            "run_context_id": {
+              "pattern": "^[A-Za-z0-9_.-]{1,128}$",
+              "title": "Run Context Id",
+              "type": "string"
+            },
+            "top_k": {
+              "default": 5,
+              "maximum": 10.0,
+              "minimum": 1.0,
+              "title": "Top K",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "run_context_id",
+            "query"
+          ],
+          "title": "RetrieveInput",
+          "type": "object"
+        },
+        "Scope": {
+          "additionalProperties": false,
+          "properties": {
+            "business_id": {
+              "pattern": "^[a-z][a-z0-9_]{0,63}$",
+              "title": "Business Id",
+              "type": "string"
+            }
+          },
+          "required": [
+            "business_id"
+          ],
+          "title": "Scope",
+          "type": "object"
+        },
+        "SessionInput": {
+          "additionalProperties": false,
+          "properties": {
+            "business_id": {
+              "pattern": "^[A-Za-z0-9_.-]{1,128}$",
+              "title": "Business Id",
+              "type": "string"
+            },
+            "context": {
+              "$ref": "#/components/schemas/Context"
+            }
+          },
+          "required": [
+            "business_id"
+          ],
+          "title": "SessionInput",
+          "type": "object"
+        },
+        "Strict": {
+          "additionalProperties": false,
+          "properties": {},
+          "title": "Strict",
+          "type": "object"
+        },
+        "Validation": {
+          "additionalProperties": false,
+          "properties": {
+            "business_id": {
+              "pattern": "^[a-z][a-z0-9_]{0,63}$",
+              "title": "Business Id",
+              "type": "string"
+            },
+            "capability_bindings": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "title": "Capability Bindings",
+              "type": "object"
+            },
+            "name": {
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+              "title": "Name",
+              "type": "string"
+            },
+            "tools": {
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 128,
+              "title": "Tools",
+              "type": "array"
+            },
+            "version": {
+              "pattern": "^(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)$",
+              "title": "Version",
+              "type": "string"
+            }
+          },
+          "required": [
+            "business_id",
+            "name",
+            "version"
+          ],
+          "title": "Validation",
+          "type": "object"
+        },
+        "ValidationError": {
+          "properties": {
+            "ctx": {
+              "title": "Context",
+              "type": "object"
+            },
+            "input": {
+              "title": "Input"
+            },
+            "loc": {
+              "items": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "integer"
+                  }
+                ]
+              },
+              "title": "Location",
+              "type": "array"
+            },
+            "msg": {
+              "title": "Message",
+              "type": "string"
+            },
+            "type": {
+              "title": "Error Type",
+              "type": "string"
+            }
+          },
+          "required": [
+            "loc",
+            "msg",
+            "type"
+          ],
+          "title": "ValidationError",
+          "type": "object"
+        },
+        "app__release_routes__Candidate": {
+          "additionalProperties": false,
+          "properties": {
+            "business_id": {
+              "pattern": "^[a-z][a-z0-9_]{0,63}$",
+              "title": "Business Id",
+              "type": "string"
+            },
+            "candidate": {
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$",
+              "title": "Candidate",
+              "type": "string"
+            }
+          },
+          "required": [
+            "business_id",
+            "candidate"
+          ],
+          "title": "Candidate",
+          "type": "object"
+        },
+        "app__release_routes__Rollout": {
+          "additionalProperties": false,
+          "properties": {
+            "canary_percent": {
+              "default": 100,
+              "maximum": 100.0,
+              "minimum": 0.0,
+              "title": "Canary Percent",
+              "type": "integer"
+            }
+          },
+          "title": "Rollout",
+          "type": "object"
+        },
+        "app__skill_routes__Candidate": {
+          "additionalProperties": false,
+          "properties": {
+            "business_id": {
+              "pattern": "^[a-z][a-z0-9_]{0,63}$",
+              "title": "Business Id",
+              "type": "string"
+            },
+            "name": {
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+              "title": "Name",
+              "type": "string"
+            },
+            "version": {
+              "pattern": "^(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)$",
+              "title": "Version",
+              "type": "string"
+            }
+          },
+          "required": [
+            "business_id",
+            "name",
+            "version"
+          ],
+          "title": "Candidate",
+          "type": "object"
+        },
+        "app__skill_routes__Rollout": {
+          "additionalProperties": false,
+          "properties": {
+            "business_id": {
+              "pattern": "^[a-z][a-z0-9_]{0,63}$",
+              "title": "Business Id",
+              "type": "string"
+            },
+            "canary_percent": {
+              "default": 100,
+              "maximum": 100.0,
+              "minimum": 1.0,
+              "title": "Canary Percent",
+              "type": "integer"
+            },
+            "name": {
+              "maxLength": 64,
+              "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+              "title": "Name",
+              "type": "string"
+            },
+            "version": {
+              "pattern": "^(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)$",
+              "title": "Version",
+              "type": "string"
+            }
+          },
+          "required": [
+            "business_id",
+            "name",
+            "version"
+          ],
+          "title": "Rollout",
+          "type": "object"
+        }
+      }
+    },
+    "info": {
+      "title": "Universal Agent",
+      "version": "3.0.0"
+    },
+    "openapi": "3.1.0",
+    "paths": {
+      "/api/v1/agent-admin/capabilities/{id}/revoke": {
+        "post": {
+          "operationId": "revoke_tool_api_v1_agent_admin_capabilities__id__revoke_post",
+          "parameters": [
+            {
+              "in": "path",
+              "name": "id",
+              "required": true,
+              "schema": {
+                "pattern": "^[a-z][a-z0-9_]{0,63}$",
+                "title": "Id",
+                "type": "string"
+              }
+            }
+          ],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Scope"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          },
+          "summary": "Revoke Tool",
+          "tags": [
+            "release management"
+          ]
+        }
+      },
+      "/api/v1/agent-admin/observability/alerts": {
+        "get": {
+          "operationId": "alerts_api_v1_agent_admin_observability_alerts_get",
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              },
+              "description": "Successful Response"
+            }
+          },
+          "summary": "Alerts"
+        }
+      },
+      "/api/v1/agent-admin/observability/metrics": {
+        "get": {
+          "operationId": "metrics_api_v1_agent_admin_observability_metrics_get",
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              },
+              "description": "Successful Response"
+            }
+          },
+          "summary": "Metrics"
+        }
+      },
+      "/api/v1/agent-admin/observability/traces/{task_id}": {
+        "get": {
+          "operationId": "trace_api_v1_agent_admin_observability_traces__task_id__get",
+          "parameters": [
+            {
+              "in": "path",
+              "name": "task_id",
+              "required": true,
+              "schema": {
+                "title": "Task Id",
+                "type": "string"
+              }
+            },
+            {
+              "in": "query",
+              "name": "page",
+              "required": false,
+              "schema": {
+                "default": 0,
+                "maximum": 100000,
+                "minimum": 0,
+                "title": "Page",
+                "type": "integer"
+              }
+            }
+          ],
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          },
+          "summary": "Trace"
+        }
+      },
+      "/api/v1/agent-admin/releases": {
+        "post": {
+          "operationId": "stage_api_v1_agent_admin_releases_post",
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/app__release_routes__Candidate"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "201": {
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          },
+          "summary": "Stage",
+          "tags": [
+            "release management"
+          ]
+        }
+      },
+      "/api/v1/agent-admin/releases/validate": {
+        "post": {
+          "operationId": "validate_api_v1_agent_admin_releases_validate_post",
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/app__release_routes__Candidate"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          },
+          "summary": "Validate",
+          "tags": [
+            "release management"
+          ]
+        }
+      },
+      "/api/v1/agent-admin/releases/{release_id}": {
+        "get": {
+          "operationId": "details_api_v1_agent_admin_releases__release_id__get",
+          "parameters": [
+            {
+              "in": "path",
+              "name": "release_id",
+              "required": true,
+              "schema": {
+                "pattern": "^[0-9a-f]{64}$",
+                "title": "Release Id",
+                "type": "string"
+              }
+            }
+          ],
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          },
+          "summary": "Details",
+          "tags": [
+            "release management"
+          ]
+        }
+      },
+      "/api/v1/agent-admin/releases/{release_id}/activate": {
+        "post": {
+          "operationId": "activate_api_v1_agent_admin_releases__release_id__activate_post",
+          "parameters": [
+            {
+              "in": "path",
+              "name": "release_id",
+              "required": true,
+              "schema": {
+                "pattern": "^[0-9a-f]{64}$",
+                "title": "Release Id",
+                "type": "string"
+              }
+            }
+          ],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/app__release_routes__Rollout"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          },
+          "summary": "Activate",
+          "tags": [
+            "release management"
+          ]
+        }
+      },
+      "/api/v1/agent-admin/releases/{release_id}/revoke": {
+        "post": {
+          "operationId": "revoke_api_v1_agent_admin_releases__release_id__revoke_post",
+          "parameters": [
+            {
+              "in": "path",
+              "name": "release_id",
+              "required": true,
+              "schema": {
+                "pattern": "^[0-9a-f]{64}$",
+                "title": "Release Id",
+                "type": "string"
+              }
+            }
+          ],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Strict"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          },
+          "summary": "Revoke",
+          "tags": [
+            "release management"
+          ]
+        }
+      },
+      "/api/v1/agent-admin/releases/{release_id}/rollback": {
+        "post": {
+          "operationId": "rollback_api_v1_agent_admin_releases__release_id__rollback_post",
+          "parameters": [
+            {
+              "in": "path",
+              "name": "release_id",
+              "required": true,
+              "schema": {
+                "pattern": "^[0-9a-f]{64}$",
+                "title": "Release Id",
+                "type": "string"
+              }
+            }
+          ],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Strict"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          },
+          "summary": "Rollback",
+          "tags": [
+            "release management"
+          ]
+        }
+      },
+      "/api/v1/agent-admin/skills/activate": {
+        "post": {
+          "operationId": "activate_api_v1_agent_admin_skills_activate_post",
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/app__skill_routes__Rollout"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          },
+          "summary": "Activate",
+          "tags": [
+            "SkillOps"
+          ]
+        }
+      },
+      "/api/v1/agent-admin/skills/audit": {
+        "get": {
+          "operationId": "audit_api_v1_agent_admin_skills_audit_get",
+          "parameters": [
+            {
+              "in": "query",
+              "name": "business_id",
+              "required": false,
+              "schema": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Business Id"
+              }
+            }
+          ],
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          },
+          "summary": "Audit",
+          "tags": [
+            "SkillOps"
+          ]
+        }
+      },
+      "/api/v1/agent-admin/skills/revoke": {
+        "post": {
+          "operationId": "revoke_api_v1_agent_admin_skills_revoke_post",
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/app__skill_routes__Candidate"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          },
+          "summary": "Revoke",
+          "tags": [
+            "SkillOps"
+          ]
+        }
+      },
+      "/api/v1/agent-admin/skills/rollback": {
+        "post": {
+          "operationId": "rollback_api_v1_agent_admin_skills_rollback_post",
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/app__skill_routes__Candidate"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          },
+          "summary": "Rollback",
+          "tags": [
+            "SkillOps"
+          ]
+        }
+      },
+      "/api/v1/agent-admin/skills/stage": {
+        "post": {
+          "operationId": "stage_api_v1_agent_admin_skills_stage_post",
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/app__skill_routes__Candidate"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          },
+          "summary": "Stage",
+          "tags": [
+            "SkillOps"
+          ]
+        }
+      },
+      "/api/v1/agent-admin/skills/validate": {
+        "post": {
+          "operationId": "validate_api_v1_agent_admin_skills_validate_post",
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Validation"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          },
+          "summary": "Validate",
+          "tags": [
+            "SkillOps"
+          ]
+        }
+      },
+      "/api/v1/agent-admin/skills/{business_id}/{name}/{version}": {
+        "get": {
+          "operationId": "inspect_api_v1_agent_admin_skills__business_id___name___version__get",
+          "parameters": [
+            {
+              "in": "path",
+              "name": "business_id",
+              "required": true,
+              "schema": {
+                "title": "Business Id",
+                "type": "string"
+              }
+            },
+            {
+              "in": "path",
+              "name": "name",
+              "required": true,
+              "schema": {
+                "title": "Name",
+                "type": "string"
+              }
+            },
+            {
+              "in": "path",
+              "name": "version",
+              "required": true,
+              "schema": {
+                "title": "Version",
+                "type": "string"
+              }
+            }
+          ],
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          },
+          "summary": "Inspect",
+          "tags": [
+            "SkillOps"
+          ]
+        }
+      },
+      "/api/v1/agent/approvals": {
+        "get": {
+          "operationId": "approval_queue_api_v1_agent_approvals_get",
+          "parameters": [
+            {
+              "in": "query",
+              "name": "status",
+              "required": false,
+              "schema": {
+                "anyOf": [
+                  {
+                    "enum": [
+                      "requested",
+                      "approved",
+                      "rejected",
+                      "expired",
+                      "cancelled"
+                    ],
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Status"
+              }
+            },
+            {
+              "in": "query",
+              "name": "limit",
+              "required": false,
+              "schema": {
+                "default": 30,
+                "maximum": 100,
+                "minimum": 1,
+                "title": "Limit",
+                "type": "integer"
+              }
+            },
+            {
+              "in": "query",
+              "name": "offset",
+              "required": false,
+              "schema": {
+                "default": 0,
+                "maximum": 10000,
+                "minimum": 0,
+                "title": "Offset",
+                "type": "integer"
+              }
+            }
+          ],
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          },
+          "summary": "Approval Queue"
+        }
+      },
+      "/api/v1/agent/approvals/{approval_id}": {
+        "get": {
+          "operationId": "approval_details_api_v1_agent_approvals__approval_id__get",
+          "parameters": [
+            {
+              "in": "path",
+              "name": "approval_id",
+              "required": true,
+              "schema": {
+                "title": "Approval Id",
+                "type": "string"
+              }
+            }
+          ],
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          },
+          "summary": "Approval Details"
+        }
+      },
+      "/api/v1/agent/approvals/{approval_id}/decision": {
+        "post": {
+          "operationId": "approval_decision_api_v1_agent_approvals__approval_id__decision_post",
+          "parameters": [
+            {
+              "in": "path",
+              "name": "approval_id",
+              "required": true,
+              "schema": {
+                "title": "Approval Id",
+                "type": "string"
+              }
+            },
+            {
+              "in": "header",
+              "name": "Idempotency-Key",
+              "required": true,
+              "schema": {
+                "maxLength": 128,
+                "minLength": 1,
+                "title": "Idempotency-Key",
+                "type": "string"
+              }
+            }
+          ],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Decision"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          },
+          "summary": "Approval Decision"
+        }
+      },
+      "/api/v1/agent/approvals/{approval_id}/receipt": {
+        "get": {
+          "operationId": "verify_mock_receipt_api_v1_agent_approvals__approval_id__receipt_get",
+          "parameters": [
+            {
+              "in": "path",
+              "name": "approval_id",
+              "required": true,
+              "schema": {
+                "title": "Approval Id",
+                "type": "string"
+              }
+            }
+          ],
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          },
+          "summary": "Verify Mock Receipt"
+        }
+      },
+      "/api/v1/agent/capabilities": {
+        "get": {
+          "operationId": "capabilities_api_v1_agent_capabilities_get",
+          "parameters": [
+            {
+              "in": "query",
+              "name": "business_id",
+              "required": true,
+              "schema": {
+                "pattern": "^[A-Za-z0-9_.-]{1,128}$",
+                "title": "Business Id",
+                "type": "string"
+              }
+            }
+          ],
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          },
+          "summary": "Capabilities"
+        }
+      },
+      "/api/v1/agent/chat": {
+        "post": {
+          "operationId": "chat_api_v1_agent_chat_post",
+          "parameters": [
+            {
+              "in": "header",
+              "name": "Idempotency-Key",
+              "required": false,
+              "schema": {
+                "anyOf": [
+                  {
+                    "maxLength": 128,
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Idempotency-Key"
+              }
+            }
+          ],
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChatInput"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              },
+              "description": "Successful Response"
+            },
+            "202": {
+              "description": "Durable task accepted; Location is its query URL."
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          },
+          "summary": "Chat"
+        }
+      },
+      "/api/v1/agent/scenarios": {
+        "get": {
+          "operationId": "scene_list_api_v1_agent_scenarios_get",
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              },
+              "description": "Successful Response"
+            }
+          },
+          "summary": "Scene List"
+        }
+      },
+      "/api/v1/agent/sessions": {
+        "post": {
+          "operationId": "create_session_api_v1_agent_sessions_post",
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionInput"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "201": {
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          },
+          "summary": "Create Session"
+        }
+      },
+      "/api/v1/agent/sessions/{session_id}": {
+        "get": {
+          "operationId": "get_session_api_v1_agent_sessions__session_id__get",
+          "parameters": [
+            {
+              "in": "path",
+              "name": "session_id",
+              "required": true,
+              "schema": {
+                "pattern": "^[A-Za-z0-9_.-]{1,128}$",
+                "title": "Session Id",
+                "type": "string"
+              }
+            }
+          ],
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          },
+          "summary": "Get Session"
+        }
+      },
+      "/api/v1/agent/skills": {
+        "get": {
+          "operationId": "skills_api_v1_agent_skills_get",
+          "parameters": [
+            {
+              "in": "query",
+              "name": "business_id",
+              "required": true,
+              "schema": {
+                "pattern": "^[A-Za-z0-9_.-]{1,128}$",
+                "title": "Business Id",
+                "type": "string"
+              }
+            }
+          ],
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          },
+          "summary": "Skills"
+        }
+      },
+      "/api/v1/agent/tasks": {
+        "get": {
+          "operationId": "recent_api_v1_agent_tasks_get",
+          "parameters": [
+            {
+              "in": "query",
+              "name": "business_id",
+              "required": false,
+              "schema": {
+                "anyOf": [
+                  {
+                    "pattern": "^[A-Za-z0-9_.-]{1,128}$",
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Business Id"
+              }
+            }
+          ],
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          },
+          "summary": "Recent"
+        }
+      },
+      "/api/v1/agent/tasks/{task_id}": {
+        "get": {
+          "operationId": "get_task_api_v1_agent_tasks__task_id__get",
+          "parameters": [
+            {
+              "in": "path",
+              "name": "task_id",
+              "required": true,
+              "schema": {
+                "pattern": "^[A-Za-z0-9_.-]{1,128}$",
+                "title": "Task Id",
+                "type": "string"
+              }
+            }
+          ],
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          },
+          "summary": "Get Task"
+        }
+      },
+      "/api/v1/agent/tasks/{task_id}/cancel": {
+        "post": {
+          "operationId": "cancel_api_v1_agent_tasks__task_id__cancel_post",
+          "parameters": [
+            {
+              "in": "path",
+              "name": "task_id",
+              "required": true,
+              "schema": {
+                "pattern": "^[A-Za-z0-9_.-]{1,128}$",
+                "title": "Task Id",
+                "type": "string"
+              }
+            }
+          ],
+          "responses": {
+            "202": {
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          },
+          "summary": "Cancel"
+        }
+      },
+      "/api/v1/agent/tasks/{task_id}/events": {
+        "get": {
+          "operationId": "replay_api_v1_agent_tasks__task_id__events_get",
+          "parameters": [
+            {
+              "in": "path",
+              "name": "task_id",
+              "required": true,
+              "schema": {
+                "pattern": "^[A-Za-z0-9_.-]{1,128}$",
+                "title": "Task Id",
+                "type": "string"
+              }
+            },
+            {
+              "in": "header",
+              "name": "Last-Event-ID",
+              "required": false,
+              "schema": {
+                "default": 0,
+                "minimum": 0,
+                "title": "Last-Event-Id",
+                "type": "integer"
+              }
+            }
+          ],
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          },
+          "summary": "Replay"
+        }
+      },
+      "/api/v1/agent/tasks/{task_id}/plan": {
+        "get": {
+          "operationId": "get_plan_api_v1_agent_tasks__task_id__plan_get",
+          "parameters": [
+            {
+              "in": "path",
+              "name": "task_id",
+              "required": true,
+              "schema": {
+                "pattern": "^[A-Za-z0-9_.-]{1,128}$",
+                "title": "Task Id",
+                "type": "string"
+              }
+            }
+          ],
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          },
+          "summary": "Get Plan"
+        }
+      },
+      "/api/v1/agent/tasks/{task_id}/steps": {
+        "get": {
+          "operationId": "get_steps_api_v1_agent_tasks__task_id__steps_get",
+          "parameters": [
+            {
+              "in": "path",
+              "name": "task_id",
+              "required": true,
+              "schema": {
+                "pattern": "^[A-Za-z0-9_.-]{1,128}$",
+                "title": "Task Id",
+                "type": "string"
+              }
+            }
+          ],
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          },
+          "summary": "Get Steps"
+        }
+      },
+      "/api/v1/agent/tasks/{task_id}/trace": {
+        "get": {
+          "operationId": "trace_api_v1_agent_tasks__task_id__trace_get",
+          "parameters": [
+            {
+              "in": "path",
+              "name": "task_id",
+              "required": true,
+              "schema": {
+                "pattern": "^[A-Za-z0-9_.-]{1,128}$",
+                "title": "Task Id",
+                "type": "string"
+              }
+            }
+          ],
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          },
+          "summary": "Trace"
+        }
+      },
+      "/internal/agent/discover": {
+        "post": {
+          "operationId": "discover_capabilities",
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DiscoverInput"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          },
+          "summary": "Discover"
+        }
+      },
+      "/internal/agent/execute": {
+        "post": {
+          "operationId": "execute_capability",
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExecuteInput"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          },
+          "summary": "Execute"
+        }
+      },
+      "/internal/agent/retrieve": {
+        "post": {
+          "operationId": "retrieve_knowledge",
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RetrieveInput"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              },
+              "description": "Successful Response"
+            },
+            "422": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              },
+              "description": "Validation Error"
+            }
+          },
+          "summary": "Retrieve"
+        }
+      },
+      "/internal/agent/triggers/events": {
+        "post": {
+          "operationId": "trigger_event_internal_agent_triggers_events_post",
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              },
+              "description": "Successful Response"
+            }
+          },
+          "summary": "Trigger Event"
+        }
+      }
+    }
+  },
+  "public_signatures": {
+    "approvals.ApprovalStore.approval": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='actor'), arg(arg='approval_id')], kwonlyargs=[], kw_defaults=[], defaults=[])",
+    "approvals.ApprovalStore.approval_receipt": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='actor'), arg(arg='approval_id')], kwonlyargs=[], kw_defaults=[], defaults=[])",
+    "approvals.ApprovalStore.approvals": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='actor'), arg(arg='status'), arg(arg='limit'), arg(arg='offset')], kwonlyargs=[], kw_defaults=[], defaults=[])",
+    "approvals.ApprovalStore.decide_approval": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='actor'), arg(arg='approval_id'), arg(arg='decision'), arg(arg='digest'), arg(arg='key'), arg(arg='comment')], kwonlyargs=[], kw_defaults=[], defaults=[Constant(value='')])",
+    "approvals.ApprovalStore.process_mock_write": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='runtime'), arg(arg='claim'), arg(arg='tool'), arg(arg='args')], kwonlyargs=[], kw_defaults=[], defaults=[])",
+    "approvals.enabled": "arguments(posonlyargs=[], args=[arg(arg='setting')], kwonlyargs=[], kw_defaults=[], defaults=[Constant(value=None)])",
+    "approvals.mock_tool": "arguments(posonlyargs=[], args=[arg(arg='catalog'), arg(arg='sid'), arg(arg='name')], kwonlyargs=[], kw_defaults=[], defaults=[])",
+    "approvals.validate_write": "arguments(posonlyargs=[], args=[arg(arg='args'), arg(arg='context')], kwonlyargs=[], kw_defaults=[], defaults=[])",
+    "approvals.verify_receipt": "arguments(posonlyargs=[], args=[arg(arg='db'), arg(arg='receipt_id'), arg(arg='digest'), arg(arg='version')], kwonlyargs=[], kw_defaults=[], defaults=[])",
+    "main.create_app": "arguments(posonlyargs=[], args=[], kwonlyargs=[arg(arg='scenarios'), arg(arg='database'), arg(arg='token'), arg(arg='model_settings'), arg(arg='principals'), arg(arg='embedded_worker'), arg(arg='skill_root')], kw_defaults=[Constant(value=None), Constant(value=None), Constant(value=None), Constant(value=None), Constant(value=None), Constant(value=None), Constant(value=None)], defaults=[])",
+    "main.fail": "arguments(posonlyargs=[], args=[arg(arg='request_id'), arg(arg='fault')], kwonlyargs=[], kw_defaults=[], defaults=[])",
+    "plan_store.PlanStore.claim_step": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='worker_id'), arg(arg='lease_seconds')], kwonlyargs=[], kw_defaults=[], defaults=[])",
+    "plan_store.PlanStore.is_durable": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='task_id')], kwonlyargs=[], kw_defaults=[], defaults=[])",
+    "plan_store.PlanStore.plan_view": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='task_id')], kwonlyargs=[], kw_defaults=[], defaults=[])",
+    "plan_store.PlanStore.renew_step": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='claim'), arg(arg='lease_seconds')], kwonlyargs=[], kw_defaults=[], defaults=[])",
+    "plan_store.PlanStore.settle_step": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='claim'), arg(arg='result'), arg(arg='error')], kwonlyargs=[], kw_defaults=[], defaults=[Constant(value=None), Constant(value=None)])",
+    "providers.MockModelProvider.complete": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='messages')], kwonlyargs=[], kw_defaults=[], defaults=[])",
+    "providers.run_provider": "arguments(posonlyargs=[], args=[arg(arg='mode'), arg(arg='scenario', annotation=Name(id='dict', ctx=Load())), arg(arg='message', annotation=Name(id='str', ctx=Load())), arg(arg='history', annotation=Subscript(value=Name(id='list', ctx=Load()), slice=Name(id='dict', ctx=Load()), ctx=Load())), arg(arg='gateway'), arg(arg='settings', annotation=Name(id='dict', ctx=Load()))], kwonlyargs=[], kw_defaults=[], defaults=[])",
+    "runtime.Gateway.authorize_tool": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='tool'), arg(arg='arguments')], kwonlyargs=[], kw_defaults=[], defaults=[])",
+    "runtime.Gateway.check": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='ctx'), arg(arg='permission'), arg(arg='resource')], kwonlyargs=[], kw_defaults=[], defaults=[])",
+    "runtime.Gateway.check_output_secrets": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='payload')], kwonlyargs=[], kw_defaults=[], defaults=[])",
+    "runtime.Gateway.check_skill_tool": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='ctx'), arg(arg='name')], kwonlyargs=[], kw_defaults=[], defaults=[])",
+    "runtime.Gateway.context": "arguments(posonlyargs=[], args=[arg(arg='self')], kwonlyargs=[], kw_defaults=[], defaults=[])",
+    "runtime.Gateway.discover": "arguments(posonlyargs=[], args=[arg(arg='self')], kwonlyargs=[], kw_defaults=[], defaults=[])",
+    "runtime.Gateway.execute": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='name'), arg(arg='arguments'), arg(arg='call_id')], kwonlyargs=[], kw_defaults=[], defaults=[])",
+    "runtime.Gateway.read_skill_reference": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='path')], kwonlyargs=[], kw_defaults=[], defaults=[])",
+    "runtime.Gateway.remember": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='evidence')], kwonlyargs=[], kw_defaults=[], defaults=[])",
+    "runtime.Gateway.retrieve": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='query'), arg(arg='top_k')], kwonlyargs=[], kw_defaults=[], defaults=[Constant(value=5)])",
+    "runtime.Gateway.trace": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='event'), arg(arg='data')], kwonlyargs=[], kw_defaults=[], defaults=[])",
+    "runtime.Runtime.authorize": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='identity'), arg(arg='scenario'), arg(arg='context')], kwonlyargs=[], kw_defaults=[], defaults=[Constant(value=None)])",
+    "runtime.Runtime.authorize_task": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='actor'), arg(arg='scenario'), arg(arg='task_id')], kwonlyargs=[], kw_defaults=[], defaults=[])",
+    "runtime.Runtime.bind_releases": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='releases'), arg(arg='snapshots')], kwonlyargs=[], kw_defaults=[], defaults=[])",
+    "runtime.Runtime.drive": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='identity'), arg(arg='body'), arg(arg='task')], kwonlyargs=[], kw_defaults=[], defaults=[])",
+    "runtime.Runtime.eligible_skills": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='actor'), arg(arg='scenario'), arg(arg='tools'), arg(arg='snapshot_id')], kwonlyargs=[], kw_defaults=[], defaults=[Constant(value=None)])",
+    "runtime.Runtime.gateway": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='run_id')], kwonlyargs=[], kw_defaults=[], defaults=[])",
+    "runtime.Runtime.grant": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='identity'), arg(arg='scenario')], kwonlyargs=[], kw_defaults=[], defaults=[])",
+    "runtime.Runtime.launch": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='identity'), arg(arg='body'), arg(arg='task')], kwonlyargs=[], kw_defaults=[], defaults=[])",
+    "runtime.Runtime.load_skill": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='context'), arg(arg='pin')], kwonlyargs=[], kw_defaults=[], defaults=[])",
+    "runtime.Runtime.principals": "arguments(posonlyargs=[], args=[arg(arg='self')], kwonlyargs=[], kw_defaults=[], defaults=[])",
+    "runtime.Runtime.release_catalog": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='snapshot_id'), arg(arg='scene_id')], kwonlyargs=[], kw_defaults=[], defaults=[])",
+    "runtime.Runtime.select_skill": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='actor'), arg(arg='scenario'), arg(arg='requested'), arg(arg='catalog'), arg(arg='snapshot_id')], kwonlyargs=[], kw_defaults=[], defaults=[])",
+    "runtime.Runtime.skill_capabilities": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='actor'), arg(arg='scenario'), arg(arg='tools'), arg(arg='snapshot_id')], kwonlyargs=[], kw_defaults=[], defaults=[])",
+    "runtime.Runtime.validate_skill_input": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='business'), arg(arg='pin'), arg(arg='message'), arg(arg='context')], kwonlyargs=[], kw_defaults=[], defaults=[])",
+    "runtime.Runtime.validate_task_result": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='task_id'), arg(arg='result')], kwonlyargs=[], kw_defaults=[], defaults=[])",
+    "runtime.Runtime.visible_tools": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='actor'), arg(arg='scenario'), arg(arg='catalog'), arg(arg='snapshot_id')], kwonlyargs=[], kw_defaults=[], defaults=[])",
+    "runtime.preview": "arguments(posonlyargs=[], args=[arg(arg='value'), arg(arg='depth')], kwonlyargs=[], kw_defaults=[], defaults=[Constant(value=0)])",
+    "skills.SkillRegistry.activate": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='business'), arg(arg='name'), arg(arg='version')], kwonlyargs=[arg(arg='reviewer'), arg(arg='canary_percent'), arg(arg='_rollback')], kw_defaults=[Constant(value='local-reviewer'), Constant(value=100), Constant(value=False)], defaults=[])",
+    "skills.SkillRegistry.active": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='business_id')], kwonlyargs=[], kw_defaults=[], defaults=[])",
+    "skills.SkillRegistry.active_for": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='actor'), arg(arg='business_id')], kwonlyargs=[], kw_defaults=[], defaults=[])",
+    "skills.SkillRegistry.audit": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='business')], kwonlyargs=[], kw_defaults=[], defaults=[Constant(value=None)])",
+    "skills.SkillRegistry.compare": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='business'), arg(arg='name'), arg(arg='first'), arg(arg='second')], kwonlyargs=[], kw_defaults=[], defaults=[])",
+    "skills.SkillRegistry.governance": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='business'), arg(arg='name'), arg(arg='version')], kwonlyargs=[], kw_defaults=[], defaults=[])",
+    "skills.SkillRegistry.has_bindings": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='business_id')], kwonlyargs=[], kw_defaults=[], defaults=[])",
+    "skills.SkillRegistry.import_package": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='directory'), arg(arg='version')], kwonlyargs=[arg(arg='author')], kw_defaults=[Constant(value='local-author')], defaults=[Constant(value=None)])",
+    "skills.SkillRegistry.inspect_package": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='name'), arg(arg='version')], kwonlyargs=[], kw_defaults=[], defaults=[])",
+    "skills.SkillRegistry.load": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='business_id'), arg(arg='name'), arg(arg='version')], kwonlyargs=[], kw_defaults=[], defaults=[])",
+    "skills.SkillRegistry.migrate_legacy": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='business'), arg(arg='name'), arg(arg='version')], kwonlyargs=[arg(arg='author'), arg(arg='reviewer'), arg(arg='available_tools')], kw_defaults=[None, None, None], defaults=[])",
+    "skills.SkillRegistry.publish": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='business_id'), arg(arg='name'), arg(arg='version'), arg(arg='tools')], kwonlyargs=[arg(arg='available_tools'), arg(arg='capability_bindings')], kw_defaults=[Tuple(elts=[], ctx=Load()), Constant(value=None)], defaults=[Tuple(elts=[], ctx=Load())])",
+    "skills.SkillRegistry.read_reference": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='business_id'), arg(arg='name'), arg(arg='version'), arg(arg='path')], kwonlyargs=[], kw_defaults=[], defaults=[])",
+    "skills.SkillRegistry.revoke": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='business_id'), arg(arg='name'), arg(arg='version')], kwonlyargs=[arg(arg='reviewer')], kw_defaults=[Constant(value='local-reviewer')], defaults=[])",
+    "skills.SkillRegistry.rollback": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='business'), arg(arg='name'), arg(arg='version')], kwonlyargs=[arg(arg='reviewer')], kw_defaults=[Constant(value='local-reviewer')], defaults=[])",
+    "skills.SkillRegistry.stage": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='business'), arg(arg='name'), arg(arg='version')], kwonlyargs=[arg(arg='reviewer')], kw_defaults=[Constant(value='local-reviewer')], defaults=[])",
+    "skills.SkillRegistry.validate": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='business_id'), arg(arg='name'), arg(arg='version'), arg(arg='tools')], kwonlyargs=[arg(arg='available_tools'), arg(arg='capability_bindings'), arg(arg='author'), arg(arg='reviewer')], kw_defaults=[Tuple(elts=[], ctx=Load()), Constant(value=None), Constant(value=None), Constant(value='local-reviewer')], defaults=[Tuple(elts=[], ctx=Load())])",
+    "skills._UniqueKeysLoader.construct_mapping": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='node'), arg(arg='deep')], kwonlyargs=[], kw_defaults=[], defaults=[Constant(value=False)])",
+    "store.Store.audit": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='action'), arg(arg='decision'), arg(arg='identity'), arg(arg='task_id'), arg(arg='resource'), arg(arg='code')], kwonlyargs=[], kw_defaults=[], defaults=[Constant(value=None), Constant(value=None), Constant(value=None), Constant(value=None)])",
+    "store.Store.begin_call": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='task_id'), arg(arg='call_id'), arg(arg='cap_id'), arg(arg='version'), arg(arg='arguments'), arg(arg='max_calls')], kwonlyargs=[arg(arg='lease')], kw_defaults=[Constant(value=None)], defaults=[Constant(value=8)])",
+    "store.Store.cancel": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='identity'), arg(arg='task_id')], kwonlyargs=[], kw_defaults=[], defaults=[])",
+    "store.Store.close": "arguments(posonlyargs=[], args=[arg(arg='self')], kwonlyargs=[], kw_defaults=[], defaults=[])",
+    "store.Store.complete_call": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='task_id'), arg(arg='call_id'), arg(arg='result'), arg(arg='error')], kwonlyargs=[arg(arg='lease')], kw_defaults=[Constant(value=None)], defaults=[Constant(value=None)])",
+    "store.Store.consume_tool_attempt": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='task_id'), arg(arg='limit')], kwonlyargs=[arg(arg='lease')], kw_defaults=[Constant(value=None)], defaults=[])",
+    "store.Store.context_id": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='task_id')], kwonlyargs=[], kw_defaults=[], defaults=[])",
+    "store.Store.create_session": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='identity'), arg(arg='business_id'), arg(arg='context')], kwonlyargs=[], kw_defaults=[], defaults=[])",
+    "store.Store.emit": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='task_id'), arg(arg='event'), arg(arg='data')], kwonlyargs=[arg(arg='lease')], kw_defaults=[Constant(value=None)], defaults=[])",
+    "store.Store.events": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='task_id'), arg(arg='after')], kwonlyargs=[], kw_defaults=[], defaults=[Constant(value=0)])",
+    "store.Store.find_replay": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='identity'), arg(arg='body'), arg(arg='key')], kwonlyargs=[], kw_defaults=[], defaults=[])",
+    "store.Store.finish": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='task_id'), arg(arg='status'), arg(arg='result'), arg(arg='error')], kwonlyargs=[], kw_defaults=[], defaults=[Constant(value=None)])",
+    "store.Store.history": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='identity'), arg(arg='session_id'), arg(arg='limit')], kwonlyargs=[arg(arg='allowed_objects'), arg(arg='allowed_types'), arg(arg='allowed_permissions'), arg(arg='inherit_to'), arg(arg='skill')], kw_defaults=[Constant(value=None), Constant(value=None), Constant(value=None), Constant(value=None), Constant(value=None)], defaults=[Constant(value=6)])",
+    "store.Store.history_types": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='task_id')], kwonlyargs=[], kw_defaults=[], defaults=[])",
+    "store.Store.permissions": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='task_id')], kwonlyargs=[], kw_defaults=[], defaults=[])",
+    "store.Store.pin_mcp_configuration": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='task_id'), arg(arg='key'), arg(arg='digest')], kwonlyargs=[], kw_defaults=[], defaults=[])",
+    "store.Store.recent": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='identity'), arg(arg='business_id'), arg(arg='limit')], kwonlyargs=[], kw_defaults=[], defaults=[Constant(value=None), Constant(value=30)])",
+    "store.Store.run": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='run_context_id')], kwonlyargs=[], kw_defaults=[], defaults=[])",
+    "store.Store.scope": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='task_id')], kwonlyargs=[], kw_defaults=[], defaults=[])",
+    "store.Store.session": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='identity'), arg(arg='session_id'), arg(arg='business_id')], kwonlyargs=[], kw_defaults=[], defaults=[Constant(value=None)])",
+    "store.Store.skill_pin": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='task_id')], kwonlyargs=[], kw_defaults=[], defaults=[])",
+    "store.Store.start": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='identity'), arg(arg='body'), arg(arg='key'), arg(arg='business_version')], kwonlyargs=[arg(arg='plan'), arg(arg='snapshot_id'), arg(arg='budget'), arg(arg='admit'), arg(arg='skill')], kw_defaults=[Constant(value=None), Constant(value=None), Constant(value=None), Constant(value=None), Constant(value=None)], defaults=[])",
+    "store.Store.task": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='identity'), arg(arg='task_id')], kwonlyargs=[], kw_defaults=[], defaults=[])",
+    "store.Store.task_snapshot": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='task_id')], kwonlyargs=[], kw_defaults=[], defaults=[])",
+    "triggers.TriggerGateway.guard_task": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='task_id')], kwonlyargs=[], kw_defaults=[], defaults=[])",
+    "triggers.TriggerGateway.ingest": "arguments(posonlyargs=[], args=[arg(arg='self'), arg(arg='raw'), arg(arg='headers')], kwonlyargs=[arg(arg='now')], kw_defaults=[Constant(value=None)], defaults=[])",
+    "triggers.TriggerGateway.run": "arguments(posonlyargs=[], args=[arg(arg='self')], kwonlyargs=[], kw_defaults=[], defaults=[])",
+    "triggers.TriggerGateway.tick": "arguments(posonlyargs=[], args=[arg(arg='self')], kwonlyargs=[arg(arg='now')], kw_defaults=[Constant(value=None)], defaults=[])",
+    "triggers.sign": "arguments(posonlyargs=[], args=[arg(arg='secret'), arg(arg='source'), arg(arg='timestamp'), arg(arg='nonce'), arg(arg='raw')], kwonlyargs=[], kw_defaults=[], defaults=[])"
+  },
+  "terminal_events": {
+    "cancelled": "task_cancelled",
+    "completed": "task_completed",
+    "failed": "task_failed",
+    "partial": "task_completed"
+  }
+}
