@@ -1,4 +1,4 @@
-"""A paused approval survives a process boundary and uses current roles at dispatch."""
+"""审批等待可跨进程恢复，执行前须重新读取角色授权。"""
 import json
 import os
 from pathlib import Path
@@ -65,7 +65,7 @@ def test_external_worker_rechecks_reviewers_current_file_grant(tmp_path, monkeyp
         updated = tmp_path / "roles.next"
         updated.write_text(json.dumps(original), encoding="utf-8")
         updated.replace(roles)
-        # The already-running API also sees the revoked role immediately.
+        # 已启动的 API 也应立即拒绝被撤权的审批人。
         assert second.get(target, headers=approver).status_code in (403,404)
         worker = run_worker()
         try:

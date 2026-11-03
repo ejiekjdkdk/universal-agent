@@ -1,4 +1,4 @@
-"""Content-addressed local scenario bundles for reproducible plan execution."""
+"""按内容摘要保存本地场景包，使任务可按相同版本重现。"""
 import hashlib
 from dataclasses import dataclass
 import json
@@ -33,12 +33,13 @@ def _bundle(folder, scene):
 
 def _digest(files):
     entries = [(name, hashlib.sha256(content).hexdigest()) for name, content in files.items()]
-    return hashlib.sha256(json.dumps(entries, ensure_ascii=False).encode()).hexdigest()
+    serialized_entries = json.dumps(entries, ensure_ascii=False).encode()
+    return hashlib.sha256(serialized_entries).hexdigest()
 
 
 @dataclass(frozen=True)
 class Bundle:
-    """Verified metadata and source bytes with no imported candidate code."""
+    """已核验的元数据与源码字节，此时尚未导入候选代码。"""
     root: Path
     scenarios: dict
     adapter_sources: dict
@@ -51,7 +52,7 @@ class Snapshots:
         self.cache = {}
         self.current = {}
         self.baselines = {}
-        # Capture one release at startup; changes to a project take effect after restart.
+        # 启动时捕获当前版本。重启后才会读取本地项目文件的更新。
         for scene_id, scene in live.scenarios.items():
             folder = live.root / scene_id
             digest = self._publish(folder, scene)

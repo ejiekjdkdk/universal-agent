@@ -1,4 +1,4 @@
-"""Smoke test a copied project against an unmodified agent checkout, using real HTTP."""
+"""使用真实 HTTP 验证复制到仓库外的项目能接入既有底座。"""
 import argparse
 from contextlib import ExitStack, contextmanager
 import json
@@ -140,7 +140,9 @@ def verify(agent_root):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description="Smoke test a copied project against an unmodified agent checkout, using real HTTP."
+    )
     parser.add_argument("--agent-root", required=True, type=Path)
     args = parser.parse_args()
     print(json.dumps(verify(args.agent_root.resolve()), ensure_ascii=False, indent=2))

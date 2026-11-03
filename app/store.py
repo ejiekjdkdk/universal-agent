@@ -1,4 +1,4 @@
-"""SQLite persistence shared by the API and independently leased plan workers."""
+"""API 和独立 Worker 共用的 SQLite 存储，保存任务、会话、事件和工具调用。"""
 import hashlib
 import json
 import sqlite3
@@ -126,7 +126,7 @@ class Store(ApprovalStore, PlanStore):
 
     @contextmanager
     def _transaction(self, identity=None, action=None, resource=None, *, write=True):
-        # Acquire the interprocess writer lock before reading state used for a transition.
+        # 状态推进需先取得写锁再读取旧状态，避免两个进程同时依据过期状态作决定。
         with self._lock:
             try:
                 with self._db:
@@ -275,9 +275,14 @@ class Store(ApprovalStore, PlanStore):
             params.append(business_id)
         with self._lock:
             rows = self._db.execute(query + " ORDER BY t.rowid DESC LIMIT ?", (*params, max(0, min(limit, 100))))
-            return [{**{k: row[k] for k in ("task_id", "session_id", "business_id", "request_id", "mode",
-                    "message", "status", "created_at", "finished_at")}, "answer": json.loads(row["result"]).get("answer", "")}
-                    for row in rows]
+            fields = ("task_id", "session_id", "business_id", "request_id", "mode",
+                      "message", "status", "created_at", "finished_at")
+            summaries = []
+            for row in rows:
+                summary = {field: row[field] for field in fields}
+                summary["answer"] = json.loads(row["result"]).get("answer", "")
+                summaries.append(summary)
+            return summaries
 
     def permissions(self, task_id):
         with self._lock:
@@ -317,7 +322,7 @@ class Store(ApprovalStore, PlanStore):
             return messages
 
     def scope(self, task_id):
-        """Server-side authorization metadata, including for completed tasks."""
+        """返回任务绑定的对象范围，供服务端在任务结束后继续校验访问权限。"""
         with self._lock:
             row = self._db.execute("SELECT context FROM runs WHERE task_id=?", (task_id,)).fetchone()
             if not row:
@@ -386,7 +391,7 @@ class Store(ApprovalStore, PlanStore):
         self._db.execute("UPDATE runs SET revoked_at=? WHERE task_id=?", (finished, task_id))
         self._db.execute("""UPDATE calls SET status='unknown_outcome',duration_ms=MAX(0,CAST((?-started)*1000 AS INT))
             WHERE task_id=? AND status='running'""", (time.time(), task_id))
-        # Completed contexts cannot replay tools. Keep only the public answer and call metadata.
+        # 任务结束后没有工具重放需求，清除调用结果缓存，保留任务结果和调用记录。
         self._db.execute("UPDATE calls SET result=NULL WHERE task_id=? AND result IS NOT NULL", (task_id,))
         data = {"status": status}
         if "mock_commits" in result:

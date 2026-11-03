@@ -1,6 +1,6 @@
 {
   "id": "project_records",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "name": "项目记录查询",
   "description": "读取独立项目 API 中的一条记录，并核对来源和版本。",
   "example": "请查询 DOC-101 的状态",

@@ -1,4 +1,5 @@
 import json
+import hashlib
 import shutil
 import asyncio
 from contextlib import closing
@@ -11,6 +12,30 @@ from app.evaluations import evaluate_release
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_only_explicitly_approved_previous_source_can_pass_the_gate(tmp_path, monkeypatch):
+    from app import evaluations
+
+    catalog_root = tmp_path / "scenarios"
+    folder = shutil.copytree(ROOT / "scenarios" / "notes", catalog_root / "notes")
+    source = folder / "adapter.py"
+    previous = source.read_bytes().replace(b"\r\n", b"\n") + "\n# 旧版说明\n".encode()
+    source.write_bytes(previous)
+    catalog = SimpleNamespace(root=catalog_root)
+    assert not evaluate_release(catalog, "notes")["passed"]
+
+    # 历史摘要来自运维金标，候选目录里的文件不能自行获得批准。
+    suites = tmp_path / "operator-goldens"
+    suites.mkdir()
+    suite = json.loads((evaluations.SUITES / "notes.json").read_text(encoding="utf-8"))
+    suite["previous_adapter_sha256"] = [hashlib.sha256(previous).hexdigest()]
+    (suites / "notes.json").write_text(json.dumps(suite), encoding="utf-8")
+    monkeypatch.setattr(evaluations, "SUITES", suites)
+    assert evaluate_release(catalog, "notes")["passed"]
+
+    source.write_bytes(previous + b"\n")
+    assert not evaluate_release(catalog, "notes")["passed"]
 
 
 @pytest.mark.parametrize(("root", "scene"), [

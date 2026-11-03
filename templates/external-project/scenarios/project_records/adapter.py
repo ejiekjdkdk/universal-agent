@@ -1,4 +1,4 @@
-"""A trusted scenario adapter. Business records live in the project service."""
+"""通过项目自己的服务读取记录，由该服务负责业务数据。"""
 import os
 import re
 

@@ -1,4 +1,4 @@
-"""Use real publication gates, public APIs and queued workers across release changes."""
+"""通过发布门禁、公开接口和待调度任务验证版本切换。"""
 import asyncio
 import json
 from pathlib import Path
@@ -74,7 +74,7 @@ def test_running_task_stays_pinned_but_emergency_revoke_stops_dispatch(tmp_path,
         step()
         step()
         failed = c.get(interrupted, headers=OWNER).json()
-        assert failed["business_version"] == "1.0.0"
+        assert failed["business_version"] == "1.0.1"
         assert failed["error"]["code"] == "CAPABILITY_REVOKED"
         assert not any(call["capability_id"] == "compose_brief" for call in failed["tool_calls"])
 
@@ -99,4 +99,4 @@ def test_reactive_project_uses_selected_release_and_retains_its_task_pin(tmp_pat
         replay = c.post(BASE + "/chat", headers=key, json=body).json()
         assert replay["task_id"] == new["task_id"] and replay["snapshot_id"] == new["snapshot_id"]
         stable = c.post(BASE + "/chat", headers=OWNER, json=body).json()
-        assert stable["business_version"] == "1.0.0" and not stable["evidence"]
+        assert stable["business_version"] == "1.0.1" and not stable["evidence"]

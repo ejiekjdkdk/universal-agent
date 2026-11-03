@@ -1,6 +1,7 @@
 {
   "golden_version": "1.0.0",
-  "adapter_sha256": "0dd31ab16f654363a2055749c23e183320aac53d1ce547311413763e2c596a8f",
+  "adapter_sha256": "52ea4485712659604deaac86031003f1aeb0cc5ff52e82552bd267378da8aef8",
+  "previous_adapter_sha256": ["0dd31ab16f654363a2055749c23e183320aac53d1ce547311413763e2c596a8f"],
   "adapters": {
     "text_stats": [
       "python",

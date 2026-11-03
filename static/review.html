@@ -1,9 +1,51 @@
-<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>审批 · Universal Agent</title><link rel="stylesheet" href="/static/style.css"><script defer src="/static/review.js"></script></head><body>
-<header><div class="brand"><span class="mark">U</span><strong>Universal Agent</strong></div><a href="/">工作台</a></header>
-<section class="reviewdesk"><div class="kicker">LOCAL APPROVALS</div><h1>模拟变更审批</h1><p>核对提案对象与版本。批准后，Worker 会重新检查权限，再更新本地账本。</p>
-<form id="access"><label for="credential">审批人访问令牌</label> <input type="password" id="credential" autocomplete="off" required>
-<button class="primary" type="submit">查看审批队列</button></form>
-<div id="queueControls" hidden><label for="filter">状态</label> <select id="filter"><option value="requested">待审批</option><option value="approved">已批准</option><option value="rejected">已拒绝</option><option value="expired">已过期</option><option value="cancelled">已取消</option></select>
-<button id="reload">刷新</button> <button id="exit">退出审批身份</button></div><p id="feedback" role="status"></p><div id="queue"></div>
-<div id="pages" hidden><button id="prev">上一页</button> <button id="next">下一页</button></div></section></body></html>
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>审批 · Universal Agent</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script defer src="/static/review.js"></script>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <span class="mark">U</span>
+      <strong>Universal Agent</strong>
+    </div>
+    <a href="/">工作台</a>
+  </header>
+
+  <section class="reviewdesk">
+    <div class="kicker">LOCAL APPROVALS</div>
+    <h1>模拟变更审批</h1>
+    <p>核对提案对象与版本。批准后，Worker 会重新检查权限，再更新本地账本。</p>
+
+    <form id="access">
+      <label for="credential">审批人访问令牌</label>
+      <input type="password" id="credential" autocomplete="off" required>
+      <button class="primary" type="submit">查看审批队列</button>
+    </form>
+
+    <div id="queueControls" hidden>
+      <label for="filter">状态</label>
+      <select id="filter">
+        <option value="requested">待审批</option>
+        <option value="approved">已批准</option>
+        <option value="rejected">已拒绝</option>
+        <option value="expired">已过期</option>
+        <option value="cancelled">已取消</option>
+      </select>
+      <button id="reload">刷新</button>
+      <button id="exit">退出审批身份</button>
+    </div>
+
+    <p id="feedback" role="status"></p>
+    <div id="queue"></div>
+    <div id="pages" hidden>
+      <button id="prev">上一页</button>
+      <button id="next">下一页</button>
+    </div>
+  </section>
+</body>
+</html>

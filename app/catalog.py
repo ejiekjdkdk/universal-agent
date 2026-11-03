@@ -1,4 +1,4 @@
-"""Load reviewed local scenarios and dispatch tools within a single scenario."""
+"""加载已审核的本地场景，在单个场景的权限范围内调度工具。"""
 import asyncio
 import copy
 from datetime import datetime, timezone
@@ -67,7 +67,7 @@ def _check(value, schema):
 
 
 def _check_schema(schema):
-    """Support inline, typed schemas only. In particular, validation never fetches references."""
+    """仅支持内联且声明类型的 Schema，校验过程中不获取外部引用。"""
     if (not isinstance(schema, dict) or set(schema) - SCHEMA_KEYWORDS
             or not isinstance(schema.get("type"), str)):
         raise ValueError("unsupported schema keyword or missing explicit type")
@@ -124,7 +124,7 @@ def _check_url(url):
 
 
 def _terms(text):
-    """English words and overlapping Chinese character pairs, without a tokenizer dependency."""
+    """英文按词匹配，中文使用相邻双字，无需额外分词库。"""
     terms = set()
     for token in re.findall(r"[\u3400-\u9fff]+|[a-z0-9]+", text.casefold()):
         if len(token) > 1 and "\u3400" <= token[0] <= "\u9fff":
@@ -145,7 +145,7 @@ async def _call_http(config, arguments, transport):
                     error = Fault("RATE_LIMITED", "下游服务限流", 429, True)
                     retry_after = response.headers.get("Retry-After", "")
                     if retry_after.isascii() and retry_after.isdecimal():
-                        # Any longer delay also exceeds the request budget.
+                        # 更长的延迟同样会超出请求预算。
                         seconds = retry_after.lstrip("0") or "0"
                         error.retry_after = int(seconds) if len(seconds) <= 9 else 1_000_000_000
                     elif retry_after:
@@ -239,7 +239,10 @@ class Catalog:
                     types = {k: v.get("type") for k, v in schema.get("properties", {}).items()}
                     required = set(schema.get("required", []))
                     expected = set(fields)
-                    valid_required = required == expected or (key == "input_schema" and required == expected - {"expected_version"})
+                    valid_required = required == expected
+                    if not valid_required and key == "input_schema":
+                        # 模拟提交可省略前置版本，此时由服务端在创建提案时读取。
+                        valid_required = required == expected - {"expected_version"}
                     if types != fields or not valid_required:
                         raise ValueError(f"mock_ledger requires its fixed {key} fields")
             else:
@@ -247,7 +250,7 @@ class Catalog:
                     file = _local_file(directory, "adapter.py")
                     spec = importlib.util.spec_from_file_location(f"scenario_{sid}", file)
                     module = importlib.util.module_from_spec(spec)
-                    # Execute reviewed source, never an adjacent or unchecked cached .pyc.
+                    # 直接执行审核过的源码，防止邻近的 .pyc 缓存替换适配器。
                     source = file.read_bytes() if self._adapter_sources is None else self._adapter_sources[sid]
                     exec(compile(source, str(file), "exec"), module.__dict__)
                 handler = getattr(module, config["handler"], None)

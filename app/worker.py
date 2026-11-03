@@ -1,4 +1,4 @@
-"""Poll durable, read-only plan steps. Run separately with python -m app.worker."""
+"""领取并续租持久化计划步骤，执行只读工具或经审批的本地模拟写入。"""
 import asyncio
 import logging
 import os
@@ -33,21 +33,21 @@ class PlanWorker:
 
     async def execute(self, claim):
         try:
-            remaining = max(0, claim["deadline"] - time.time())
-            async with asyncio.timeout(remaining):
+            remaining_seconds = max(0, claim["deadline"] - time.time())
+            async with asyncio.timeout(remaining_seconds):
                 catalog = self.snapshots.open(claim["snapshot_id"], claim["business_id"])
                 gateway = Gateway(self.runtime, claim["run_context_id"], catalog=catalog, lease=claim)
                 step = claim["step"]
                 args = resolve_arguments(step, claim["outputs"])
-                ledger = mock_tool(catalog, claim["business_id"], step["capability_id"])
-                if ledger:
-                    self.store.process_mock_write(self.runtime, claim, ledger, args)
+                ledger_tool = mock_tool(catalog, claim["business_id"], step["capability_id"])
+                if ledger_tool:
+                    self.store.process_mock_write(self.runtime, claim, ledger_tool, args)
                     return
                 result = await gateway.execute(step["capability_id"], args, "plan." + claim["step_id"])
                 gateway.context()
                 self.store.settle_step(claim, result=result)
         except asyncio.CancelledError:
-            # A surviving worker may reclaim this read after lease expiry.
+            # 取消异常向上传递；其他 Worker 可在租约过期后按持久化状态接管步骤。
             raise
         except Exception as exc:
             if isinstance(exc, Fault):

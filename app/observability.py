@@ -1,4 +1,4 @@
-"""Admin-only local metrics and OTLP/HTTP JSON export from persisted lifecycle events."""
+"""从持久化事件生成本地指标和 OTLP/HTTP JSON，仅管理员可读取。"""
 from collections import Counter, defaultdict, deque
 from datetime import datetime
 import hashlib
@@ -61,8 +61,15 @@ def _usage_metrics(db):
     observed = [r for r in rows if r["reports"] == 1 and all(
         type(r[k]) is int and 0 <= r[k] < 2**31 for k in ("prompt", "completion"))]
     priced = [r for r in observed if r["usd"] is not None and math.isfinite(r["usd"]) and r["usd"] >= 0]
-    p, c = sum(r["prompt"] for r in observed), sum(r["completion"] for r in observed)
-    totals = {"prompt_tokens": p, "completion_tokens": c, "total_tokens": p+c} if observed else None
+    prompt_tokens = sum(row["prompt"] for row in observed)
+    completion_tokens = sum(row["completion"] for row in observed)
+    totals = None
+    if observed:
+        totals = {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        }
     cost = round(math.fsum(r["usd"] for r in priced), 12) if priced else None
     known_cost = cost if len(priced) == len(rows) else None
     count = len({r["task_id"] for r in rows})
@@ -100,7 +107,7 @@ def _metrics(store, first_event):
     finished = sum(map(len, latencies.values()))
     statuses = Counter(t["status"] for t in tasks)
     events = Counter(dict(attempts))
-    # Each lease expiry that led to a retry and each terminal failed attempt count once.
+    # 触发重试的租约到期和最终失败的尝试各计一次。
     return {"version": "1.0", "window": "last_1000_tasks", "task_count": len(tasks),
             "finished_count": finished, "status_counts": dict(statuses),
             "task_completion_rate": _rate(statuses["completed"], finished),
@@ -166,8 +173,8 @@ def _error(code):
 
 
 def _trace(store, tid, settings, page):
-    # Select metadata columns only; terminal event result, raw previews and free-form errors
-    # are intentionally never projected onto an exported span.
+    # 仅查询允许导出的元数据。终态结果、原始预览和自由格式的错误消息
+    # 不写入导出的 span。
     with store._transaction(write=False):
         row = store._db.execute("""SELECT t.request_id,t.status,t.created_at,t.finished_at,t.mode,
             json_extract(t.error,'$.code') AS error_code,s.business_id,p.snapshot_id
@@ -175,8 +182,8 @@ def _trace(store, tid, settings, page):
             WHERE t.task_id=?""", (tid,)).fetchone()
         if not row:
             raise HTTPException(404, "Task not found")
-        # Stable IDs are joined to their server-side record. An event payload alone
-        # cannot export an arbitrary string disguised as a tool, approval or step ID.
+        # 根据服务端记录校验标识，避免事件载荷中的任意字符串
+        # 冒充工具、审批或步骤标识进入导出结果。
         events = store._db.execute("""SELECT e.event_id AS id,e.event,e.timestamp,s.step_id,a.approval_id,
             c.execution_id,COALESCE(c.capability_id,json_extract(s.definition,'$.capability_id')) AS capability_id,
             json_extract(e.payload,'$.status') AS status,json_extract(e.payload,'$.error_code') AS error_code,
@@ -200,9 +207,15 @@ def _trace(store, tid, settings, page):
     def span(key, name, begin, finish, fields, failed=False, terminal=True, parent=root_id):
         attrs = [_attr("agent." + k, v) for k, v in fields.items() if v is not None]
         attrs.append(_attr("agent.duration_ms", max(0, (finish - begin) // 1_000_000)))
+        if failed:
+            status_code = 2
+        elif terminal:
+            status_code = 1
+        else:
+            status_code = 0
         data = {"traceId": trace_id, "spanId": _id(tid + "/" + key, 16), "name": name, "kind": 1,
                 "startTimeUnixNano": str(begin), "endTimeUnixNano": str(max(begin, finish)),
-                "attributes": attrs, "status": {"code": 2 if failed else (1 if terminal else 0)}}
+                "attributes": attrs, "status": {"code": status_code}}
         if parent:
             data["parentSpanId"] = parent
         return data

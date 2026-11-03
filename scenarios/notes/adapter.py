@@ -1,4 +1,4 @@
-"""Local demo adapter. Only the scenario-bound retrieval function can search notes."""
+"""通过绑定到当前场景的检索函数查找笔记。"""
 
 
 def search(arguments, retrieve):

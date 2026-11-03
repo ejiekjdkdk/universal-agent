@@ -1,3 +1,4 @@
+"""审批队列、人工决定和账本回执核对接口。"""
 from typing import Annotated, Literal
 
 from fastapi import Depends, Header, Query

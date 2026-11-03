@@ -1,4 +1,4 @@
-"""Exercise the copied starter using separate project and agent processes."""
+"""用独立的项目进程和底座进程验证复制后的接入模板。"""
 import json
 import os
 from pathlib import Path

@@ -1,4 +1,4 @@
-"""Fixed offline goldens and non-optional security probes for a frozen release."""
+"""针对冻结版本运行固定的离线金标用例和必测安全用例。"""
 import argparse
 import asyncio
 from contextlib import closing
@@ -41,7 +41,7 @@ def _read(folder, name):
 
 
 def _request_key(request):
-    # JSON Boolean and numeric values must remain different even though True == 1 in Python.
+    # Python 中 True 等于 1，但录制请求必须保留 JSON 布尔值与数值的区别。
     content = json.dumps(_load(request.content), sort_keys=True, allow_nan=False) if request.content else ""
     return request.method, str(request.url.copy_with(query=None)), tuple(sorted(request.url.params.multi_items())), content
 
@@ -81,26 +81,38 @@ class _RecordedHTTP:
 
 
 def _isolated_catalog(root, sid, suite, temp):
-    """Copy checked bytes, never import a candidate module or .pyc from its directory."""
+    """仅复制核验过的字节，从隔离目录运行，避免直接导入候选目录的模块或字节码。"""
     folder = (root / sid).resolve()
     if folder.parent != root.resolve():
         raise ValueError("nonlocal scenario")
     manifest = _read(folder, "scenario.json")
     scene = _load(manifest)
-    actual = {t["name"]: [t["adapter"]["type"], t["adapter"].get("handler"), t["permission"], t["action_level"]]
-              for t in scene["tools"]}
-    if actual != suite["adapters"] or any(
-        not (t[0] in {"python", "http"} and t[3] == "read" or t[0] == "mock_ledger" and t[3] == "commit_write")
-        for t in actual.values()
-    ):
+    bindings = {}
+    for tool in scene["tools"]:
+        adapter = tool["adapter"]
+        bindings[tool["name"]] = [adapter["type"], adapter.get("handler"), tool["permission"], tool["action_level"]]
+    if bindings != suite["adapters"]:
         raise ValueError("unreviewed bindings")
+    for adapter_type, _, _, action in bindings.values():
+        read_only = adapter_type in {"python", "http"} and action == "read"
+        mock_write = adapter_type == "mock_ledger" and action == "commit_write"
+        if not (read_only or mock_write):
+            raise ValueError("unreviewed bindings")
     http = _RecordedHTTP(scene, suite.get("http_fixtures", []))
     target = temp / sid
     target.mkdir()
     (target / "scenario.json").write_bytes(manifest)
-    if any(t[0] == "python" for t in actual.values()):
+    if any(adapter_type == "python" for adapter_type, _, _, _ in bindings.values()):
         code = _read(folder, "adapter.py").replace(b"\r\n", b"\n")
-        if hashlib.sha256(code).hexdigest() != suite["adapter_sha256"]:
+        # 历史摘要只能由运维写入可信金标，供仍受支持的旧版本重新评测和回滚。
+        previous_hashes = suite.get("previous_adapter_sha256", [])
+        if not isinstance(previous_hashes, list) or any(
+            not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value)
+            for value in previous_hashes
+        ):
+            raise ValueError("invalid historical adapter hashes")
+        digest = hashlib.sha256(code).hexdigest()
+        if digest != suite["adapter_sha256"] and digest not in previous_hashes:
             raise ValueError("adapter not approved for offline evaluation")
         (target / "adapter.py").write_bytes(code)
     if scene.get("documents"):
@@ -179,7 +191,7 @@ async def _case(catalog, sid, case):
 
 
 class _InjectionProbe:
-    """A synthetic retrieved instruction and a tripwire. No side-effecting handler exists."""
+    """模拟带注入指令的检索结果，以断言检测非法调度，不提供实际写入操作。"""
     scenarios = {"guard": {"version": "1.0.0", "tools": []}}
 
     def discover(self, sid):
@@ -240,13 +252,13 @@ async def _run(catalog, sid, suite):
         try:
             rows.append(await _case(catalog, sid, case))
         except Exception:
-            # Neither adapter exceptions nor evaluated material belong in the report.
+            # 报告仅记录问题类别，避免披露适配器异常详情或评测原文。
             rows.append(_row(case["case_id"], ["contract_or_execution_failure"], "golden"))
     return rows
 
 
 def evaluate_release(catalog, scene_id):
-    """Synchronous release gate. Use asyncio.to_thread from async handlers."""
+    """同步发布门禁。异步请求处理函数通过 asyncio.to_thread 调用。"""
     report = {"environment": "offline", "golden_version": VERSION, "planner_version": "offline-v1",
               "scenario_version": None, "suite_digest": None, "business_id": scene_id}
     rows, cases = [], []

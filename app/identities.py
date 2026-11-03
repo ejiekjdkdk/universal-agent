@@ -1,4 +1,4 @@
-"""Load a reviewed local role map; credentials remain in server-side environment variables."""
+"""从本地角色文件读取授权，令牌由服务端环境变量提供。"""
 import json
 import os
 from pathlib import Path
@@ -11,8 +11,12 @@ def local_principals(catalog, default_token, supplied=None):
     if supplied is not None:
         return supplied
     if not path:
-        grants = {sid: {"permissions": sorted({"knowledge.read"} | {t["permission"] for t in catalog.discover(sid)})}
-                  for sid in catalog.scenarios}
+        grants = {}
+        for scene_id in catalog.scenarios:
+            permissions = {"knowledge.read"}
+            for tool in catalog.discover(scene_id):
+                permissions.add(tool["permission"])
+            grants[scene_id] = {"permissions": sorted(permissions)}
         return {default_token: {"tenant_id": "personal", "org_id": "local", "user_id": "owner", "grants": grants}}
     entries = json.loads(Path(path).read_text(encoding="utf-8"))
     if not isinstance(entries, list) or not entries:
@@ -38,9 +42,9 @@ def local_principals(catalog, default_token, supplied=None):
                 raise ValueError("Invalid scenario grant")
             if set(grant) - {"permissions", "objects", "resource_types"}:
                 raise ValueError("Unknown grant fields")
-            if not all(isinstance(values, list) and all(isinstance(v, str) and v for v in values)
-                       for values in grant.values()):
-                raise ValueError("Invalid permission or resource list")
+            for values in grant.values():
+                if not isinstance(values, list) or not all(isinstance(value, str) and value for value in values):
+                    raise ValueError("Invalid permission or resource list")
         actors[token] = {k: v for k, v in entry.items() if k != "token_env"}
         subjects.add(subject)
     return actors
@@ -53,7 +57,7 @@ def check_credentials(actors, admin, service):
 
 
 def role_source(catalog, default_token, supplied, admin, service):
-    """Workers and the API consult the same operator-owned file at authorization time."""
+    """API 与 Worker 每次鉴权都重读同一份角色文件，使撤权及时生效。"""
     if supplied is not None or not os.getenv("AGENT_PRINCIPALS_FILE"):
         return None
     def current():

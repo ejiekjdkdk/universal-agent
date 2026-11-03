@@ -1,4 +1,5 @@
-"""Prepare reviewed, scenario-local read-only plans for the durable executor."""
+"""读取场景内已审核的计划，并在交给持久化执行器前校验依赖、参数、权限和预算。"""
+
 import copy
 import json
 import re
@@ -12,16 +13,31 @@ from .errors import Fault
 from .approvals import enabled, mock_tool, validate_write
 
 
-BUDGET_LIMITS = {"max_steps": 12, "max_parallel_steps": 3, "max_tool_calls": 12,
-                 "deadline_ms": 900_000}
+BUDGET_LIMITS = {
+    "max_steps": 12,
+    "max_parallel_steps": 3,
+    "max_tool_calls": 12,
+    "deadline_ms": 900_000,
+}
 MAX_EDGES = 24
 MAX_DAG_DEPTH = 6
-STEP = _object({
-    "step_id": ID, "capability_id": ID, "depends_on": {"type": "array", "items": ID, "uniqueItems": True},
-    "arguments": {"type": "object"}, "required": {"type": "boolean"},
-}, ["step_id", "capability_id", "arguments"])
-PLAN = _object({"schema_version": {"const": "2.0"}, "result_contract": {"const": "summary_v1"},
-                "steps": {"type": "array", "minItems": 1, "items": STEP}})
+STEP = _object(
+    {
+        "step_id": ID,
+        "capability_id": ID,
+        "depends_on": {"type": "array", "items": ID, "uniqueItems": True},
+        "arguments": {"type": "object"},
+        "required": {"type": "boolean"},
+    },
+    ["step_id", "capability_id", "arguments"],
+)
+PLAN = _object(
+    {
+        "schema_version": {"const": "2.0"},
+        "result_contract": {"const": "summary_v1"},
+        "steps": {"type": "array", "minItems": 1, "items": STEP},
+    }
+)
 
 
 def _invalid(reason):
@@ -37,7 +53,7 @@ class PlanProvider(Protocol):
 
 
 class MockPlanProvider:
-    """Read a trusted server-side template. No prompt or client field selects a file."""
+    """从服务端确定的场景目录读取已审核模板。"""
 
     def propose_plan(self, catalog, scene_id):
         root = Path(catalog.root).resolve()
@@ -50,8 +66,11 @@ class MockPlanProvider:
                 raw = stream.read(131073)
             if len(raw) > 131072:
                 raise _over_budget("场景计划文件超过大小上限。")
-            return json.loads(raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys,
-                              parse_constant=_reject_nonfinite)
+            return json.loads(
+                raw.decode("utf-8"),
+                object_pairs_hook=_reject_duplicate_keys,
+                parse_constant=_reject_nonfinite,
+            )
         except FileNotFoundError:
             raise Fault("PLAN_NOT_FOUND", "此场景未配置 durable_plan 模板。", 404) from None
         except (OSError, ValueError, RecursionError):
@@ -74,7 +93,7 @@ def _budget(request):
 
 
 def _order(steps):
-    """Stable topological order, with all transitive ancestors for reference checks."""
+    """按拓扑顺序排列步骤，同级按声明顺序选取，同时记录可引用的直接和间接前驱。"""
     ids = {s["step_id"] for s in steps}
     if len(ids) != len(steps) or any(set(s["depends_on"]) - ids for s in steps):
         raise _invalid("步骤 ID 重复或引用了不存在的依赖。")
@@ -99,8 +118,12 @@ def _order(steps):
 
 
 def _pointer(path):
-    if (not isinstance(path, str) or len(path) > 1024 or not path.startswith("/data/")
-            or re.search(r"~(?![01])", path)):
+    if (
+        not isinstance(path, str)
+        or len(path) > 1024
+        or not path.startswith("/data/")
+        or re.search(r"~(?![01])", path)
+    ):
         raise _invalid("输出引用须使用指向 data 内已声明字段的 JSON Pointer。")
     parts = [p.replace("~1", "/").replace("~0", "~") for p in path.split("/")[2:]]
     if len(parts) > 16 or any(p in {"", ".", "..", "*"} or p.startswith("$") for p in parts):
@@ -122,7 +145,7 @@ def _declared_output(schema, parts):
 
 
 def _prepare_arguments(step, tools, ancestors, step_tools, message):
-    """Check literals now and retain typed predecessor references for runtime validation."""
+    """在准备计划时校验字面值及引用字段的类型，待前驱完成后再校验解析出的实参。"""
     refs = set()
     tool = tools[step["capability_id"]]
     inputs = tool["input_schema"]
@@ -139,7 +162,9 @@ def _prepare_arguments(step, tools, ancestors, step_tools, message):
                 source = value["$step_output"]
                 if not isinstance(source, str) or source not in ancestors:
                     raise _invalid("步骤仅可引用自身的前置依赖。")
-                source_schema = _declared_output(step_tools[source]["output_schema"], _pointer(value["path"]))
+                source_schema = _declared_output(
+                    step_tools[source]["output_schema"], _pointer(value["path"])
+                )
                 types = (source_schema["type"], schema.get("type"))
                 if types[0] != types[1] and types != ("integer", "number"):
                     raise _invalid("引用字段与目标输入类型不匹配。")
@@ -156,7 +181,7 @@ def _prepare_arguments(step, tools, ancestors, step_tools, message):
         raise _invalid("步骤输入必须是对象。")
     for err in Draft202012Validator(inputs).iter_errors(arguments):
         location = tuple(err.absolute_path)
-        if not any(location[:len(ref)] == ref for ref in refs):
+        if not any(location[: len(ref)] == ref for ref in refs):
             raise _invalid(f"步骤 {step['step_id']} 的输入不符合 {err.validator} 校验。")
     field = tool.get("object_ids_field")
     if field and any(not ref or ref[0] == field for ref in refs):
@@ -175,7 +200,9 @@ def _check_size(arguments):
     return size
 
 
-def prepare_plan(catalog, scene_id, message, permissions, context, *, budget=None, mock_writes=None):
+def prepare_plan(
+    catalog, scene_id, message, permissions, context, *, budget=None, mock_writes=None
+):
     budget = _budget(budget)
     tools = {tool["name"]: tool for tool in catalog.discover(scene_id)}
     plan = MockPlanProvider().propose_plan(catalog, scene_id)
@@ -204,7 +231,9 @@ def prepare_plan(catalog, scene_id, message, permissions, context, *, budget=Non
         if mock:
             validate_write(args, context)
         field = tool.get("object_ids_field")
-        if field and (not args.get(field) or not set(args[field]).issubset(context.get("object_ids", []))):
+        if field and (
+            not args.get(field) or not set(args[field]).issubset(context.get("object_ids", []))
+        ):
             raise Fault("PERMISSION_DENIED", "请求的对象超出了任务授权范围。", 403)
         step["arguments"] = args
         step_tools[sid] = tool
@@ -213,7 +242,7 @@ def prepare_plan(catalog, scene_id, message, permissions, context, *, budget=Non
 
 
 def resolve_arguments(step, outputs):
-    """Resolve a validated, persisted template. Never interpret returned data as instructions."""
+    """从已完成的前驱读取参数值。取出的数据只做深拷贝，防止其中的字段被再次解释为指令。"""
     expanded_size = 0
 
     def resolve(value):
@@ -234,7 +263,9 @@ def resolve_arguments(step, outputs):
                         raise _over_budget("引用数据展开后超过步骤大小上限。")
                     return copy.deepcopy(node)
                 except (KeyError, IndexError, ValueError, TypeError):
-                    raise Fault("STEP_OUTPUT_UNAVAILABLE", "依赖步骤未返回计划声明的字段。", 422) from None
+                    raise Fault(
+                        "STEP_OUTPUT_UNAVAILABLE", "依赖步骤未返回计划声明的字段。", 422
+                    ) from None
             return {k: resolve(v) for k, v in value.items()}
         if isinstance(value, list):
             return [resolve(v) for v in value]

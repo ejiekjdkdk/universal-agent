@@ -1,4 +1,4 @@
-"""Deterministic offline execution and a bounded Chat Completions tool loop."""
+"""运行确定性的离线规划器，以及限制轮数和工具调用次数的 Chat Completions 规划器。"""
 
 import asyncio
 import ipaddress
@@ -13,19 +13,35 @@ from .errors import Fault
 
 
 def _tool(name, description, fields, required):
-    return {"type": "function", "function": {
-        "name": name, "description": description,
-        "parameters": {"type": "object", "properties": fields, "required": required,
-                       "additionalProperties": False}}}
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": {
+                "type": "object",
+                "properties": fields,
+                "required": required,
+                "additionalProperties": False,
+            },
+        },
+    }
 
 
 TOOLS = [
     _tool("discover_capabilities", "List available scenario tools and argument schemas.", {}, []),
-    _tool("execute_capability", "Run one scenario tool using its published argument schema.",
-          {"name": {"type": "string"}, "arguments": {"type": "object"}}, ["name", "arguments"]),
-    _tool("retrieve_knowledge", "Search sources available to this scenario.",
-          {"query": {"type": "string"}, "top_k": {"type": "integer", "minimum": 1, "maximum": 10}},
-          ["query"]),
+    _tool(
+        "execute_capability",
+        "Run one scenario tool using its published argument schema.",
+        {"name": {"type": "string"}, "arguments": {"type": "object"}},
+        ["name", "arguments"],
+    ),
+    _tool(
+        "retrieve_knowledge",
+        "Search sources available to this scenario.",
+        {"query": {"type": "string"}, "top_k": {"type": "integer", "minimum": 1, "maximum": 10}},
+        ["query"],
+    ),
 ]
 SYSTEM = (
     "Answer the user in their language. Use discover_capabilities to inspect authorized tools "
@@ -59,18 +75,32 @@ def _configuration(settings):
         loopback = ipaddress.ip_address(url.host).is_loopback
     except ValueError:
         loopback = url.host == "localhost"
-    if (not url.host or url.userinfo or url.query or url.fragment
-            or (url.scheme != "https" and not (loopback and url.scheme == "http"))
-            or not isinstance(model, str) or not model.strip() or len(model) > 256
-            or not isinstance(key, str) or len(key) > 4096 or (not key and not loopback)
-            or (key and not re.fullmatch(r"[!-~]+", key))):
+    if (
+        not url.host
+        or url.userinfo
+        or url.query
+        or url.fragment
+        or (url.scheme != "https" and not (loopback and url.scheme == "http"))
+        or not isinstance(model, str)
+        or not model.strip()
+        or len(model) > 256
+        or not isinstance(key, str)
+        or len(key) > 4096
+        or (not key and not loopback)
+        or (key and not re.fullmatch(r"[!-~]+", key))
+    ):
         raise missing
     return str(url).rstrip("/") + "/chat/completions", model, key
 
 
 async def _completion(client, url, model, messages):
-    payload = {"model": model, "messages": messages, "tools": TOOLS, "tool_choice": "auto",
-               "stream": False}
+    payload = {
+        "model": model,
+        "messages": messages,
+        "tools": TOOLS,
+        "tool_choice": "auto",
+        "stream": False,
+    }
     async with client.stream("POST", url, json=payload) as response:
         if response.status_code != 200:
             retry = response.status_code in {408, 429} or response.status_code >= 500
@@ -86,8 +116,7 @@ async def _completion(client, url, model, messages):
         msg = choice["message"]
         if not isinstance(msg, dict) or msg.get("role") != "assistant":
             raise _invalid_reply()
-        # Some proxies include request diagnostics in a successful completion.
-        # Reject a reflected bearer token before any answer or tool call is persisted.
+        # 代理可能在成功响应中回显鉴权令牌，应在保存回答或分发工具调用前拦截。
         secret = client.headers.get("Authorization", "").removeprefix("Bearer ")
         if secret and json.dumps(secret)[1:-1] in json.dumps(msg):
             raise _invalid_reply()
@@ -101,8 +130,12 @@ async def _completion(client, url, model, messages):
 def _parse_call(call, seen):
     try:
         call_id, fn = call["id"], call["function"]
-        if (call["type"] != "function" or not isinstance(call_id, str)
-                or not re.fullmatch(r"[a-zA-Z0-9_-]{1,128}", call_id) or call_id in seen):
+        if (
+            call["type"] != "function"
+            or not isinstance(call_id, str)
+            or not re.fullmatch(r"[a-zA-Z0-9_-]{1,128}", call_id)
+            or call_id in seen
+        ):
             raise _invalid_reply()
         name, raw = fn["name"], fn["arguments"]
         if not isinstance(raw, str) or len(raw) > 48_000:
@@ -113,12 +146,21 @@ def _parse_call(call, seen):
         if name == "discover_capabilities":
             valid = not args
         elif name == "execute_capability":
-            valid = (set(args) == {"name", "arguments"} and isinstance(args["name"], str)
-                     and 0 < len(args["name"]) <= 128 and isinstance(args["arguments"], dict))
+            valid = (
+                set(args) == {"name", "arguments"}
+                and isinstance(args["name"], str)
+                and 0 < len(args["name"]) <= 128
+                and isinstance(args["arguments"], dict)
+            )
         elif name == "retrieve_knowledge":
             k = args.get("top_k", 5)
-            valid = (set(args) <= {"query", "top_k"} and isinstance(args.get("query"), str)
-                     and 0 < len(args["query"].strip()) <= 8192 and type(k) is int and 1 <= k <= 10)
+            valid = (
+                set(args) <= {"query", "top_k"}
+                and isinstance(args.get("query"), str)
+                and 0 < len(args["query"].strip()) <= 8192
+                and type(k) is int
+                and 1 <= k <= 10
+            )
         else:
             valid = False
         if not valid:
@@ -184,8 +226,16 @@ def _record_usage(gateway, round_no, usage, rates):
     cost = None
     if None not in rates:
         cost = (prompt * rates[0] + completion * rates[1]) / 1_000_000
-    gateway.trace("model_usage", {"round": round_no, "prompt_tokens": prompt, "completion_tokens": completion,
-                                  "estimated_cost_usd": cost, "cost_basis": "operator_rates_per_million" if cost is not None else None})
+    gateway.trace(
+        "model_usage",
+        {
+            "round": round_no,
+            "prompt_tokens": prompt,
+            "completion_tokens": completion,
+            "estimated_cost_usd": cost,
+            "cost_basis": "operator_rates_per_million" if cost is not None else None,
+        },
+    )
 
 
 async def _model_loop(client, url, model, messages, gateway, max_rounds, max_calls, rates):
@@ -201,7 +251,7 @@ async def _model_loop(client, url, model, messages, gateway, max_rounds, max_cal
             answer = reply.get("content")
             if not isinstance(answer, str):
                 raise _invalid_reply()
-            # Some local Chat Completions servers prepend reasoning in the text field.
+            # 部分本地模型将推理过程放在正文开头，保存回答前先移除这段内容。
             answer = answer.strip()
             if answer.startswith("<think>"):
                 _, closed, answer = answer.partition("</think>")
@@ -210,7 +260,7 @@ async def _model_loop(client, url, model, messages, gateway, max_rounds, max_cal
                 answer = answer.strip()
             if not answer or len(answer) > 16_000 or "<think>" in answer or "</think>" in answer:
                 raise _invalid_reply()
-            # Only labels assigned to this run's gateway evidence can be emitted.
+            # 回答中的引用编号必须来自本次网关实际返回的证据。
             allowed = {f"E{i}" for i in range(1, len(sources) + 1)}
             labels = re.findall(r"\[([^\[\]]*)\]", answer)
             if re.search(r"\]\s*\(", answer) or any(label not in allowed for label in labels):
@@ -219,16 +269,18 @@ async def _model_loop(client, url, model, messages, gateway, max_rounds, max_cal
         if len(seen) + len(calls) > max_calls or round_no == max_rounds:
             raise _limit()
         parsed = [_parse_call(call, seen) for call in calls]
-        messages.append({"role": "assistant", "content": None,
-                         "tool_calls": [clean for clean, _, _ in parsed]})
+        messages.append(
+            {"role": "assistant", "content": None, "tool_calls": [clean for clean, _, _ in parsed]}
+        )
         for clean, name, args in parsed:
             gateway.trace("model_tool_call", {"round": round_no, "function": name})
             messages.append(await _tool_result(gateway, name, args, clean["id"], sources))
     raise _limit()
 
 
-async def run_provider(mode, scenario: dict, message: str, history: list[dict], gateway,
-                       settings: dict) -> str:
+async def run_provider(
+    mode, scenario: dict, message: str, history: list[dict], gateway, settings: dict
+) -> str:
     if not isinstance(message, str) or not message.strip() or len(message) > 16_000:
         raise Fault("INVALID_REQUEST", "请求文本长度无效。")
     if mode == "offline":
@@ -245,19 +297,29 @@ async def run_provider(mode, scenario: dict, message: str, history: list[dict], 
     max_calls = _budget(settings, "max_calls", 8, 32)
     messages = [{"role": "system", "content": SYSTEM}]
     for entry in history[-12:]:
-        if (entry.get("role") in ("user", "assistant")
-                and isinstance(entry.get("content"), str)):
+        if entry.get("role") in ("user", "assistant") and isinstance(entry.get("content"), str):
             messages.append({"role": entry["role"], "content": entry["content"][:4000]})
     messages.append({"role": "user", "content": message})
     gateway.trace("provider_selected", {"mode": "openai", "model": model})
     headers = {"Authorization": f"Bearer {key}"} if key else {}
     try:
-        async with asyncio.timeout(90), httpx.AsyncClient(
-            headers=headers, transport=settings.get("transport"), trust_env=False,
-            follow_redirects=False, timeout=httpx.Timeout(30, connect=5),
-        ) as client:
-            rates = (_price(settings, "input_usd_per_million"), _price(settings, "output_usd_per_million"))
-            return await _model_loop(client, url, model, messages, gateway, max_rounds, max_calls, rates)
+        async with (
+            asyncio.timeout(90),
+            httpx.AsyncClient(
+                headers=headers,
+                transport=settings.get("transport"),
+                trust_env=False,
+                follow_redirects=False,
+                timeout=httpx.Timeout(30, connect=5),
+            ) as client,
+        ):
+            rates = (
+                _price(settings, "input_usd_per_million"),
+                _price(settings, "output_usd_per_million"),
+            )
+            return await _model_loop(
+                client, url, model, messages, gateway, max_rounds, max_calls, rates
+            )
     except (TimeoutError, httpx.TimeoutException):
         raise Fault("MODEL_TIMEOUT", "模型请求超时。", 504, True) from None
     except httpx.RequestError:

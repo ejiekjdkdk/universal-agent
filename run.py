@@ -1,4 +1,4 @@
-"""Start the personal workbench on loopback with one worker."""
+"""启动只监听本机回环地址的工作台。"""
 import os
 from pathlib import Path
 

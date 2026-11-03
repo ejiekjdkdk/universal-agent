@@ -100,6 +100,7 @@ class RequestLimits:
                 return await fail(uuid4().hex, Fault("INVALID_REQUEST", "请求过大", 400))(scope, receive, send)
             if not packet.get("more_body"):
                 break
+        # 下游应用仍从 ASGI 的 receive 读取同一份、已校验大小的请求体。
         delivered = False
 
         async def replay():
@@ -143,7 +144,8 @@ def create_app(*, scenarios=None, database=None, token=None, model_settings=None
             raise ValueError("This release supports only the local mock ledger")
         app.state.snapshots = Snapshots(db_path, catalog)
         store = Store(db_path)
-        rt = app.state.runtime = Runtime(catalog, store, actors, model)
+        rt = Runtime(catalog, store, actors, model)
+        app.state.runtime = rt
         rt.role_source = role_source(catalog, local_token, principals, admin_token, service_token)
         dispatcher = None
         try:
@@ -154,6 +156,7 @@ def create_app(*, scenarios=None, database=None, token=None, model_settings=None
                 dispatcher = asyncio.create_task(worker.run())
             yield
         finally:
+            # 等待已取消的 Worker 退出，随后才能关闭它们共用的 SQLite 连接。
             workers = list(app.state.runtime.workers.values())
             if dispatcher:
                 workers.append(dispatcher)
@@ -239,23 +242,25 @@ def create_app(*, scenarios=None, database=None, token=None, model_settings=None
 
     @app.get(API + "/scenarios")
     async def scene_list(actor=Depends(identify)):
-        rt = runtime()
+        agent_runtime = runtime()
         scenes = []
-        for sid in rt.catalog.scenarios:
-            grant = rt.grant(actor, sid)
+        for scenario_id in agent_runtime.catalog.scenarios:
+            grant = agent_runtime.grant(actor, scenario_id)
             if not grant:
                 continue
             try:
-                selected = rt.releases.select(sid, actor, "")
+                selected = agent_runtime.releases.select(scenario_id, actor, "")
             except Fault as exc:
                 if exc.code == "CAPABILITY_REVOKED":
                     continue
                 raise
-            scene = rt.release_catalog(selected, sid).scenarios[sid]
+            scene = agent_runtime.release_catalog(selected, scenario_id).scenarios[scenario_id]
             objects = grant.get("objects", [])
-            scenes.append({**{k: scene.get(k) for k in ("id", "name", "description", "version", "example")},
-                           "durable_plan": (rt.release_catalog(selected, sid).root / sid / "plan.json").is_file(),
-                           "default_object": objects[0] if len(objects) == 1 else None})
+            summary = {field: scene.get(field) for field in ("id", "name", "description", "version", "example")}
+            plan_path = agent_runtime.release_catalog(selected, scenario_id).root / scenario_id / "plan.json"
+            summary["durable_plan"] = plan_path.is_file()
+            summary["default_object"] = objects[0] if len(objects) == 1 else None
+            scenes.append(summary)
         return {"scenarios": scenes, "model_available": model_ready, "model_name": model.get("model", ""),
                 "can_review": any("approval.decide" in g["permissions"] for g in actor["grants"].values())}
 
@@ -289,69 +294,80 @@ def create_app(*, scenarios=None, database=None, token=None, model_settings=None
     @app.post(API + "/chat", responses={202: {"description": "Durable task accepted; Location is its query URL."}})
     async def chat(body: ChatInput, actor=Depends(identify),
                    key: Annotated[str | None, Header(alias="Idempotency-Key", min_length=1, max_length=128)] = None):
-        rt = runtime()
-        data = body.model_dump(exclude_none=True)
-        durable = body.execution_mode == "durable_plan"
-        if not durable:
-            data.pop("execution_mode")
+        agent_runtime = runtime()
+        request_data = body.model_dump(exclude_none=True)
+        is_durable = body.execution_mode == "durable_plan"
+        if not is_durable:
+            request_data.pop("execution_mode")
             if body.budget is not None:
                 raise Fault("INVALID_REQUEST", "budget 只适用于 durable_plan")
         elif body.mode != "offline":
             raise Fault("INVALID_REQUEST", "当前持久计划使用离线场景规划器")
-        rt.authorize(actor, body.business_id, data["context"])
+        agent_runtime.authorize(actor, body.business_id, request_data["context"])
         if body.session_id:
-            session = rt.store.session(actor, body.session_id, body.business_id)
-            rt.authorize(actor, body.business_id, session["context"])
+            session = agent_runtime.store.session(actor, body.session_id, body.business_id)
+            agent_runtime.authorize(actor, body.business_id, session["context"])
             if "context" not in body.model_fields_set:
-                data["context"] = session["context"]
+                request_data["context"] = session["context"]
         if body.mode == "openai" and not model_ready:
             raise Fault("MODEL_NOT_CONFIGURED", "请先在本机配置模型地址和名称", 503)
         now = time.monotonic()
-        window = bursts[(actor["tenant_id"], actor["org_id"], actor["user_id"])]
-        while window and window[0] < now - 60:
-            window.popleft()
-        if len(window) >= 90 or len(rt.workers) >= 24:
-            rt.store.audit("chat", "deny", actor, code="RATE_LIMITED")
+        recent_requests = bursts[(actor["tenant_id"], actor["org_id"], actor["user_id"])]
+        while recent_requests and recent_requests[0] < now - 60:
+            recent_requests.popleft()
+        if len(recent_requests) >= 90 or len(agent_runtime.workers) >= 24:
+            agent_runtime.store.audit("chat", "deny", actor, code="RATE_LIMITED")
             raise Fault("RATE_LIMITED", "请求过多，请稍后再试", 429, True)
-        window.append(now)
-        options = {}
-        task = rt.store.find_replay(actor, data, key) if key else None
+        recent_requests.append(now)
+
+        # 重放必须返回首次提交的任务，不能因灰度比例变化而重新选版本。
+        task = None
+        if key:
+            task = agent_runtime.store.find_replay(actor, request_data, key)
         created = False
         if task is None:
-            sid = body.business_id
-            selected = rt.releases.select(sid, actor, "")
-            snapshot_id = selected
-            catalog = rt.release_catalog(selected, sid)
-            if durable:
+            scenario_id = body.business_id
+            selected_release = agent_runtime.releases.select(scenario_id, actor, "")
+            catalog = agent_runtime.release_catalog(selected_release, scenario_id)
+            task_options = {}
+            if is_durable:
                 snapshots = app.state.snapshots
-                snapshot_id = selected or snapshots.current.get(sid)
+                snapshot_id = selected_release or snapshots.current.get(scenario_id)
                 if not snapshot_id:
                     raise Fault("PLAN_NOT_FOUND", "此场景没有已注册的计划模板", 404)
                 try:
-                    plan, budget = prepare_plan(snapshots.open(snapshot_id, body.business_id),
-                                                body.business_id, body.message,
-                                                rt.grant(actor, body.business_id)["permissions"],
-                                                data["context"], budget=body.budget)
+                    pinned_catalog = snapshots.open(snapshot_id, scenario_id)
+                    permissions = agent_runtime.grant(actor, scenario_id)["permissions"]
+                    plan, budget = prepare_plan(
+                        pinned_catalog, scenario_id, body.message, permissions, request_data["context"], budget=body.budget
+                    )
                 except Fault as exc:
-                    rt.store.audit("plan.validate", "deny", actor, resource=body.business_id, code=exc.code)
+                    agent_runtime.store.audit("plan.validate", "deny", actor, resource=body.business_id, code=exc.code)
                     raise
-                options = {"plan": plan, "budget": budget, "snapshot_id": snapshot_id}
-            elif selected:
-                options["snapshot_id"] = selected
-            task, created = rt.store.start(actor, data, key, catalog.scenarios[sid]["version"],
-                                          admit=lambda: rt.releases.guard_selection(selected, sid, actor, ""),
-                                          **options)
-        if created and not durable:
-            rt.launch(actor, data, task)
-        if durable:
+                task_options = {"plan": plan, "budget": budget, "snapshot_id": snapshot_id}
+            elif selected_release:
+                task_options["snapshot_id"] = selected_release
+
+            # 入库时再核对一次发布绑定，防止准备计划期间恰好切换版本。
+            def check_release_at_admission():
+                agent_runtime.releases.guard_selection(selected_release, scenario_id, actor, "")
+
+            task, created = agent_runtime.store.start(
+                actor, request_data, key, catalog.scenarios[scenario_id]["version"],
+                admit=check_release_at_admission, **task_options,
+            )
+        if created and not is_durable:
+            agent_runtime.launch(actor, request_data, task)
+        if is_durable:
             task = allowed_task(actor, task["task_id"])
         if body.response_mode == "streaming":
             return event_stream(task["task_id"], actor, 0)
-        if durable:
+        if is_durable:
             location = API + "/tasks/" + task["task_id"]
             return JSONResponse(task, status_code=202, headers={"Location": location})
-        worker = rt.workers.get(task["task_id"])
+        worker = agent_runtime.workers.get(task["task_id"])
         if worker:
+            # 阻塞请求断开连接时，后台任务仍须继续执行并持久化结果。
             await asyncio.gather(asyncio.shield(worker), return_exceptions=True)
         return allowed_task(actor, task["task_id"])
 
@@ -380,17 +396,17 @@ def create_app(*, scenarios=None, database=None, token=None, model_settings=None
     @app.get(API + "/tasks/{task_id}/plan")
     async def get_plan(task_id: Identifier, actor=Depends(identify)):
         task = allowed_task(actor, task_id)
-        rt = runtime()
-        plan = rt.store.plan_view(task_id)
-        sid = task["business_id"]
-        permissions = rt.grant(actor, sid)["permissions"]
+        agent_runtime = runtime()
+        plan = agent_runtime.store.plan_view(task_id)
+        scenario_id = task["business_id"]
+        permissions = agent_runtime.grant(actor, scenario_id)["permissions"]
         visible = set()
         for step in plan["steps"]:
-            t = rt.releases.current_tool(sid, actor, "", step["capability_id"])
-            if t and t["permission"] in permissions:
-                visible.add(t["name"])
+            current_tool = agent_runtime.releases.current_tool(scenario_id, actor, "", step["capability_id"])
+            if current_tool and current_tool["permission"] in permissions:
+                visible.add(current_tool["name"])
         if any(step["capability_id"] not in visible for step in plan["steps"]):
-            rt.store.audit("plan.read", "deny", actor, task_id, code="PERMISSION_DENIED")
+            agent_runtime.store.audit("plan.read", "deny", actor, task_id, code="PERMISSION_DENIED")
             raise Fault("PERMISSION_DENIED", "没有查看此计划所需的能力权限", 403)
         return plan
 

@@ -1,4 +1,4 @@
-"""Public HTTP checks for the combined local governance features."""
+"""通过公开 HTTP 接口核验本地审批和观测链路。"""
 import json
 from pathlib import Path
 import time

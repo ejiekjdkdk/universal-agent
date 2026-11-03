@@ -1,4 +1,4 @@
-"""Shared execution path for the offline and model planners."""
+"""离线规划器和模型规划器共用的鉴权、执行与审计流程。"""
 import asyncio
 import hashlib
 import json
@@ -9,7 +9,7 @@ from .providers import run_provider
 
 
 def preview(value, depth=0):
-    """Record structure and size without copying free-form user text into a trace."""
+    """只记录结构、长度和摘要，避免将用户原文复制到执行轨迹。"""
     if isinstance(value, str):
         digest = hashlib.sha256(value.encode()).hexdigest()[:12]
         return {"chars": len(value), "sha256_prefix": digest}
@@ -91,46 +91,55 @@ class Gateway:
         return hits
 
     def authorize_tool(self, tool, arguments):
-        ctx = self.context()
-        sid = ctx["business_id"]
+        context = self.context()
+        scenario_id = context["business_id"]
         name = tool["name"]
-        self.check(ctx, tool["permission"], name)
+        self.check(context, tool["permission"], name)
         if tool["action_level"] not in ("read", "propose_write"):
             raise Fault("ACTION_NOT_ALLOWED", "当前版本仅允许读取或生成草稿", 403)
         if not isinstance(arguments, dict) or len(json.dumps(arguments, ensure_ascii=False)) > 32000:
             raise Fault("SCHEMA_VALIDATION_FAILED", "工具参数无效", 422)
         live_tool = None
         if self.runtime.releases:
-            self.runtime.releases.guard(self.snapshot_id, sid, name)
-            live_tool = self.runtime.releases.current_tool(sid, ctx, "", name)
+            self.runtime.releases.guard(self.snapshot_id, scenario_id, name)
+            live_tool = self.runtime.releases.current_tool(scenario_id, context, "", name)
         elif self.lease:
-            live_tool = next((t for t in self.runtime.catalog.discover(sid) if t["name"] == name), None)
+            live_tool = next((t for t in self.runtime.catalog.discover(scenario_id) if t["name"] == name), None)
         if self.lease or self.runtime.releases:
             if not live_tool or live_tool["action_level"] != tool["action_level"]:
                 raise Fault("CAPABILITY_REVOKED", "当前场景已撤销此能力", 403)
             if live_tool["permission"] != tool["permission"]:
-                self.check(ctx, live_tool["permission"], name)
-        fields = {t["object_ids_field"] for t in (tool, live_tool) if t and t.get("object_ids_field")}
+                self.check(context, live_tool["permission"], name)
+        # 固定版本和当前版本可能用不同字段限定对象，两者都要检查。
+        fields = set()
+        for definition in (tool, live_tool):
+            if definition and definition.get("object_ids_field"):
+                fields.add(definition["object_ids_field"])
         for field in fields:
-            ids = arguments.get(field)
-            if not isinstance(ids, list) or not all(isinstance(i, str) for i in ids):
+            object_ids = arguments.get(field)
+            if not isinstance(object_ids, list) or not all(isinstance(i, str) for i in object_ids):
                 raise Fault("SCHEMA_VALIDATION_FAILED", "对象参数应为 ID 数组", 422)
-            if not ids or not set(ids).issubset(ctx["object_ids"]):
-                self.store.audit("object_access", "deny", ctx, self.task_id, name, "PERMISSION_DENIED")
+            if not object_ids or not set(object_ids).issubset(context["object_ids"]):
+                self.store.audit("object_access", "deny", context, self.task_id, name, "PERMISSION_DENIED")
                 raise Fault("PERMISSION_DENIED", "请求的对象超出了本次任务范围", 403)
 
     async def execute(self, name, arguments, call_id):
-        ctx = self.context()
-        sid = ctx["business_id"]
-        tool = next((t for t in self.catalog.discover(sid) if t["name"] == name), None)
+        context = self.context()
+        scenario_id = context["business_id"]
+        tool = None
+        for candidate in self.catalog.discover(scenario_id):
+            if candidate["name"] == name:
+                tool = candidate
+                break
         if tool is None:
-            self.store.audit("execute", "deny", ctx, self.task_id, name, "CAPABILITY_NOT_FOUND")
+            self.store.audit("execute", "deny", context, self.task_id, name, "CAPABILITY_NOT_FOUND")
             raise Fault("CAPABILITY_NOT_FOUND", "场景中没有此工具", 404)
         self.authorize_tool(tool, arguments)
-        version = tool.get("version", self.catalog.scenarios[sid]["version"])
+        version = tool.get("version", self.catalog.scenarios[scenario_id]["version"])
+        call_budget = self.lease["max_tool_calls"] if self.lease else 8
         execution_id, cached = self.store.begin_call(
-            self.task_id, call_id, name, version, arguments,
-            max_calls=self.lease["max_tool_calls"] if self.lease else 8, lease=self.lease)
+            self.task_id, call_id, name, version, arguments, max_calls=call_budget, lease=self.lease
+        )
         if cached is not None:
             self.remember(cached.get("evidence", []))
             return cached
@@ -144,11 +153,15 @@ class Gateway:
                 async with self.runtime.slots:
                     for attempt in range(2):
                         try:
+                            # 排队或退避期间可能撤权，每次发出请求前都要复查。
                             self.authorize_tool(tool, arguments)
+
                             def authorize_retrieval():
                                 self.check(self.context(), "knowledge.read", "retrieve_knowledge")
-                            output = await self.catalog.execute(sid, name, arguments,
-                                                                authorize_retrieval=authorize_retrieval)
+
+                            output = await self.catalog.execute(
+                                scenario_id, name, arguments, authorize_retrieval=authorize_retrieval
+                            )
                             self.authorize_tool(tool, arguments)
                             break
                         except Fault as exc:
@@ -159,7 +172,7 @@ class Gateway:
                                 raise
                             self.trace("tool_retry", {"execution_id": execution_id, "error_code": exc.code, "delay_s": delay})
                             await asyncio.sleep(delay)
-            result = {"execution_id": execution_id, "capability_id": name, "capability_version": tool.get("version", self.catalog.scenarios[sid]["version"]),
+            result = {"execution_id": execution_id, "capability_id": name, "capability_version": tool.get("version", self.catalog.scenarios[scenario_id]["version"]),
                       "status": "completed", "error": None, **output}
             self.store.complete_call(self.task_id, call_id, result, lease=self.lease)
             self.remember(result["evidence"])
@@ -167,12 +180,15 @@ class Gateway:
                                        "source_ids": [s["source_id"] for s in result["evidence"]],
                                        "duration_ms": round((time.monotonic() - started) * 1000)})
             return result
-        except (Exception, asyncio.CancelledError) as exc:
-            if isinstance(exc, asyncio.CancelledError):
-                raise
-            fault = exc if isinstance(exc, Fault) else (
-                Fault("TOOL_TIMEOUT", "工具超时", 504) if isinstance(exc, TimeoutError)
-                else Fault("UPSTREAM_DEPENDENCY_FAILED", "工具执行失败", 424))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if isinstance(exc, Fault):
+                fault = exc
+            elif isinstance(exc, TimeoutError):
+                fault = Fault("TOOL_TIMEOUT", "工具超时", 504)
+            else:
+                fault = Fault("UPSTREAM_DEPENDENCY_FAILED", "工具执行失败", 424)
             self.store.complete_call(self.task_id, call_id, None, fault.as_dict(), lease=self.lease)
             raise fault
 
@@ -199,7 +215,9 @@ class Runtime:
         return self.role_source() if self.role_source else self._principals
 
     def release_catalog(self, snapshot_id, scene_id):
-        return self.snapshots.open(snapshot_id, scene_id) if snapshot_id and self.snapshots else self.catalog
+        if snapshot_id and self.snapshots:
+            return self.snapshots.open(snapshot_id, scene_id)
+        return self.catalog
 
     def grant(self, identity, scenario):
         for principal in self.principals.values():
@@ -240,32 +258,43 @@ class Runtime:
         task_id = task["task_id"]
         run_id = self.store.context_id(task_id)
         try:
-            gw = Gateway(self, run_id)
-            self.gateways[run_id] = gw
+            gateway = Gateway(self, run_id)
+            self.gateways[run_id] = gateway
             mode = body["mode"]
-            scene = gw.catalog.scenarios[body["business_id"]]
-            gw.trace("planner_started", {"mode": mode, "scenario": scene["id"], "version": scene["version"]})
-            scope = gw.context()
-            allowed_types = [scope["object_type"]] if scope["object_type"] else self.grant(identity, body["business_id"]).get("resource_types", [])
-            history = self.store.history(identity, task["session_id"], allowed_objects=scope["object_ids"],
-                                         allowed_types=allowed_types,
-                                         allowed_permissions=self.grant(identity, scene["id"])["permissions"],
-                                         inherit_to=task_id) if mode == "openai" else []
+            scene = gateway.catalog.scenarios[body["business_id"]]
+            gateway.trace("planner_started", {"mode": mode, "scenario": scene["id"], "version": scene["version"]})
+            scope = gateway.context()
+            if scope["object_type"]:
+                allowed_types = [scope["object_type"]]
+            else:
+                allowed_types = self.grant(identity, body["business_id"]).get("resource_types", [])
+
+            history = []
+            if mode == "openai":
+                history = self.store.history(
+                    identity, task["session_id"], allowed_objects=scope["object_ids"],
+                    allowed_types=allowed_types,
+                    allowed_permissions=self.grant(identity, scene["id"])["permissions"],
+                    inherit_to=task_id,
+                )
             async with asyncio.timeout(120):
-                answer = await run_provider(mode, scene, body["message"], history, gw, self.settings)
+                answer = await run_provider(mode, scene, body["message"], history, gateway, self.settings)
             if not isinstance(answer, str) or not answer.strip():
                 raise Fault("UPSTREAM_INVALID_RESPONSE", "回复为空", 502)
-            gw.context()
-            evidence = list(gw.evidence.values())
-            gw.trace("message_delta", {"delta": answer})
+            gateway.context()
+            evidence = list(gateway.evidence.values())
+            gateway.trace("message_delta", {"delta": answer})
             self.store.finish(task_id, "completed", {"answer": answer, "evidence": evidence, "artifacts": []})
         except asyncio.CancelledError:
             self.store.finish(task_id, "cancelled", {})
             raise
         except Exception as exc:
-            fault = exc if isinstance(exc, Fault) else (
-                Fault("TASK_TIMEOUT", "任务超时", 504) if isinstance(exc, TimeoutError)
-                else Fault("INTERNAL_ERROR", "任务执行失败", 500))
+            if isinstance(exc, Fault):
+                fault = exc
+            elif isinstance(exc, TimeoutError):
+                fault = Fault("TASK_TIMEOUT", "任务超时", 504)
+            else:
+                fault = Fault("INTERNAL_ERROR", "任务执行失败", 500)
             self.store.finish(task_id, "failed", {}, fault.as_dict())
         finally:
             self.gateways.pop(run_id, None)

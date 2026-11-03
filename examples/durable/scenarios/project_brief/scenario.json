@@ -3,7 +3,7 @@
   "name": "项目简报",
   "description": "从两条示例记录中读取进度和风险，再整理为简报。",
   "example": "请为本周项目准备一份简报。",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "documents": "notes.json",
   "tools": [
     {

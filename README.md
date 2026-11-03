@@ -20,7 +20,7 @@ Universal Agent 是一套可跨项目复用的通用 Agent 底座。它负责模
 
 ```sh
 python -m venv .venv
-# macOS / Linux
+# 在 macOS 或 Linux 中激活虚拟环境
 . .venv/bin/activate
 # Windows PowerShell 则运行 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt

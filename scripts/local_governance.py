@@ -1,4 +1,4 @@
-"""Run a disposable local approval/release demo. --verify exercises the public HTTP APIs."""
+"""在临时环境演示审批和发布；使用 --verify 可通过公开 HTTP 接口验收。"""
 import argparse
 import json
 import os
@@ -82,7 +82,9 @@ def verify(client, owner, reviewer, publisher):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description="Run a disposable local approval/release demo. --verify exercises the public HTTP APIs."
+    )
     parser.add_argument("--verify", action="store_true", help="run the acceptance scenario and exit")
     args = parser.parse_args()
     with tempfile.TemporaryDirectory() as folder:

@@ -1,4 +1,4 @@
-"""SQLite state transitions for validated, read-only plans. Mutations run inside Store transactions."""
+"""在 Store 事务中推进持久化计划，包括只读步骤和需要人工审批的本地模拟写入。"""
 import hashlib
 import json
 import time
@@ -25,7 +25,7 @@ CREATE INDEX IF NOT EXISTS plan_step_claim ON plan_steps(task_id,status,lease_un
 
 MAX_ATTEMPTS = 3
 ACTIVE = {"leased", "running"}
-# A generic dependency failure may conceal malformed input or an upstream denial.
+# 仅这些错误允许可选步骤降级。未分类的依赖错误可能来自错误入参或上游拒绝授权。
 OPTIONAL_ERRORS = {"UPSTREAM_UNAVAILABLE", "TOOL_TIMEOUT", "RATE_LIMITED", "STEP_ATTEMPTS_EXHAUSTED"}
 
 
@@ -156,66 +156,83 @@ class PlanStore:
                           limitations=["部分可选步骤未能提供结果：" + "、".join(missing)])
         self._finish(task_id, "partial" if missing else "completed", result, None)
 
+    def _recover_expired_steps(self, task_id, rows, now):
+        """保留已落库的错误，为可重试步骤留下重新领取租约的机会。"""
+        states = {step_row["step_id"]: step_row["status"] for step_row in rows}
+        for step_row in rows:
+            if step_row["status"] not in ACTIVE or step_row["lease_until"] > now:
+                continue
+            call = self._db.execute("""SELECT status,error FROM calls WHERE task_id=? AND call_id=?""",
+                                    (task_id, "plan." + step_row["step_id"])).fetchone()
+            approved_proposal = self._db.execute("""SELECT proposal_token FROM approvals WHERE task_id=? AND step_id=?
+                AND status='approved'""", (task_id, step_row["step_id"])).fetchone()
+            operation_attempt = step_row["token"] - (approved_proposal[0] if approved_proposal else 0)
+            if call and call["status"] == "failed":
+                error = json.loads(call["error"])
+            elif operation_attempt < MAX_ATTEMPTS or (
+                operation_attempt == MAX_ATTEMPTS and call and call["status"] == "completed"
+            ):
+                # 尝试次数耗尽时，仅允许领取最后一次租约以核验已保存的成功结果。
+                continue
+            else:
+                error = _error("STEP_ATTEMPTS_EXHAUSTED", "Worker lease attempts exhausted.")
+            self._change_step(task_id, step_row["step_id"], "failed", error)
+            states[step_row["step_id"]] = "failed"
+        return states
+
+    def _advance_dependencies(self, task_id, rows, states):
+        # 一次依赖失败可连续跳过多个后继，即使计划文件未按依赖顺序排列。
+        changed = True
+        while changed:
+            changed = False
+            for step_row in rows:
+                step_id = step_row["step_id"]
+                if states[step_id] != "blocked":
+                    continue
+                dependency_states = [states[d] for d in json.loads(step_row["definition"])["depends_on"]]
+                if any(state in {"failed", "skipped", "cancelled"} for state in dependency_states):
+                    state = "skipped"
+                elif all(state == "succeeded" for state in dependency_states):
+                    state = "ready"
+                else:
+                    continue
+                self._change_step(task_id, step_id, state)
+                states[step_id] = state
+                changed = True
+
     def _advance(self, p, now):
         task_id = p["task_id"]
         self._expire_approvals(task_id, now)
         rows = self._steps(task_id)
-        states = {r["step_id"]: r["status"] for r in rows}
-        for r in rows:
-            if r["status"] not in ACTIVE or r["lease_until"] > now:
-                continue
-            call = self._db.execute("""SELECT status,error FROM calls WHERE task_id=? AND call_id=?""",
-                                    (task_id, "plan." + r["step_id"])).fetchone()
-            prior_proposal = self._db.execute("""SELECT proposal_token FROM approvals WHERE task_id=? AND step_id=?
-                AND status='approved'""", (task_id, r["step_id"])).fetchone()
-            attempt = r["token"] - (prior_proposal[0] if prior_proposal else 0)
-            if call and call["status"] == "failed":
-                # A committed denial or schema error must keep its original classification after a crash.
-                error = json.loads(call["error"])
-            elif attempt < MAX_ATTEMPTS or (attempt == MAX_ATTEMPTS and call and call["status"] == "completed"):
-                # At the attempt limit, only a committed result can receive a final cache-only lease.
-                continue
-            else:
-                error = _error("STEP_ATTEMPTS_EXHAUSTED", "Worker lease attempts exhausted.")
-            self._change_step(task_id, r["step_id"], "failed", error)
-            states[r["step_id"]] = "failed"
+        states = self._recover_expired_steps(task_id, rows, now)
         if p["deadline"] <= now:
             self._finish(task_id, "failed", {}, _error("TASK_TIMEOUT", "Plan deadline exceeded."))
             return
-        # Fixed point also handles valid plans whose file order is not topological.
-        changed = True
-        while changed:
-            changed = False
-            for r in rows:
-                name = r["step_id"]
-                if states[name] != "blocked":
-                    continue
-                deps = [states[d] for d in json.loads(r["definition"])["depends_on"]]
-                if any(s in {"failed", "skipped", "cancelled"} for s in deps):
-                    state = "skipped"
-                elif all(s == "succeeded" for s in deps):
-                    state = "ready"
-                else:
-                    continue
-                self._change_step(task_id, name, state)
-                states[name] = state
-                changed = True
+
+        self._advance_dependencies(task_id, rows, states)
         rows = self._steps(task_id)
-        failed = [r for r in rows if r["status"] == "failed"]
-        for r in failed:
-            error = json.loads(r["error"])
-            if json.loads(r["definition"]).get("required", True) or error["code"] not in OPTIONAL_ERRORS:
+        failed_steps = [step_row for step_row in rows if step_row["status"] == "failed"]
+        for step_row in failed_steps:
+            error = json.loads(step_row["error"])
+            if json.loads(step_row["definition"]).get("required", True) or error["code"] not in OPTIONAL_ERRORS:
                 self._finish(task_id, "failed", {}, error)
                 return
-        if any(r["status"] == "skipped" and json.loads(r["definition"]).get("required", True) for r in rows):
+        required_step_skipped = any(
+            row["status"] == "skipped" and json.loads(row["definition"]).get("required", True)
+            for row in rows
+        )
+        if required_step_skipped:
             self._finish(task_id, "failed", {}, _error("DEPENDENCY_FAILED", "Required dependency failed."))
             return
-        if all(r["status"] in {"succeeded", "failed", "skipped"} for r in rows):
+        if all(step_row["status"] in {"succeeded", "failed", "skipped"} for step_row in rows):
             self._aggregate(task_id, rows)
-        elif any(r["status"] == "waiting_approval" for r in rows) and not any(r["status"] in ACTIVE | {"ready"} for r in rows):
+            return
+        awaiting_approval = any(row["status"] == "waiting_approval" for row in rows)
+        if awaiting_approval and not any(row["status"] in ACTIVE | {"ready"} for row in rows):
             self._db.execute("UPDATE tasks SET status='waiting_approval' WHERE task_id=?", (task_id,))
 
     def claim_step(self, worker_id, lease_seconds):
+        """在一个写事务中确认剩余并发额度、登记新租约并分配递增的 token。"""
         if not worker_id or not lease_seconds > 0:
             raise ValueError("worker_id and positive lease duration are required")
         with self._lock:
@@ -229,38 +246,43 @@ class PlanStore:
             now = time.time()
             plans = self._db.execute("""SELECT p.* FROM plans p JOIN tasks t USING(task_id)
                 WHERE t.status IN ('running','waiting_approval') ORDER BY t.rowid""").fetchall()
-            for p in plans:
-                tid = p["task_id"]
-                self._advance(p, now)
-                if self._task_row(tid)["status"] != "running":
+            for plan in plans:
+                task_id = plan["task_id"]
+                self._advance(plan, now)
+                if self._task_row(task_id)["status"] != "running":
                     continue
-                rows = self._steps(tid)
-                active = sum(r["status"] in ACTIVE and r["lease_until"] > now for r in rows)
-                if active >= p["parallel_limit"]:
+                rows = self._steps(task_id)
+                occupied_slots = sum(row["status"] in ACTIVE and row["lease_until"] > now for row in rows)
+                if occupied_slots >= plan["parallel_limit"]:
                     continue
-                for r in rows:
-                    if r["status"] != "ready" and not (r["status"] in ACTIVE and r["lease_until"] <= now):
+                for step_row in rows:
+                    lease_expired = step_row["status"] in ACTIVE and step_row["lease_until"] <= now
+                    if step_row["status"] != "ready" and not lease_expired:
                         continue
-                    step, token = json.loads(r["definition"]), r["token"] + 1
-                    key = (tid, r["step_id"])
+                    step = json.loads(step_row["definition"])
+                    token = step_row["token"] + 1
+                    step_id = step_row["step_id"]
+                    key = (task_id, step_id)
                     self._db.execute("""UPDATE plan_steps SET status='leased',token=?,lease_owner=?,lease_until=?
-                        WHERE task_id=? AND step_id=?""", (token, worker_id, min(now + lease_seconds, p["deadline"]), *key))
-                    if r["status"] in ACTIVE:
-                        self._event(tid, "step_retrying", {"step_id": r["step_id"], "attempt": min(token, MAX_ATTEMPTS),
-                                                          "error_code": "LEASE_EXPIRED"})
-                    proposal = self._db.execute("""SELECT proposal_token FROM approvals WHERE task_id=? AND step_id=?
+                        WHERE task_id=? AND step_id=?""", (token, worker_id, min(now + lease_seconds, plan["deadline"]), *key))
+                    if lease_expired:
+                        self._event(task_id, "step_retrying", {
+                            "step_id": step_id, "attempt": min(token, MAX_ATTEMPTS), "error_code": "LEASE_EXPIRED",
+                        })
+                    approved_proposal = self._db.execute("""SELECT proposal_token FROM approvals WHERE task_id=? AND step_id=?
                         AND status='approved'""", key).fetchone()
-                    operation_attempt = token - (proposal[0] if proposal else 0)
+                    # token 跨审批持续递增。获批后从提案时的 token 起算本次提交的尝试次数。
+                    operation_attempt = token - (approved_proposal[0] if approved_proposal else 0)
                     recovery_only = operation_attempt > MAX_ATTEMPTS
                     attempt = min(operation_attempt, MAX_ATTEMPTS)
-                    self._event(tid, "step_leased", {"step_id": r["step_id"], "attempt_no": attempt,
+                    self._event(task_id, "step_leased", {"step_id": step_id, "attempt_no": attempt,
                                                       "recovery_only": recovery_only})
-                    return {"task_id": tid, "step_id": r["step_id"], "token": token, "attempt_no": attempt,
+                    return {"task_id": task_id, "step_id": step_id, "token": token, "attempt_no": attempt,
                             "recovery_only": recovery_only,
-                            "worker_id": worker_id, "business_id": self._task_row(tid)["business_id"],
-                            "run_context_id": self.context_id(tid), "snapshot_id": p["snapshot_id"],
+                            "worker_id": worker_id, "business_id": self._task_row(task_id)["business_id"],
+                            "run_context_id": self.context_id(task_id), "snapshot_id": plan["snapshot_id"],
                             "step": step, "outputs": _predecessor_outputs(step, rows),
-                            "max_tool_calls": p["call_limit"], "deadline": p["deadline"]}
+                            "max_tool_calls": plan["call_limit"], "deadline": plan["deadline"]}
             return None
 
     def _lease(self, claim):

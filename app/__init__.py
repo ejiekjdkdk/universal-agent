@@ -1,1 +1,1 @@
-"""Universal business agent runtime."""
+"""跨项目复用的 Agent 运行底座。"""

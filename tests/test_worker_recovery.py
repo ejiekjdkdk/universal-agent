@@ -1,4 +1,4 @@
-"""Crash a real plan Worker at the join step and resume against its frozen release."""
+"""在汇总步骤强制终止 Worker，验证接手进程使用原任务的版本快照。"""
 from contextlib import ExitStack
 import json
 import os
@@ -17,8 +17,8 @@ ROOT = Path(__file__).resolve().parents[1]
 SCENARIO = ROOT / "examples" / "durable" / "scenarios" / "project_brief"
 API = "/api/v1/agent"
 
-# A file per invocation lets the parent count actual calls even after the interpreter dies.
-# The gate lives outside the published scene, like a controllable read-only data source.
+# 每次调用单独写一个文件，进程退出后仍能核对实际调用次数。
+# 控制汇总步骤的标记放在场景包外，不参与版本快照。
 ADAPTER = '''
 import os
 from pathlib import Path
@@ -148,8 +148,7 @@ def test_worker_killed_during_join_resumes_only_uncommitted_read_and_pins_releas
         assert {s["step_id"]: s["status"] for s in steps} == {
             "progress": "succeeded", "risks": "succeeded", "brief": "running"}
 
-        # Kill the process without graceful shutdown. Neither a cached task object nor an
-        # in-process scheduling hook survives the subsequent API restart.
+        # 强制退出并重启 API，确保接手方只能依赖持久化状态恢复。
         kill(first_worker[0])
         kill(first_api[0])
         publish(scene, "2.0.0", "updated-release")

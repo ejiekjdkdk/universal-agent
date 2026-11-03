@@ -2,6 +2,8 @@
 
 从项目根目录运行固定金标。命令向标准输出写入 JSON，任一门禁失败或目录没有场景时返回非零退出码。
 
+Python 适配器的源码摘要包含注释和 Docstring，计算前按 LF 统一换行。运维金标里的 `adapter_sha256` 绑定当前源码。需要保留已审核版本的回滚能力时，可在同一份可信金标中添加 `previous_adapter_sha256` 数组，每项为一个完整的小写 SHA-256。未配置时只接受当前摘要。历史版本仍需通过同一套行为评测；停止信任某版时，应移除其摘要，并对已发布的对应版本执行紧急禁用。
+
 ```powershell
 python -m app.evaluations --scenarios scenarios
 python -m app.evaluations --scenarios examples/durable/scenarios

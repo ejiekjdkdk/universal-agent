@@ -1,4 +1,4 @@
-"""Read-only, self-contained project brief example."""
+"""从两份只读资料生成项目简报。"""
 
 
 def _record(title, retrieve):

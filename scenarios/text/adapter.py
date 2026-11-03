@@ -1,4 +1,4 @@
-"""Deterministic counts: Unicode code points, nonempty lines and simple tokens."""
+"""按 Unicode 码点计数字符，并统计非空行和高频词项。"""
 import re
 from collections import Counter
 

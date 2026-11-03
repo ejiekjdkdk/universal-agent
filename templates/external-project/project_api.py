@@ -1,4 +1,4 @@
-"""Standalone project backend. Its only agent dependency is the public HTTP API."""
+"""独立项目后端，通过底座公开的 HTTP 接口发起任务。"""
 import hmac
 import json
 import os
@@ -39,10 +39,11 @@ def read_record(record_id: str):
     return {"id": record_id, **records[record_id]}
 
 
-@app.post("/ask", dependencies=[Depends(authenticate)])
+@app.post("/ask", dependencies=[Depends(authenticate)],
+          description="Submit a question and fetch its persisted trace using the same agent identity.")
 async def ask(question: Question,
               key: Annotated[str | None, Header(alias="Idempotency-Key", min_length=1, max_length=128)] = None):
-    """Submit a question and fetch its persisted trace using the same agent identity."""
+    """用同一底座身份提交问题并读取这次任务的执行记录。"""
     headers = {"Authorization": "Bearer " + AGENT_TOKEN}
     payload = {"business_id": "project_records", **question.model_dump(), "response_mode": "blocking"}
     try:

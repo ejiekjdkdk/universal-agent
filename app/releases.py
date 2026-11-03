@@ -1,4 +1,4 @@
-"""Trusted bundle publication, stable rollout and online emergency revocation."""
+"""发布可信场景包，按稳定分组灰度，并在运行期间执行紧急禁用。"""
 import asyncio
 from contextlib import contextmanager
 import hashlib
@@ -44,8 +44,8 @@ def _version(text):
 
 
 def _breaking_schema(old, new, output=False):
-    """Reject changed contracts conservatively. Ignore descriptions and other annotations."""
-    # Inputs may get wider. Outputs may get narrower without surprising a previous consumer.
+    """保守判断契约是否发生破坏性变化，忽略说明文字等注解。"""
+    # 为兼容旧调用方，输入可接受更多值，输出可缩小原有取值范围。
     subset, superset = (new, old) if output else (old, new)
     lower = {"minimum", "exclusiveMinimum", "minLength", "minItems", "minProperties"}
     upper = {"maximum", "exclusiveMaximum", "maxLength", "maxItems", "maxProperties"}
@@ -70,8 +70,13 @@ def _breaking_schema(old, new, output=False):
         return False
     before, after = old.get("properties", {}), new.get("properties", {})
     required_before, required_after = set(old.get("required", [])), set(new.get("required", []))
-    if (before.keys() - after.keys() or (output and after.keys() - before.keys())
-            or (required_before - required_after if output else required_after - required_before)):
+    if before.keys() - after.keys():
+        return True
+    if output:
+        # 旧调用方可能使用封闭的输出 Schema，也可能依赖原先保证返回的字段。
+        if after.keys() - before.keys() or required_before - required_after:
+            return True
+    elif required_after - required_before:
         return True
     return any(_breaking_schema(schema, after[key], output) for key, schema in before.items())
 

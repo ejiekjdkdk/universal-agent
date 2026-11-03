@@ -1,5 +1,5 @@
 class Fault(Exception):
-    """An error safe to return to API clients."""
+    """可返回给 API 调用方的错误，不包含内部异常详情。"""
 
     def __init__(self, code, message, status=400, retryable=False):
         super().__init__(message)

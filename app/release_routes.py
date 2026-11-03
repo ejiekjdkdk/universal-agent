@@ -1,4 +1,4 @@
-"""Operator-only management endpoints. Candidate names select locally reviewed bundles."""
+"""仅供管理员使用的发布接口，候选名对应本地已审核的场景包。"""
 from typing import Annotated
 
 from fastapi import APIRouter, Depends
