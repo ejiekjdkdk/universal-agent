@@ -1,0 +1,119 @@
+"""Poll durable, read-only plan steps. Run separately with python -m app.worker."""
+import asyncio
+import logging
+import os
+from pathlib import Path
+import socket
+import time
+from uuid import uuid4
+
+from dotenv import load_dotenv
+
+from .catalog import Catalog
+from .errors import Fault
+from .plans import resolve_arguments
+from .runtime import Gateway, Runtime
+from .snapshots import Snapshots
+from .store import Store
+
+LOG = logging.getLogger(__name__)
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def personal_actor(catalog):
+    grants = {}
+    for sid in catalog.scenarios:
+        permissions = {tool["permission"] for tool in catalog.discover(sid)}
+        permissions.add("knowledge.read")
+        grants[sid] = {"permissions": sorted(permissions)}
+    return {"tenant_id": "personal", "org_id": "local", "user_id": "owner", "grants": grants}
+
+
+class PlanWorker:
+    def __init__(self, runtime, snapshots):
+        self.runtime = runtime
+        self.store = runtime.store
+        self.snapshots = snapshots
+        self.owner = f"{socket.gethostname()}-{os.getpid()}-{uuid4().hex[:10]}"
+        self.lease_seconds = float(os.getenv("AGENT_PLAN_LEASE_SECONDS", "12"))
+        if not 1 <= self.lease_seconds <= 120:
+            raise ValueError("AGENT_PLAN_LEASE_SECONDS must be between 1 and 120")
+
+    async def execute(self, claim):
+        try:
+            remaining = max(0, claim["deadline"] - time.time())
+            async with asyncio.timeout(remaining):
+                catalog = self.snapshots.open(claim["snapshot_id"], claim["business_id"])
+                gateway = Gateway(self.runtime, claim["run_context_id"], catalog=catalog, lease=claim)
+                step = claim["step"]
+                args = resolve_arguments(step, claim["outputs"])
+                result = await gateway.execute(step["capability_id"], args, "plan." + claim["step_id"])
+                gateway.context()
+                self.store.settle_step(claim, result=result)
+        except asyncio.CancelledError:
+            # A surviving worker may reclaim this read after lease expiry.
+            raise
+        except Exception as exc:
+            if isinstance(exc, Fault):
+                fault = exc
+            elif isinstance(exc, TimeoutError):
+                fault = Fault("TASK_TIMEOUT", "计划执行期限已到", 504)
+            else:
+                LOG.error("Plan worker error (%s) for task %s", type(exc).__name__, claim["task_id"])
+                fault = Fault("INTERNAL_ERROR", "计划步骤执行失败", 500)
+            self.store.settle_step(claim, error=fault.as_dict())
+
+    async def leased(self, claim):
+        job = asyncio.create_task(self.execute(claim))
+        try:
+            while not job.done():
+                done, _ = await asyncio.wait({job}, timeout=self.lease_seconds / 3)
+                if done:
+                    break
+                if not self.store.renew_step(claim, self.lease_seconds):
+                    job.cancel()
+                    break
+            await asyncio.gather(job, return_exceptions=False)
+        finally:
+            job.cancel()
+            await asyncio.gather(job, return_exceptions=True)
+
+    async def run(self):
+        jobs = set()
+        try:
+            while True:
+                while len(jobs) < 3:
+                    claim = self.store.claim_step(self.owner, self.lease_seconds)
+                    if not claim:
+                        break
+                    jobs.add(asyncio.create_task(self.leased(claim)))
+                if not jobs:
+                    await asyncio.sleep(.15)
+                    continue
+                done, jobs = await asyncio.wait(jobs, timeout=.15, return_when=asyncio.FIRST_COMPLETED)
+                for job in done:
+                    if not job.cancelled():
+                        job.result()
+        finally:
+            for job in jobs:
+                job.cancel()
+            await asyncio.gather(*jobs, return_exceptions=True)
+
+
+async def main():
+    load_dotenv(ROOT / ".env")
+    database = Path(os.getenv("AGENT_DATABASE") or ROOT / "var" / "agent.db")
+    catalog = Catalog(Path(os.getenv("AGENT_SCENARIOS") or ROOT / "scenarios"))
+    store = Store(database, recover_reactive=False)
+    try:
+        rt = Runtime(catalog, store, {"worker": personal_actor(catalog)}, {})
+        await PlanWorker(rt, Snapshots(database, catalog)).run()
+    finally:
+        store.close()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass

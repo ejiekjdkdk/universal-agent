@@ -1,0 +1,42 @@
+{
+  "schema_version": "2.0",
+  "result_contract": "summary_v1",
+  "steps": [
+    {
+      "step_id": "progress",
+      "capability_id": "read_progress",
+      "arguments": {
+        "text": {
+          "$message": true
+        }
+      }
+    },
+    {
+      "step_id": "risks",
+      "capability_id": "read_risks",
+      "arguments": {
+        "text": {
+          "$message": true
+        }
+      }
+    },
+    {
+      "step_id": "brief",
+      "capability_id": "compose_brief",
+      "depends_on": [
+        "progress",
+        "risks"
+      ],
+      "arguments": {
+        "progress": {
+          "$step_output": "progress",
+          "path": "/data/summary"
+        },
+        "risks": {
+          "$step_output": "risks",
+          "path": "/data/summary"
+        }
+      }
+    }
+  ]
+}

@@ -11,10 +11,14 @@
 <div class="rail-title"><h2>最近运行</h2><button id="refresh" class="link">刷新</button></div><div id="history"></div></aside>
 <section class="studio">
 <div class="kicker">AGENT STUDIO</div><h1 id="title">运行工作台</h1><p id="description">加载本地场景…</p>
-<form id="ask"><div class="toolbar"><label for="question">输入问题或文本</label><select id="mode" aria-label="运行模式"><option value="offline">离线演示</option><option value="openai">模型模式</option></select></div>
+<form id="ask"><div class="toolbar"><label for="question">输入问题或文本</label><div class="mode-options">
+<label id="executionOptions" hidden>执行方式 <select id="executionMode"><option value="reactive">即时执行</option><option value="durable_plan">持久化计划</option></select></label>
+<select id="mode" aria-label="规划器"><option value="offline">离线演示</option><option value="openai">模型模式</option></select></div></div>
+<p id="planHint" hidden>按场景预设的只读步骤执行，可从最近运行查看进度。</p>
 <textarea id="question" maxlength="16000" required rows="5" placeholder="输入你想处理的内容…"></textarea>
 <div class="actions"><button type="button" class="link" id="example">使用示例</button><span class="spacer"></span><button type="button" id="cancel" hidden>取消运行</button><button id="submit" class="primary">运行 ↗</button></div></form>
 <p id="notice" role="status"></p>
+<section id="planPanel" aria-labelledby="planTitle" hidden><div class="rail-title"><h2 id="planTitle">计划步骤</h2><span id="planCount" class="meta"></span></div><ol id="planSteps"></ol></section>
 <div class="result-head"><div><div class="kicker">RESULT</div><h2>回答与证据</h2></div><button class="link" id="new">新会话</button></div>
 <p id="prompt"></p><div id="answer" aria-live="polite">运行一个问题，就能在这里查看回答。</div><div id="evidence"></div>
 </section>

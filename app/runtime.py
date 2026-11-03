@@ -23,16 +23,19 @@ def preview(value, depth=0):
 
 
 class Gateway:
-    def __init__(self, runtime, run_id):
+    def __init__(self, runtime, run_id, *, catalog=None, lease=None):
         self.runtime = runtime
         self.store = runtime.store
-        self.catalog = runtime.catalog
+        self.catalog = catalog or runtime.catalog
+        self.lease = lease
         self.run_id = run_id
         self.task_id = self.store.run(run_id)["task_id"]
         self.evidence = {}
 
     def trace(self, event, data):
-        self.store.emit(self.task_id, event, data)
+        if self.lease:
+            data = {**data, "step_id": self.lease["step_id"]}
+        self.store.emit(self.task_id, event, data, lease=self.lease)
 
     def context(self):
         context = self.store.run(self.run_id)
@@ -83,26 +86,40 @@ class Gateway:
             raise Fault("ACTION_NOT_ALLOWED", "当前版本仅允许读取或生成草稿", 403)
         if not isinstance(arguments, dict) or len(json.dumps(arguments, ensure_ascii=False)) > 32000:
             raise Fault("SCHEMA_VALIDATION_FAILED", "工具参数无效", 422)
-        field = tool.get("object_ids_field")
-        if field:
+        live_tool = None
+        if self.lease:
+            live_tool = next((t for t in self.runtime.catalog.discover(sid) if t["name"] == name), None)
+            if not live_tool or live_tool["action_level"] != "read" or tool["action_level"] != "read":
+                raise Fault("CAPABILITY_REVOKED", "当前场景已撤销此只读能力", 403)
+            self.check(ctx, live_tool["permission"], name)
+        fields = {t["object_ids_field"] for t in (tool, live_tool) if t and t.get("object_ids_field")}
+        for field in fields:
             ids = arguments.get(field)
             if not isinstance(ids, list) or not all(isinstance(i, str) for i in ids):
                 raise Fault("SCHEMA_VALIDATION_FAILED", "对象参数应为 ID 数组", 422)
             if not ids or not set(ids).issubset(ctx["object_ids"]):
                 self.store.audit("object_access", "deny", ctx, self.task_id, name, "PERMISSION_DENIED")
                 raise Fault("PERMISSION_DENIED", "请求的对象超出了本次任务范围", 403)
-        execution_id, cached = self.store.begin_call(self.task_id, call_id, name, tool.get("version", self.catalog.scenarios[sid]["version"]), arguments)
+        version = tool.get("version", self.catalog.scenarios[sid]["version"])
+        execution_id, cached = self.store.begin_call(
+            self.task_id, call_id, name, version, arguments,
+            max_calls=self.lease["max_tool_calls"] if self.lease else 8, lease=self.lease)
         if cached is not None:
             self.remember(cached.get("evidence", []))
             return cached
         started = time.monotonic()
         self.trace("tool_input", {"execution_id": execution_id, "arguments": preview(arguments)})
+        deadline = started + self.runtime.tool_timeout
+        if self.lease:
+            deadline = min(deadline, started + self.lease["deadline"] - time.time())
         try:
             async with asyncio.timeout(self.runtime.tool_timeout):
                 async with self.runtime.slots:
                     for attempt in range(2):
                         try:
                             self.check(self.context(), tool["permission"], name)
+                            if live_tool and live_tool["permission"] != tool["permission"]:
+                                self.check(self.context(), live_tool["permission"], name)
                             def authorize_retrieval():
                                 self.check(self.context(), "knowledge.read", "retrieve_knowledge")
                             output = await self.catalog.execute(sid, name, arguments,
@@ -112,12 +129,14 @@ class Gateway:
                         except Fault as exc:
                             if attempt or not exc.retryable or tool["action_level"] != "read":
                                 raise
-                            delay = min(2, max(0.2, getattr(exc, "retry_after", 0.2)))
+                            delay = max(0.2, getattr(exc, "retry_after", 0.2))
+                            if time.monotonic() + delay >= deadline:
+                                raise
                             self.trace("tool_retry", {"execution_id": execution_id, "error_code": exc.code, "delay_s": delay})
                             await asyncio.sleep(delay)
             result = {"execution_id": execution_id, "capability_id": name, "capability_version": tool.get("version", self.catalog.scenarios[sid]["version"]),
                       "status": "completed", "error": None, **output}
-            self.store.complete_call(self.task_id, call_id, result)
+            self.store.complete_call(self.task_id, call_id, result, lease=self.lease)
             self.remember(result["evidence"])
             self.trace("tool_result", {"execution_id": execution_id, "tool": name, "output": preview(result["data"]),
                                        "source_ids": [s["source_id"] for s in result["evidence"]],
@@ -129,7 +148,7 @@ class Gateway:
             fault = exc if isinstance(exc, Fault) else (
                 Fault("TOOL_TIMEOUT", "工具超时", 504) if isinstance(exc, TimeoutError)
                 else Fault("UPSTREAM_DEPENDENCY_FAILED", "工具执行失败", 424))
-            self.store.complete_call(self.task_id, call_id, None, fault.as_dict())
+            self.store.complete_call(self.task_id, call_id, None, fault.as_dict(), lease=self.lease)
             raise fault
 
 
@@ -160,7 +179,9 @@ class Runtime:
             raise Fault("PERMISSION_DENIED", "没有场景或对象访问权限", 403)
 
     def gateway(self, run_id):
-        self.store.run(run_id)
+        ctx = self.store.run(run_id)
+        if self.store.is_durable(ctx["task_id"]):
+            raise Fault("PERMISSION_DENIED", "持久计划步骤仅允许由持有租约的 Worker 执行", 403)
         return self.gateways.get(run_id) or Gateway(self, run_id)
 
     def authorize_task(self, actor, scenario, task_id):

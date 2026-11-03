@@ -21,6 +21,9 @@ from .catalog import Catalog
 from .errors import Fault
 from .runtime import Runtime
 from .store import Store
+from .plans import prepare_plan
+from .snapshots import Snapshots
+from .worker import PlanWorker, personal_actor
 
 ROOT = Path(__file__).resolve().parents[1]
 API = "/api/v1/agent"
@@ -47,6 +50,8 @@ class ChatInput(SessionInput):
     message: Message
     mode: Literal["offline", "openai"] = "offline"
     response_mode: Literal["blocking", "streaming"] = "blocking"
+    execution_mode: Literal["reactive", "durable_plan"] = "reactive"
+    budget: dict[str, int] | None = None
 
 
 class DiscoverInput(Strict):
@@ -101,7 +106,8 @@ class RequestLimits:
         return await self.app(scope, replay, send)
 
 
-def create_app(*, scenarios=None, database=None, token=None, model_settings=None, principals=None):
+def create_app(*, scenarios=None, database=None, token=None, model_settings=None, principals=None,
+               embedded_worker=None):
     model = model_settings if model_settings is not None else {
         "base_url": os.getenv("AGENT_MODEL_BASE_URL", "").strip(),
         "model": os.getenv("AGENT_MODEL_NAME", "").strip(),
@@ -118,21 +124,32 @@ def create_app(*, scenarios=None, database=None, token=None, model_settings=None
         catalog = Catalog(Path(scenarios or os.getenv("AGENT_SCENARIOS") or ROOT / "scenarios"))
         db_path = Path(database or os.getenv("AGENT_DATABASE") or ROOT / "var" / "agent.db")
         db_path.parent.mkdir(parents=True, exist_ok=True)
+        worker_mode = os.getenv("AGENT_PLAN_WORKER", "embedded")
+        if worker_mode not in ("embedded", "external"):
+            raise ValueError("AGENT_PLAN_WORKER must be embedded or external")
+        run_here = worker_mode == "embedded" if embedded_worker is None else embedded_worker
+        if principals is not None and not run_here:
+            raise ValueError("Use the embedded worker for custom in-process principals.")
+        app.state.snapshots = Snapshots(db_path, catalog)
         store = Store(db_path)
-        grants = {sid: {"permissions": ["knowledge.read"] + [t["permission"] for t in catalog.discover(sid)]}
-                  for sid in catalog.scenarios}
-        local = {"tenant_id": "personal", "org_id": "local", "user_id": "owner", "grants": grants}
-        app.state.runtime = Runtime(catalog, store, principals if principals is not None else {local_token: local}, model)
+        actors = principals if principals is not None else {local_token: personal_actor(catalog)}
+        app.state.runtime = Runtime(catalog, store, actors, model)
+        dispatcher = None
         try:
+            if run_here:
+                worker = PlanWorker(app.state.runtime, app.state.snapshots)
+                dispatcher = asyncio.create_task(worker.run())
             yield
         finally:
             workers = list(app.state.runtime.workers.values())
+            if dispatcher:
+                workers.append(dispatcher)
             for worker in workers:
                 worker.cancel()
             await asyncio.gather(*workers, return_exceptions=True)
             store.close()
 
-    app = FastAPI(title="Universal Agent", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(title="Universal Agent", version="0.2.0", lifespan=lifespan)
     app.add_middleware(RequestLimits)
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=["localhost", "127.0.0.1"])
 
@@ -188,7 +205,8 @@ def create_app(*, scenarios=None, database=None, token=None, model_settings=None
     @app.get(API + "/scenarios")
     async def scene_list(actor=Depends(identify)):
         rt = runtime()
-        return {"scenarios": [{k: scene.get(k) for k in ("id", "name", "description", "version", "example")}
+        return {"scenarios": [{**{k: scene.get(k) for k in ("id", "name", "description", "version", "example")},
+                               "durable_plan": sid in app.state.snapshots.current}
                               for sid, scene in rt.catalog.scenarios.items() if rt.grant(actor, sid)],
                 "model_available": model_ready, "model_name": model.get("model", "")}
 
@@ -219,11 +237,18 @@ def create_app(*, scenarios=None, database=None, token=None, model_settings=None
         return StreamingResponse(stream(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
 
-    @app.post(API + "/chat")
+    @app.post(API + "/chat", responses={202: {"description": "Durable task accepted; Location is its query URL."}})
     async def chat(body: ChatInput, actor=Depends(identify),
                    key: Annotated[str | None, Header(alias="Idempotency-Key", min_length=1, max_length=128)] = None):
         rt = runtime()
         data = body.model_dump(exclude_none=True)
+        durable = body.execution_mode == "durable_plan"
+        if not durable:
+            data.pop("execution_mode")
+            if body.budget is not None:
+                raise Fault("INVALID_REQUEST", "budget 只适用于 durable_plan")
+        elif body.mode != "offline":
+            raise Fault("INVALID_REQUEST", "当前持久计划使用离线场景规划器")
         rt.authorize(actor, body.business_id, data["context"])
         if body.session_id:
             session = rt.store.session(actor, body.session_id, body.business_id)
@@ -240,11 +265,35 @@ def create_app(*, scenarios=None, database=None, token=None, model_settings=None
             rt.store.audit("chat", "deny", actor, code="RATE_LIMITED")
             raise Fault("RATE_LIMITED", "请求过多，请稍后再试", 429, True)
         window.append(now)
-        task, created = rt.store.start(actor, data, key, rt.catalog.scenarios[body.business_id]["version"])
-        if created:
+        options = {}
+        task = rt.store.find_replay(actor, data, key) if key and durable else None
+        created = False
+        if task is None:
+            if durable:
+                snapshots = app.state.snapshots
+                snapshot_id = snapshots.current.get(body.business_id)
+                if not snapshot_id:
+                    raise Fault("PLAN_NOT_FOUND", "此场景没有已注册的计划模板", 404)
+                try:
+                    plan, budget = prepare_plan(snapshots.open(snapshot_id, body.business_id),
+                                                body.business_id, body.message,
+                                                rt.grant(actor, body.business_id)["permissions"],
+                                                data["context"], budget=body.budget)
+                except Fault as exc:
+                    rt.store.audit("plan.validate", "deny", actor, resource=body.business_id, code=exc.code)
+                    raise
+                options = {"plan": plan, "budget": budget, "snapshot_id": snapshot_id}
+            task, created = rt.store.start(actor, data, key, rt.catalog.scenarios[body.business_id]["version"],
+                                          **options)
+        if created and not durable:
             rt.launch(actor, data, task)
+        if durable:
+            task = allowed_task(actor, task["task_id"])
         if body.response_mode == "streaming":
             return event_stream(task["task_id"], actor, 0)
+        if durable:
+            location = API + "/tasks/" + task["task_id"]
+            return JSONResponse(task, status_code=202, headers={"Location": location})
         worker = rt.workers.get(task["task_id"])
         if worker:
             await asyncio.gather(asyncio.shield(worker), return_exceptions=True)
@@ -271,6 +320,24 @@ def create_app(*, scenarios=None, database=None, token=None, model_settings=None
     async def trace(task_id: Identifier, actor=Depends(identify)):
         allowed_task(actor, task_id)
         return {"events": runtime().store.events(task_id, 0)}
+
+    @app.get(API + "/tasks/{task_id}/plan")
+    async def get_plan(task_id: Identifier, actor=Depends(identify)):
+        task = allowed_task(actor, task_id)
+        rt = runtime()
+        plan = rt.store.plan_view(task_id)
+        visible = {t["name"] for t in rt.catalog.discover(task["business_id"])
+                   if t["permission"] in rt.grant(actor, task["business_id"])["permissions"]
+                   and t["action_level"] == "read"}
+        if any(step["capability_id"] not in visible for step in plan["steps"]):
+            rt.store.audit("plan.read", "deny", actor, task_id, code="PERMISSION_DENIED")
+            raise Fault("PERMISSION_DENIED", "没有查看此计划所需的能力权限", 403)
+        return plan
+
+    @app.get(API + "/tasks/{task_id}/steps")
+    async def get_steps(task_id: Identifier, actor=Depends(identify)):
+        plan = await get_plan(task_id, actor)
+        return {"task_id": task_id, "steps": plan["steps"]}
 
     @app.get(API + "/tasks/{task_id}/events")
     async def replay(task_id: Identifier, actor=Depends(identify),

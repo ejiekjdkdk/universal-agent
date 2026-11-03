@@ -1,0 +1,303 @@
+{
+  "environment": "local-windows-sqlite-offline",
+  "task_id": "task_e95f3c28fc5a4ac794cc99b62445a101",
+  "status": "completed",
+  "answer": "项目进度\n示例项目已完成首轮资料整理和内部演示。下一阶段将试用说明交给两位评审人核对。\n\n待跟进的风险\n示例项目仍缺少一份评审反馈。协调人计划在周五前确认反馈时间，确认后再调整排期。",
+  "evidence": [
+    {
+      "snippet": "示例项目已完成首轮资料整理和内部演示。下一阶段将试用说明交给两位评审人核对。",
+      "source_id": "brief-progress",
+      "title": "项目进度",
+      "version": "1.0.0"
+    },
+    {
+      "snippet": "示例项目仍缺少一份评审反馈。协调人计划在周五前确认反馈时间，确认后再调整排期。",
+      "source_id": "brief-risks",
+      "title": "项目风险",
+      "version": "1.0.0"
+    }
+  ],
+  "plan": {
+    "task_id": "task_e95f3c28fc5a4ac794cc99b62445a101",
+    "plan_id": "plan_694f3ecde5814875aeddcec39c5c320d",
+    "revision": 1,
+    "digest": "460a3fca9fd359060f5aa62895d113d6dbc5331f3f4c6766b6c19f76113142d9",
+    "snapshot_id": "927326f9c43922a010434d43633257cfe6d414071471feff5b0f57878d5ef889",
+    "schema_version": "2.0",
+    "result_contract": "summary_v1",
+    "steps": [
+      {
+        "step_id": "progress",
+        "capability_id": "read_progress",
+        "required": true,
+        "depends_on": [],
+        "status": "succeeded",
+        "attempt_no": 1,
+        "error": null
+      },
+      {
+        "step_id": "risks",
+        "capability_id": "read_risks",
+        "required": true,
+        "depends_on": [],
+        "status": "succeeded",
+        "attempt_no": 1,
+        "error": null
+      },
+      {
+        "step_id": "brief",
+        "capability_id": "compose_brief",
+        "required": true,
+        "depends_on": [
+          "progress",
+          "risks"
+        ],
+        "status": "succeeded",
+        "attempt_no": 1,
+        "error": null
+      }
+    ]
+  },
+  "timeline": [
+    {
+      "id": 1,
+      "event": "task_started",
+      "status": "running"
+    },
+    {
+      "id": 2,
+      "event": "plan_created"
+    },
+    {
+      "id": 3,
+      "event": "plan_validated"
+    },
+    {
+      "id": 4,
+      "event": "step_queued",
+      "step_id": "progress"
+    },
+    {
+      "id": 5,
+      "event": "step_queued",
+      "step_id": "risks"
+    },
+    {
+      "id": 6,
+      "event": "step_leased",
+      "step_id": "progress",
+      "attempt_no": 1
+    },
+    {
+      "id": 7,
+      "event": "step_leased",
+      "step_id": "risks",
+      "attempt_no": 1
+    },
+    {
+      "id": 8,
+      "event": "authorization",
+      "step_id": "progress"
+    },
+    {
+      "id": 9,
+      "event": "authorization",
+      "step_id": "progress"
+    },
+    {
+      "id": 10,
+      "event": "step_started",
+      "step_id": "progress",
+      "execution_id": "exec_df7dd4f4668842a2b070e53be31af89f",
+      "capability_id": "read_progress",
+      "attempt_no": 1
+    },
+    {
+      "id": 11,
+      "event": "tool_input",
+      "step_id": "progress",
+      "execution_id": "exec_df7dd4f4668842a2b070e53be31af89f"
+    },
+    {
+      "id": 12,
+      "event": "authorization",
+      "step_id": "progress"
+    },
+    {
+      "id": 13,
+      "event": "authorization",
+      "step_id": "progress"
+    },
+    {
+      "id": 14,
+      "event": "authorization",
+      "step_id": "risks"
+    },
+    {
+      "id": 15,
+      "event": "authorization",
+      "step_id": "risks"
+    },
+    {
+      "id": 16,
+      "event": "step_started",
+      "step_id": "risks",
+      "execution_id": "exec_bbcb7a775923487fb0c26f77cb855e7f",
+      "capability_id": "read_risks",
+      "attempt_no": 1
+    },
+    {
+      "id": 17,
+      "event": "tool_input",
+      "step_id": "risks",
+      "execution_id": "exec_bbcb7a775923487fb0c26f77cb855e7f"
+    },
+    {
+      "id": 18,
+      "event": "authorization",
+      "step_id": "risks"
+    },
+    {
+      "id": 19,
+      "event": "authorization",
+      "step_id": "progress"
+    },
+    {
+      "id": 20,
+      "event": "authorization",
+      "step_id": "risks"
+    },
+    {
+      "id": 21,
+      "event": "tool_call_completed",
+      "step_id": "progress",
+      "execution_id": "exec_df7dd4f4668842a2b070e53be31af89f",
+      "capability_id": "read_progress",
+      "attempt_no": 1,
+      "status": "completed",
+      "duration_ms": 41
+    },
+    {
+      "id": 22,
+      "event": "tool_result",
+      "step_id": "progress",
+      "execution_id": "exec_df7dd4f4668842a2b070e53be31af89f",
+      "duration_ms": 31
+    },
+    {
+      "id": 23,
+      "event": "step_completed",
+      "step_id": "progress",
+      "execution_id": "exec_df7dd4f4668842a2b070e53be31af89f",
+      "capability_id": "read_progress",
+      "status": "succeeded"
+    },
+    {
+      "id": 24,
+      "event": "authorization",
+      "step_id": "risks"
+    },
+    {
+      "id": 25,
+      "event": "tool_call_completed",
+      "step_id": "risks",
+      "execution_id": "exec_bbcb7a775923487fb0c26f77cb855e7f",
+      "capability_id": "read_risks",
+      "attempt_no": 1,
+      "status": "completed",
+      "duration_ms": 30
+    },
+    {
+      "id": 26,
+      "event": "tool_result",
+      "step_id": "risks",
+      "execution_id": "exec_bbcb7a775923487fb0c26f77cb855e7f",
+      "duration_ms": 31
+    },
+    {
+      "id": 27,
+      "event": "step_completed",
+      "step_id": "risks",
+      "execution_id": "exec_bbcb7a775923487fb0c26f77cb855e7f",
+      "capability_id": "read_risks",
+      "status": "succeeded"
+    },
+    {
+      "id": 28,
+      "event": "step_queued",
+      "step_id": "brief",
+      "capability_id": "compose_brief",
+      "status": "ready"
+    },
+    {
+      "id": 29,
+      "event": "step_leased",
+      "step_id": "brief",
+      "attempt_no": 1
+    },
+    {
+      "id": 30,
+      "event": "authorization",
+      "step_id": "brief"
+    },
+    {
+      "id": 31,
+      "event": "authorization",
+      "step_id": "brief"
+    },
+    {
+      "id": 32,
+      "event": "step_started",
+      "step_id": "brief",
+      "execution_id": "exec_5ef3229aa4d34b04a391c546f0453da8",
+      "capability_id": "compose_brief",
+      "attempt_no": 1
+    },
+    {
+      "id": 33,
+      "event": "tool_input",
+      "step_id": "brief",
+      "execution_id": "exec_5ef3229aa4d34b04a391c546f0453da8"
+    },
+    {
+      "id": 34,
+      "event": "authorization",
+      "step_id": "brief"
+    },
+    {
+      "id": 35,
+      "event": "authorization",
+      "step_id": "brief"
+    },
+    {
+      "id": 36,
+      "event": "tool_call_completed",
+      "step_id": "brief",
+      "execution_id": "exec_5ef3229aa4d34b04a391c546f0453da8",
+      "capability_id": "compose_brief",
+      "attempt_no": 1,
+      "status": "completed",
+      "duration_ms": 12
+    },
+    {
+      "id": 37,
+      "event": "tool_result",
+      "step_id": "brief",
+      "execution_id": "exec_5ef3229aa4d34b04a391c546f0453da8",
+      "duration_ms": 15
+    },
+    {
+      "id": 38,
+      "event": "step_completed",
+      "step_id": "brief",
+      "execution_id": "exec_5ef3229aa4d34b04a391c546f0453da8",
+      "capability_id": "compose_brief",
+      "status": "succeeded"
+    },
+    {
+      "id": 39,
+      "event": "task_completed",
+      "status": "completed"
+    }
+  ]
+}

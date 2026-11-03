@@ -1,4 +1,4 @@
-"""Transactional task store for one service process and its worker threads."""
+"""SQLite persistence shared by the API and independently leased plan workers."""
 import hashlib
 import json
 import sqlite3
@@ -10,6 +10,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from .errors import Fault
+from .plan_store import MAX_ATTEMPTS, PLAN_SCHEMA, PlanStore
 
 
 TERMINAL_EVENTS = {
@@ -100,8 +101,8 @@ def _scope(session, requested):
     return scope
 
 
-class Store:
-    def __init__(self, path, run_ttl_seconds=900):
+class Store(PlanStore):
+    def __init__(self, path, run_ttl_seconds=900, *, recover_reactive=True):
         if str(path) != ":memory:":
             Path(path).parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
@@ -110,19 +111,22 @@ class Store:
         self._ttl = run_ttl_seconds
         self._db.execute("PRAGMA foreign_keys=ON")
         self._db.execute("PRAGMA journal_mode=WAL")
-        self._db.executescript(SCHEMA)
-        with self._transaction():
-            running = self._db.execute("SELECT task_id FROM tasks WHERE finished_at IS NULL").fetchall()
-            for row in running:
-                error = Fault("TASK_INTERRUPTED", "The service restarted during this task.", 503).as_dict()
-                self._finish(row["task_id"], "failed", {}, error)
+        self._db.executescript(SCHEMA + PLAN_SCHEMA)
+        if recover_reactive:
+            with self._transaction():
+                running = self._db.execute("""SELECT task_id FROM tasks t WHERE finished_at IS NULL
+                    AND NOT EXISTS(SELECT 1 FROM plans p WHERE p.task_id=t.task_id)""").fetchall()
+                for row in running:
+                    error = Fault("TASK_INTERRUPTED", "The service restarted during this task.", 503).as_dict()
+                    self._finish(row["task_id"], "failed", {}, error)
 
     @contextmanager
-    def _transaction(self, identity=None, action=None, resource=None):
-        # Transactions on a shared SQLite connection must not interleave across threads.
+    def _transaction(self, identity=None, action=None, resource=None, *, write=True):
+        # Acquire the interprocess writer lock before reading state used for a transition.
         with self._lock:
             try:
                 with self._db:
+                    self._db.execute("BEGIN IMMEDIATE" if write else "BEGIN")
                     yield
             except Fault as exc:
                 if action:
@@ -169,21 +173,31 @@ class Store:
                 "status": "active", "created_at": row["created_at"]}
 
     def session(self, identity, session_id, business_id=None):
-        with self._transaction(identity, "session.read", session_id):
+        with self._transaction(identity, "session.read", session_id, write=False):
             return self._session(identity, session_id, business_id)
 
-    def start(self, identity, body, key, business_version):
+    def _replay(self, identity, body, key):
+        if key is None:
+            return None
+        row = self._db.execute("""SELECT request_hash,task_id FROM idempotency
+            WHERE tenant_id=? AND org_id=? AND user_id=? AND business_id=? AND key=?""",
+            (*_owner(identity), body["business_id"], key)).fetchone()
+        if not row:
+            return None
+        if row["request_hash"] != _digest(body):
+            raise Fault("IDEMPOTENCY_CONFLICT", "Key already used for a different request.", 409)
+        return self._task(row["task_id"])
+
+    def find_replay(self, identity, body, key):
+        with self._transaction(identity, "task.replay", body["business_id"], write=False):
+            return self._replay(identity, body, key)
+
+    def start(self, identity, body, key, business_version, *, plan=None, snapshot_id=None, budget=None):
         business_id = body["business_id"]
         with self._transaction(identity, "task.start", business_id):
-            if key is not None:
-                scope = (*_owner(identity), business_id, key)
-                digest = _digest(body)
-                old = self._db.execute("""SELECT request_hash,task_id FROM idempotency
-                    WHERE tenant_id=? AND org_id=? AND user_id=? AND business_id=? AND key=?""", scope).fetchone()
-                if old:
-                    if old["request_hash"] != digest:
-                        raise Fault("IDEMPOTENCY_CONFLICT", "Key already used for a different request.", 409)
-                    return self._task(old["task_id"]), False
+            existing = self._replay(identity, body, key)
+            if existing is not None:
+                return existing, False
             if body.get("session_id"):
                 session = self._session(identity, body["session_id"], business_id)
             else:
@@ -197,8 +211,14 @@ class Store:
             self._db.execute("INSERT INTO runs(context_id,task_id,context,expires_at) VALUES(?,?,?,?)",
                              (_id("ctx"), task_id, _json(context), time.time() + self._ttl))
             if key is not None:
-                self._db.execute("INSERT INTO idempotency VALUES(?,?,?,?,?,?,?)", (*scope, digest, task_id))
-            self._event(task_id, "task_started", {"session_id": session["session_id"], "status": "running"})
+                self._db.execute("INSERT INTO idempotency VALUES(?,?,?,?,?,?,?)",
+                                 (*_owner(identity), business_id, key, _digest(body), task_id))
+            startup = {"session_id": session["session_id"], "status": "running"}
+            if plan is not None:
+                startup["execution_mode"] = "durable_plan"
+            self._event(task_id, "task_started", startup)
+            if plan is not None:
+                self._create_plan(task_id, plan, snapshot_id, budget)
             self._audit("task.start", "allow", identity, task_id, business_id, None, audit_id)
             return self._task(task_id), True
 
@@ -215,12 +235,17 @@ class Store:
                                     FROM calls WHERE task_id=? ORDER BY rowid""", (task_id,))
         summary = {k: row[k] for k in ("task_id", "session_id", "business_id", "business_version",
                    "audit_id", "request_id", "mode", "status", "message", "created_at", "finished_at")}
+        if self.is_durable(task_id):
+            summary["execution_mode"] = "durable_plan"
+            for key in ("failed_steps", "missing_outputs", "limitations"):
+                if key in result:
+                    summary[key] = result[key]
         return {**summary, "answer": result.get("answer", ""), "artifacts": result.get("artifacts", []),
                 "evidence": result.get("evidence", []), "error": json.loads(row["error"] or "null"),
                 "tool_calls": [dict(call) for call in calls], "result": result}
 
     def task(self, identity, task_id):
-        with self._transaction(identity, "task.read", task_id):
+        with self._transaction(identity, "task.read", task_id, write=False):
             return self._task(task_id, identity)
 
     def recent(self, identity, business_id=None, limit=30):
@@ -242,7 +267,7 @@ class Store:
 
     def history(self, identity, session_id, limit=6, *, allowed_objects=None, allowed_types=None,
                 allowed_permissions=None, inherit_to=None):
-        with self._transaction(identity, "session.history", session_id):
+        with self._transaction(identity, "session.history", session_id, write=bool(inherit_to)):
             self._session(identity, session_id, None)
             limit = max(0, min(limit, 12))
             if not limit:
@@ -305,10 +330,13 @@ class Store:
             SELECT ?, COALESCE(MAX(event_id),0)+1, ?, ?, ? FROM events WHERE task_id=?""",
             (task_id, event, _json({**data, "task_id": task_id}), _now(), task_id))
 
-    def emit(self, task_id, event, data):
+    def emit(self, task_id, event, data, *, lease=None):
         if event in TERMINAL_EVENTS.values() or event == "task_started":
             raise Fault("TASK_STATE_CONFLICT", "Lifecycle events are controlled by task transitions.", 409)
         with self._transaction():
+            step = self._guard_lease(task_id, lease)
+            if step:
+                data = {**data, "step_id": step["step_id"]}
             if self._task_row(task_id)["status"] == "running":
                 if event == "authorization" and data["allowed"]:
                     self._db.execute("INSERT OR IGNORE INTO task_permissions VALUES (?,?)",
@@ -327,6 +355,8 @@ class Store:
             raise Fault("TASK_STATE_CONFLICT", "Invalid terminal state.", 409)
         if self._task_row(task_id)["status"] in TERMINAL_EVENTS:
             return False
+        if self.is_durable(task_id):
+            self._interrupt_plan(task_id, status)
         finished = _now()
         self._db.execute("UPDATE tasks SET status=?,result=?,error=?,finished_at=? WHERE task_id=?",
                          (status, _json(result), _json(error), finished, task_id))
@@ -346,6 +376,8 @@ class Store:
 
     def finish(self, task_id, status, result, error=None):
         with self._transaction():
+            if self.is_durable(task_id):
+                raise Fault("TASK_STATE_CONFLICT", "Plan tasks finish through step transitions.", 409)
             return self._finish(task_id, status, result, error)
 
     def cancel(self, identity, task_id):
@@ -354,13 +386,16 @@ class Store:
             self._finish(task_id, "cancelled", {}, None)
             return self._task(task_id)
 
-    def begin_call(self, task_id, call_id, cap_id, version, arguments, max_calls=8):
+    def begin_call(self, task_id, call_id, cap_id, version, arguments, max_calls=8, *, lease=None):
         with self._transaction():
+            step = self._guard_lease(task_id, lease, call_id, cap_id)
             if self._task_row(task_id)["status"] != "running":
                 raise Fault("TASK_STATE_CONFLICT", "Task is no longer running.", 409)
             self.run(self.context_id(task_id))
             digest = _digest(arguments)
             row = self._db.execute("SELECT * FROM calls WHERE task_id=? AND call_id=?", (task_id, call_id)).fetchone()
+            if step and step["token"] > MAX_ATTEMPTS and (not row or row["status"] != "completed"):
+                raise Fault("STEP_ATTEMPTS_EXHAUSTED", "Recovery lease only permits a cached result.", 409)
             if row:
                 if (row["capability_id"], row["capability_version"], row["arguments_digest"]) != (cap_id, version, digest):
                     raise Fault("IDEMPOTENCY_CONFLICT", "Call ID already used for a different operation.", 409)
@@ -369,19 +404,33 @@ class Store:
                 if row["status"] == "failed":
                     error = json.loads(row["error"])
                     raise Fault(error["code"], error["message"], error.get("status", 424), error.get("retryable", False))
+                if step and step["call_token"] != step["token"] and row["status"] == "running":
+                    self._mark_call_started(step)
+                    return row["execution_id"], None
                 raise Fault("TASK_STATE_CONFLICT", "Call already in progress.", 409)
             count = self._db.execute("SELECT COUNT(*) FROM calls WHERE task_id=?", (task_id,)).fetchone()[0]
-            if count >= max_calls:
+            if count >= (step["call_limit"] if step else max_calls):
                 raise Fault("RATE_LIMITED", "Task tool-call budget exhausted.", 429)
             execution = _id("exec")
             self._db.execute("""INSERT INTO calls(task_id,call_id,execution_id,capability_id,capability_version,
                 arguments_digest,status,started) VALUES(?,?,?,?,?,?,'running',?)""",
                 (task_id, call_id, execution, cap_id, version, digest, time.time()))
-            self._event(task_id, "step_started", {"capability_id": cap_id, "execution_id": execution})
+            detail = {"capability_id": cap_id, "execution_id": execution}
+            if step:
+                self._mark_call_started(step)
+                detail.update(step_id=step["step_id"], attempt_no=step["token"])
+            self._event(task_id, "step_started", detail)
             return execution, None
 
-    def complete_call(self, task_id, call_id, result, error=None):
+    def _mark_call_started(self, step):
+        self._db.execute("""UPDATE plan_steps SET call_token=token,status='running' WHERE task_id=? AND step_id=?""",
+                         (step["task_id"], step["step_id"]))
+
+    def complete_call(self, task_id, call_id, result, error=None, *, lease=None):
         with self._transaction():
+            step = self._guard_lease(task_id, lease, call_id)
+            if step and step["call_token"] != step["token"]:
+                raise Fault("LEASE_LOST", "This attempt has not started the tool.", 409)
             row = self._db.execute("SELECT * FROM calls WHERE task_id=? AND call_id=?", (task_id, call_id)).fetchone()
             if not row:
                 raise Fault("TASK_STATE_CONFLICT", "Call has not started.", 409)
@@ -396,4 +445,6 @@ class Store:
                       "status": status, "duration_ms": duration}
             if error is not None:
                 detail["error"] = error
-            self._event(task_id, "step_" + status, detail)
+            if step:
+                detail.update(step_id=step["step_id"], attempt_no=step["token"])
+            self._event(task_id, ("tool_call_" if step else "step_") + status, detail)

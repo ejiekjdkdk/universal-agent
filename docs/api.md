@@ -11,6 +11,8 @@
 | GET /api/v1/agent/tasks | 当前身份的最近任务，支持 business_id 过滤 |
 | GET /api/v1/agent/tasks/{id} | 任务状态、回答、工具调用、证据、错误和审计 ID |
 | GET /api/v1/agent/tasks/{id}/trace | 持久化的有序事件，含时间和事件 ID |
+| GET /api/v1/agent/tasks/{id}/plan | 持久计划摘要、依赖和版本快照 |
+| GET /api/v1/agent/tasks/{id}/steps | 持久计划各步状态、尝试次数与错误代码 |
 | GET /api/v1/agent/tasks/{id}/events | SSE 事件流，通过 Last-Event-ID 从上次位置恢复 |
 | POST /api/v1/agent/tasks/{id}/cancel | 尽力取消任务，以持久化终态为准 |
 
@@ -28,6 +30,6 @@ Trace 的事件 ID 在任务内递增。前端可实时订阅，或稍后通过 
 
 ## 存储与运行边界
 
-服务以单进程运行。默认 SQLite 文件为 `var/agent.db`，可通过 `AGENT_DATABASE` 指定。数据库持久化任务、事件、会话、执行摘要和审计；重启会将中断任务标记为失败，历史仍可查询。每次任务的工具数、模型轮数、工具并发与总耗时有上限。只读工具遇到符合条件的暂时故障可重试一次，取消或超时不能撤回已发出的远程请求。
+默认 SQLite 文件为 `var/agent.db`，可通过 `AGENT_DATABASE` 指定。原有 reactive 任务由一个 API 进程运行，重启时中断任务记为失败，历史仍可查询。显式选择 `execution_mode=durable_plan` 的任务保存计划和步骤，可由嵌入式或独立 Worker 恢复。JSON 提交返回 202 和查询地址，流式提交返回 200 SSE。每次任务的调用、并发与耗时均受限，取消或超时不能撤回已发出的远程请求。[可恢复计划协议](v2/durable-plans.md)
 
 离线模式可用来开发和验收扩展。接入企业环境时，由项目提供 SSO 身份、资源授权与服务端凭据管理。

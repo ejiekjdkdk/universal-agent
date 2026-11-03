@@ -1,6 +1,8 @@
 """Load reviewed local scenarios and dispatch tools within a single scenario."""
 import asyncio
 import copy
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 import importlib.util
 import inspect
 import ipaddress
@@ -41,6 +43,9 @@ MANIFEST = _object({
     "id": ID, "name": _string(128), "description": _string(1024), "example": _string(8192),
     "version": VERSION, "tools": {"type": "array", "items": TOOL, "maxItems": 128},
     "offline_tool": {"type": "string", "maxLength": 64}, "documents": _string(128),
+    "snapshot_files": {"type": "array", "maxItems": 32, "uniqueItems": True,
+                       "items": {"type": "string", "maxLength": 128,
+                                 "pattern": "^[A-Za-z0-9_-][A-Za-z0-9_.-]*[.](json|txt|csv|md)$"}},
 }, ["id", "name", "description", "example", "version", "tools"])
 ENVELOPE = _object({"data": {"type": "object"}, "evidence": {"type": "array", "maxItems": 32, "items": EVIDENCE}})
 DOCS = {"type": "array", "maxItems": 4096, "items": EVIDENCE}
@@ -138,8 +143,16 @@ async def _call_http(config, arguments, transport):
                 if status == 429:
                     error = Fault("RATE_LIMITED", "下游服务限流", 429, True)
                     retry_after = response.headers.get("Retry-After", "")
-                    if re.fullmatch(r"[0-9]{1,6}", retry_after):
-                        error.retry_after = min(int(retry_after), 5)
+                    if retry_after.isascii() and retry_after.isdecimal():
+                        # Any longer delay also exceeds the request budget.
+                        seconds = retry_after.lstrip("0") or "0"
+                        error.retry_after = int(seconds) if len(seconds) <= 9 else 1_000_000_000
+                    elif retry_after:
+                        try:
+                            when = parsedate_to_datetime(retry_after)
+                            error.retry_after = max(0, (when - datetime.now(timezone.utc)).total_seconds())
+                        except (ValueError, TypeError, OverflowError):
+                            pass
                     raise error
                 if status in (408, 500, 502, 503, 504):
                     raise Fault("UPSTREAM_UNAVAILABLE", "下游服务暂不可用", 503, True)
@@ -167,7 +180,7 @@ class Catalog:
         self._documents = {}
         self._handlers = {}
         self._http_transport = http_transport
-        root = Path(root)
+        root = self.root = Path(root).resolve()
         if not root.exists():
             return
         if not root.is_dir():

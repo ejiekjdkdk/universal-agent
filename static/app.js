@@ -1,15 +1,22 @@
 "use strict";
 const $ = (id) => document.getElementById(id);
 const api = "/api/v1/agent";
-const state = {scenes: [], scene: null, token: "", session: null, task: null, busy: false, view: 0};
+const state = {scenes: [], scene: null, token: "", session: null, task: null, busy: false,
+  running: false, poll: null, view: 0, historyRequest: 0};
 const labels = {
   task_started: "任务开始", planner_started: "启动规划器", tools_discovered: "发现可用工具",
   authorization: "权限校验", step_started: "开始执行工具", tool_input: "输入摘要", tool_result: "输出与耗时",
   step_completed: "工具完成", step_failed: "工具失败", tool_retry: "重试工具", knowledge_retrieved: "检索资料",
   message_delta: "生成回答", task_completed: "任务完成", task_cancelled: "已取消", task_failed: "任务失败",
-  model_request: "调用模型", model_response: "收到模型响应", model_round: "模型规划", tool_selected: "选择工具"
+  model_request: "调用模型", model_response: "收到模型响应", model_round: "模型规划", tool_selected: "选择工具",
+  plan_created: "创建计划", plan_validated: "计划校验通过", step_queued: "步骤已就绪",
+  step_leased: "工作进程已领取", step_running: "执行步骤", step_retrying: "重新尝试步骤",
+  step_suspended: "步骤已挂起", step_skipped: "步骤已跳过", step_cancelled: "步骤已取消",
+  task_partial: "任务部分完成", model_tool_call: "模型请求工具", provider_selected: "选择规划器"
 };
 const statuses = {completed: "已完成", failed: "失败", cancelled: "已取消", running: "运行中", partial: "部分完成"};
+const stepStatuses = {...statuses, blocked: "等待依赖", ready: "已就绪", leased: "已领取",
+  succeeded: "已完成", skipped: "已跳过", suspended: "已挂起"};
 function element(tag, content, cls) {
   const node = document.createElement(tag);
   if (content !== undefined) node.textContent = content;
@@ -29,13 +36,26 @@ async function request(path, options = {}) {
 function showBusy(value) {
   state.busy = value;
   $("submit").disabled = value || !state.scene;
-  $("mode").disabled = value;
+  const planned = $("executionMode").value === "durable_plan" && state.scene?.durable_plan;
+  $("executionMode").disabled = value;
+  $("mode").disabled = value || planned;
+  $("mode").hidden = Boolean(planned);
+  $("planHint").hidden = !planned;
   $("new").disabled = value;
-  $("cancel").hidden = !value || !state.task;
+  $("cancel").hidden = !state.running || !state.task;
   document.querySelectorAll(".scene,.past").forEach(node => {node.disabled = value;});
 }
-function resetView() {
+function beginView() {
   state.view++;
+  clearTimeout(state.poll);
+  state.running = false;
+  $("cancel").hidden = true;
+  $("planPanel").hidden = true;
+  $("planSteps").replaceChildren();
+  return state.view;
+}
+function resetView() {
+  beginView();
   state.task = null;
   state.session = null;
   $("status").textContent = "等待运行";
@@ -48,7 +68,7 @@ function resetView() {
 function drawTrace(entry) {
   const item = element("li"), details = element("details");
   const data = entry.data || {};
-  const title = data.capability_id || data.tool || data.resource || "";
+  const title = data.step_id || data.capability_id || data.tool || data.resource || "";
   details.append(element("summary", (labels[entry.event] || entry.event) + (title ? " · " + title : "")));
   details.append(element("pre", JSON.stringify(data, null, 2)));
   const stamp = entry.timestamp ? new Date(entry.timestamp).toLocaleTimeString() : "";
@@ -57,6 +77,8 @@ function drawTrace(entry) {
 }
 function showResult(run) {
   state.task = run.task_id;
+  state.running = run.status === "running";
+  $("cancel").hidden = !state.running;
   state.session = run.session_id;
   $("taskid").textContent = run.task_id;
   $("status").textContent = statuses[run.status] || run.status;
@@ -70,20 +92,65 @@ function showResult(run) {
     $("evidence").append(details);
   }
 }
-async function openTask(id) {
-  const view = ++state.view;
+function showPlan(plan) {
+  const rows = plan.steps.map(step => {
+    const row = element("li"), heading = element("div", undefined, "step-heading");
+    heading.append(element("strong", step.step_id), element("span", stepStatuses[step.status] || step.status, "badge"));
+    const deps = step.depends_on.length ? step.depends_on.join("、") : "无";
+    const attempt = step.attempt_no ? "第 " + step.attempt_no + " 次尝试" : "尚未尝试";
+    row.append(heading, element("div", step.capability_id + " · " + (step.required ? "必需" : "可选"), "meta"),
+      element("div", "依赖：" + deps + " · " + attempt, "step-detail"));
+    if (step.error?.code) row.append(element("div", step.error.code, "meta"));
+    return row;
+  });
+  $("planCount").textContent = "共 " + rows.length + " 步";
+  $("planSteps").replaceChildren(...rows);
+  $("planPanel").hidden = false;
+}
+async function loadPlan(id, view, live = false) {
+  try {
+    const plan = await (await request(api + "/tasks/" + encodeURIComponent(id) + "/plan")).json();
+    if (view === state.view) showPlan(plan);
+  } catch (error) {
+    if (view === state.view) notice(error.message);
+  }
+  if (live && view === state.view && state.busy) {
+    state.poll = setTimeout(() => loadPlan(id, view, true), 1000);
+  }
+}
+async function loadTask(id, view) {
   const path = api + "/tasks/" + encodeURIComponent(id);
-  const [run, trace] = await Promise.all([request(path).then(r => r.json()), request(path + "/trace").then(r => r.json())]);
-  if (view !== state.view) return;
-  showResult(run);
-  $("trace").replaceChildren();
-  trace.events.forEach(drawTrace);
+  try {
+    const [run, trace] = await Promise.all([request(path).then(r => r.json()), request(path + "/trace").then(r => r.json())]);
+    if (view !== state.view) return;
+    showResult(run);
+    $("trace").replaceChildren();
+    trace.events.forEach(drawTrace);
+    if (run.execution_mode === "durable_plan") {
+      await loadPlan(id, view);
+      if (view === state.view && state.running) state.poll = setTimeout(() => loadTask(id, view), 1000);
+    }
+  } catch (error) {
+    if (view === state.view) notice(error.message);
+  }
+}
+function openTask(id) {
+  resetView();
+  $("answer").textContent = "正在读取任务…";
+  return loadTask(id, state.view);
 }
 async function history() {
   const sid = state.scene?.id;
+  const requestId = ++state.historyRequest;
   if (!sid) return;
-  const {tasks} = await (await request(api + "/tasks?business_id=" + encodeURIComponent(sid))).json();
-  if (sid !== state.scene?.id) return;
+  let tasks;
+  try {
+    ({tasks} = await (await request(api + "/tasks?business_id=" + encodeURIComponent(sid))).json());
+  } catch (error) {
+    if (requestId === state.historyRequest && sid === state.scene?.id) notice(error.message);
+    return;
+  }
+  if (sid !== state.scene?.id || requestId !== state.historyRequest) return;
   $("history").replaceChildren();
   for (const run of tasks) {
     const node = element("button", run.message || run.task_id, "past");
@@ -97,6 +164,8 @@ async function history() {
 async function select(scene) {
   resetView();
   state.scene = scene;
+  $("executionOptions").hidden = !scene.durable_plan;
+  $("executionMode").value = scene.durable_plan ? "durable_plan" : "reactive";
   $("title").textContent = scene.name;
   $("description").textContent = scene.description;
   $("question").value = "";
@@ -146,7 +215,7 @@ async function consume(response, onEvent) {
 $("ask").onsubmit = async e => {
   e.preventDefault();
   if (state.busy || !state.scene || !$("question").value.trim()) return;
-  state.view++;
+  const view = beginView();
   state.task = null;
   $("trace").replaceChildren(); $("evidence").replaceChildren();
   $("status").textContent = "运行中"; $("answer").textContent = "等待回答…";
@@ -155,12 +224,18 @@ $("ask").onsubmit = async e => {
   notice(); showBusy(true);
   try {
     const body = {business_id: state.scene.id, session_id: state.session, message: $("question").value, mode: $("mode").value, response_mode: "streaming"};
+    if (state.scene.durable_plan && $("executionMode").value === "durable_plan") {
+      body.execution_mode = "durable_plan";
+      body.mode = "offline";
+    }
     const response = await request(api + "/chat", {method: "POST", headers: {"Idempotency-Key": crypto.randomUUID()}, body: JSON.stringify(body)});
     await consume(response, entry => {
       drawTrace(entry);
       state.task = entry.data.task_id;
+      state.running = !["task_completed", "task_partial", "task_cancelled", "task_failed"].includes(entry.event);
       $("taskid").textContent = state.task;
-      $("cancel").hidden = false;
+      $("cancel").hidden = !state.running;
+      if (body.execution_mode === "durable_plan" && entry.event === "plan_validated") loadPlan(state.task, view, true);
       if (entry.event === "message_delta") $("answer").textContent = entry.data.delta;
     });
     if (state.task) await openTask(state.task);
@@ -173,6 +248,7 @@ $("ask").onsubmit = async e => {
     await history().catch(e => notice(e.message));
   }
 };
+$("executionMode").onchange = () => showBusy(state.busy);
 $("example").onclick = () => { $("question").value = state.scene?.example || ""; $("question").focus(); };
 $("new").onclick = () => { resetView(); $("question").value = ""; $("question").focus(); };
 $("refresh").onclick = () => history().catch(e => notice(e.message));

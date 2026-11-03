@@ -178,6 +178,18 @@ def test_strict_http_destination(notes):
         Catalog(folder.parent)
 
 
+def test_upstream_retry_after_is_not_shortened(notes):
+    folder, manifest = notes
+    manifest["tools"][0]["adapter"] = {"type": "http", "url": "https://example.test/notes", "method": "POST"}
+    write_manifest(folder, manifest)
+    def limited(request):
+        return httpx.Response(429, headers={"Retry-After": "60"})
+    catalog = Catalog(folder.parent, http_transport=httpx.MockTransport(limited))
+    with pytest.raises(Fault) as error:
+        run(catalog, "notes", "notes_search", {"text": "x"})
+    assert error.value.retry_after == 60
+
+
 def test_http_tool_uses_exact_configured_target_and_rejects_redirect(notes):
     folder, manifest = notes
     manifest["tools"][0]["adapter"] = {"type": "http", "url": "https://example.test/notes", "method": "POST"}

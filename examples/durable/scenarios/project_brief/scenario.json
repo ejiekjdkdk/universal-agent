@@ -1,0 +1,142 @@
+{
+  "id": "project_brief",
+  "name": "项目简报",
+  "description": "从两条示例记录中读取进度和风险，再整理为简报。",
+  "example": "请为本周项目准备一份简报。",
+  "version": "1.0.0",
+  "documents": "notes.json",
+  "tools": [
+    {
+      "name": "read_progress",
+      "description": "读取项目进度记录。",
+      "permission": "brief.read",
+      "action_level": "read",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 16000
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "summary": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1600
+          },
+          "count": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 1
+          }
+        },
+        "required": [
+          "summary",
+          "count"
+        ],
+        "additionalProperties": false
+      },
+      "adapter": {
+        "type": "python",
+        "handler": "progress"
+      }
+    },
+    {
+      "name": "read_risks",
+      "description": "读取项目风险记录。",
+      "permission": "brief.read",
+      "action_level": "read",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 16000
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "summary": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1600
+          },
+          "count": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 1
+          }
+        },
+        "required": [
+          "summary",
+          "count"
+        ],
+        "additionalProperties": false
+      },
+      "adapter": {
+        "type": "python",
+        "handler": "risks"
+      }
+    },
+    {
+      "name": "compose_brief",
+      "description": "将进度与风险整理成项目简报。",
+      "permission": "brief.read",
+      "action_level": "read",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "progress": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1600
+          },
+          "risks": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1600
+          }
+        },
+        "required": [
+          "progress",
+          "risks"
+        ],
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "summary": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          }
+        },
+        "required": [
+          "summary"
+        ],
+        "additionalProperties": false
+      },
+      "adapter": {
+        "type": "python",
+        "handler": "compose"
+      }
+    }
+  ]
+}
