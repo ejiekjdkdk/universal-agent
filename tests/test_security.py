@@ -282,3 +282,33 @@ def test_cancelling_inflight_adapter_releases_worker_and_emits_one_terminal(secu
     assert replay.text.count("event: task_cancelled\n") == 1
     assert "event: task_completed\n" not in replay.text and "event: task_failed\n" not in replay.text
     assert client.get(path, headers=OWNER).json()["tool_calls"][0]["status"] == "unknown_outcome"
+
+
+@pytest.mark.parametrize("revoked_field", ["permissions", "objects", "resource_types"])
+def test_open_sse_rechecks_access_before_each_buffered_event(secured_app, revoked_field):
+    client, runtime, actor = secured_app
+    task, _ = running_task(runtime, actor, context={"object_ids": ["mine"], "object_type": "document"})
+    task_id = task["task_id"]
+    runtime.store.emit(task_id, "authorization", {"allowed": True, "permission": "text.read"})
+    runtime.store.emit(task_id, "message_delta", {"delta": "private-answer-marker"})
+    runtime.store.finish(task_id, "completed", {"answer": "private-answer-marker"})
+    endpoint = next(route.endpoint for route in client.app.routes
+                    if getattr(route, "path", "") == API + "/tasks/{task_id}/events")
+
+    async def consume():
+        response = await endpoint(task_id, actor=actor, cursor=0)
+        stream = response.body_iterator
+        try:
+            assert "event: task_started" in await anext(stream)
+            # 模拟客户端接收首帧后暂停；同一批后续事件仍留在服务端迭代器中。
+            actor["grants"]["text"][revoked_field].clear()
+            with pytest.raises(Fault) as direct:
+                runtime.authorize_task(actor, "text", task_id)
+            assert direct.value.code == "PERMISSION_DENIED"
+            with pytest.raises(Fault) as streamed:
+                await anext(stream)
+            assert streamed.value.code == "PERMISSION_DENIED"
+        finally:
+            await stream.aclose()
+
+    asyncio.run(consume())

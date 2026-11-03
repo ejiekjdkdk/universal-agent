@@ -326,6 +326,8 @@ def create_app(*, scenarios=None, database=None, token=None, model_settings=None
             while True:
                 task = allowed_task(actor, task_id)
                 for entry in runtime().store.events(task_id, cursor):
+                    # 每次 yield 都可能等待网络发送；下一帧必须重新检查期间发生的撤权。
+                    allowed_task(actor, task_id)
                     cursor = entry["id"]
                     payload = json.dumps(entry["data"], ensure_ascii=False, separators=(",", ":"))
                     yield f"id: {cursor}\nevent: {entry['event']}\ndata: {payload}\n\n"

@@ -254,6 +254,8 @@ class ApprovalStore:
                             AND commit_status='not_started'""", (tid,))
 
     def _mock_requester(self, runtime, task, tool, args):
+        # 模拟写入不经过普通工具 Gateway，也必须检查任务来源和当前范围。
+        runtime.authorize_task(dict(task), task["business_id"], task["task_id"])
         scope = self.scope(task["task_id"])
         validate_write(args, scope)
         grant = runtime.grant(dict(task), task["business_id"])
@@ -336,7 +338,8 @@ class ApprovalStore:
             call_count = self._db.execute("SELECT COUNT(*) FROM calls WHERE task_id=?", (task_id,)).fetchone()[0]
             if call_count >= lease["call_limit"]:
                 raise Fault("EXECUTION_BUDGET_EXCEEDED", "工具调用预算已耗尽。", 429)
-            # 紧贴写入再次校验租约和审批时限，先前通过校验的步骤也可能已过期。
+            # 来源配置可在事务之外热更新；落账前与租约、审批时限一起重新检查。
+            runtime.authorize_task(dict(task), task["business_id"], task_id)
             self._guard_lease(task_id, claim)
             if time.time() >= approval["expires"]:
                 raise Fault("APPROVAL_EXPIRED", "审批有效期已结束。", 409)

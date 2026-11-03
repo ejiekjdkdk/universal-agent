@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 import json
 import sqlite3
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -18,6 +19,7 @@ from app.plans import prepare_plan
 from app.runtime import Runtime
 from app.store import Store
 from app.worker import PlanWorker
+from app.triggers import TriggerGateway, sign
 
 
 SID = "change_requests"
@@ -109,6 +111,86 @@ def proposal(s, scope=SCOPE):
 def decide(s, p, who="judge", decision="approve", key="one", **extra):
     return s.client.post(f"{BASE}/{p['approval_id']}/decision", headers={"Authorization": who, "Idempotency-Key": key},
                          json={"decision": decision, "proposal_digest": p["proposal_digest"], **extra})
+
+
+@pytest.fixture
+def triggered_write(system, tmp_path, monkeypatch):
+    source_secret = "local-trigger-write-test-secret-32-characters"
+    monkeypatch.setenv("TEST_WRITE_TRIGGER_ACTOR", "owner")
+    monkeypatch.setenv("TEST_WRITE_TRIGGER_SECRET", source_secret)
+    config = {"sources": [{
+        "source_id": "local", "token_env": "TEST_WRITE_TRIGGER_ACTOR",
+        "signing_key_env": "TEST_WRITE_TRIGGER_SECRET",
+        "businesses": {SID: {"object_types": [], "object_ids": ["draft-1"]}},
+    }], "schedules": []}
+    config_path = tmp_path / "triggers.json"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    system.snap.current = {SID: "snap"}
+    gateway = TriggerGateway(system.rt, system.snap, config_path)
+    system.rt.triggers = gateway
+    now = int(time.time())
+    event = {"event_id": "write-test", "business_id": SID, "message": "local test change",
+             "context": SCOPE, "issued_at": now, "expires_at": now + 120, "execution_mode": "durable_plan"}
+    raw = json.dumps(event).encode()
+    headers = {"X-Trigger-Source": "local", "X-Trigger-Timestamp": str(now), "X-Trigger-Nonce": "nonce",
+               "X-Trigger-Signature": sign(source_secret, "local", str(now), "nonce", raw)}
+    receipt = gateway.ingest(raw, headers)
+    return system, config, config_path, receipt["task_id"]
+
+
+@pytest.mark.parametrize("phase", ["proposal", "commit", "during_commit"])
+@pytest.mark.parametrize("revocation,code", [
+    ("disabled", "TRIGGER_SOURCE_DENIED"),
+    ("scope", "TRIGGER_SCOPE_DENIED"),
+    ("identity", "TASK_NOT_FOUND"),
+])
+def test_triggered_mock_write_rechecks_source_inside_transaction(triggered_write, monkeypatch, phase, revocation, code):
+    s, config, config_path, task_id = triggered_write
+
+    def revoke():
+        if revocation == "disabled":
+            config["sources"][0]["enabled"] = False
+        elif revocation == "scope":
+            config["sources"][0]["businesses"][SID]["object_ids"] = []
+        else:
+            monkeypatch.setenv("TEST_WRITE_TRIGGER_ACTOR", "reader")
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    if phase != "proposal":
+        work(s)
+        approval = s.store.approvals(s.principals["judge"], None, 10, 0)[0]
+        assert decide(s, approval).status_code == 200
+    if phase == "during_commit":
+        import app.approvals as approvals
+        original_check = approvals._require_current_approval
+
+        def check_then_revoke(*args):
+            original_check(*args)
+            # 事务入口已通过检查，再改变来源，验证实际落账前仍会复核。
+            revoke()
+
+        monkeypatch.setattr(approvals, "_require_current_approval", check_then_revoke)
+    else:
+        revoke()
+    work(s)
+    task = s.store.task(s.principals["owner"], task_id)
+    assert task["status"] == "failed"
+    assert task["error"]["code"] == code
+    assert s.store._db.execute("SELECT COUNT(*) FROM mock_ledger").fetchone()[0] == 0
+    assert s.store._db.execute("SELECT COUNT(*) FROM mock_receipts").fetchone()[0] == 0
+    if phase == "proposal":
+        assert s.store._db.execute("SELECT COUNT(*) FROM approvals").fetchone()[0] == 0
+
+
+def test_authorized_triggered_mock_write_still_commits_once(triggered_write):
+    s, _, _, task_id = triggered_write
+    work(s)
+    approval = s.store.approvals(s.principals["judge"], None, 10, 0)[0]
+    assert decide(s, approval).status_code == 200
+    work(s)
+    assert s.store.task(s.principals["owner"], task_id)["status"] == "completed"
+    assert s.store._db.execute("SELECT COUNT(*) FROM mock_ledger").fetchone()[0] == 1
+    assert s.store._db.execute("SELECT COUNT(*) FROM mock_receipts").fetchone()[0] == 1
 
 
 @pytest.fixture
