@@ -142,6 +142,22 @@ def test_untrusted_payloads_are_rejected_without_task(env, changes, code):
     assert count(gateway, "tasks") == 0
 
 
+@pytest.mark.parametrize("field", ["issued_at", "expires_at"])
+@pytest.mark.parametrize("timestamp", [10 ** 400, -(10 ** 400)], ids=["huge-positive", "huge-negative"])
+def test_oversized_event_timestamps_are_rejected_and_audited(env, field, timestamp):
+    gateway = env[0]
+    with pytest.raises(Fault) as exc:
+        gateway.ingest(*request(changes={field: timestamp}))
+    assert exc.value.code == "TRIGGER_INVALID"
+    assert exc.value.status == 422
+    for table in ("tasks", "plans", "sessions", "trigger_events", "trigger_nonces"):
+        assert count(gateway, table) == 0
+    audit = gateway.store._db.execute(
+        "SELECT action,decision,code FROM audit_logs ORDER BY rowid DESC LIMIT 1"
+    ).fetchone()
+    assert tuple(audit) == ("trigger.ingress", "deny", "TRIGGER_INVALID")
+
+
 def test_signature_freshness_and_exact_bytes_are_checked(env):
     gateway = env[0]
     raw, auth = request()

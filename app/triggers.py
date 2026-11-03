@@ -53,14 +53,28 @@ def _identifier(value):
 
 
 def _number(value):
-    return type(value) in (int, float) and math.isfinite(value)
+    if type(value) not in (int, float):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        # JSON 整数可超出浮点表示范围；仍作为无效输入交给入口记录拒绝审计。
+        return False
 
 
 def _context(value):
-    return (isinstance(value, dict) and not set(value) - {"object_type", "object_ids"}
-            and (value.get("object_type") is None or _identifier(value["object_type"]))
-            and isinstance(value.get("object_ids", []), list) and len(value.get("object_ids", [])) <= 64
-            and all(_identifier(x) for x in value.get("object_ids", [])))
+    if not isinstance(value, dict) or set(value) - {"object_type", "object_ids"}:
+        return False
+    object_type = value.get("object_type")
+    if object_type is not None and not _identifier(object_type):
+        return False
+    object_ids = value.get("object_ids", [])
+    if not isinstance(object_ids, list) or len(object_ids) > 64:
+        return False
+    for object_id in object_ids:
+        if not _identifier(object_id):
+            return False
+    return True
 
 
 def sign(secret, source, timestamp, nonce, raw):
@@ -71,9 +85,13 @@ def sign(secret, source, timestamp, nonce, raw):
 
 class TriggerGateway:
     def __init__(self, runtime, snapshots, config_path=None):
-        self.runtime, self.store, self.snapshots = runtime, runtime.store, snapshots
-        self.path = Path(config_path or os.environ["AGENT_TRIGGERS_FILE"]) if (
-            config_path or os.getenv("AGENT_TRIGGERS_FILE")) else None
+        self.runtime = runtime
+        self.store = runtime.store
+        self.snapshots = snapshots
+        configured_path = config_path or os.getenv("AGENT_TRIGGERS_FILE")
+        self.path = None
+        if configured_path:
+            self.path = Path(configured_path)
         with self.store._lock:
             self.store._db.executescript(SCHEMA)
         if self.path:
@@ -295,36 +313,36 @@ class TriggerGateway:
         now = time.time() if now is None else now
         schedules = self._config()[1]
         results = []
-        for sid, schedule in schedules.items():
+        for schedule_id, schedule in schedules.items():
             try:
                 with self.store._transaction():
                     # 取得写锁后重读配置，已经删除的定时器不能继续创建任务。
-                    if self._config()[1].get(sid) != schedule:
+                    if self._config()[1].get(schedule_id) != schedule:
                         continue
-                    digest = _hash(_json(schedule).encode())
+                    definition_hash = _hash(_json(schedule).encode())
                     db = self.store._db
-                    db.execute("INSERT OR IGNORE INTO trigger_schedules VALUES(?,?,?)", (sid, digest, schedule["start_at"]))
-                    row = db.execute("SELECT * FROM trigger_schedules WHERE schedule_id=?", (sid,)).fetchone()
-                    if row["definition_hash"] != digest:
+                    db.execute("INSERT OR IGNORE INTO trigger_schedules VALUES(?,?,?)", (schedule_id, definition_hash, schedule["start_at"]))
+                    row = db.execute("SELECT * FROM trigger_schedules WHERE schedule_id=?", (schedule_id,)).fetchone()
+                    if row["definition_hash"] != definition_hash:
                         raise Fault("TRIGGER_SCHEDULE_CONFLICT", "Changed schedules require a new schedule ID.", 409)
                     if row["next_due"] > now:
                         continue
                     interval = schedule["interval_seconds"]
                     # 错过的周期合并到最近一个到期时点，重启不会补发整个积压队列。
-                    due = row["next_due"] + int((now - row["next_due"]) // interval) * interval
+                    due_at = row["next_due"] + int((now - row["next_due"]) // interval) * interval
                     event = {k: schedule[k] for k in ("business_id", "message", "context")}
-                    event.update(event_id=f"schedule.{sid}.{due}", issued_at=due, expires_at=due + 300,
+                    event.update(event_id=f"schedule.{schedule_id}.{due_at}", issued_at=due_at, expires_at=due_at + 300,
                                  execution_mode="durable_plan")
                     if event["expires_at"] <= now:
-                        db.execute("UPDATE trigger_schedules SET next_due=? WHERE schedule_id=?", (due + interval, sid))
-                        self.store._audit("trigger.schedule.expired", "skip", None, None, sid, "TRIGGER_EXPIRED")
+                        db.execute("UPDATE trigger_schedules SET next_due=? WHERE schedule_id=?", (due_at + interval, schedule_id))
+                        self.store._audit("trigger.schedule.expired", "skip", None, None, schedule_id, "TRIGGER_EXPIRED")
                         continue
-                    raw_hash = _hash(_json(event).encode())
-                    result = self._accept(schedule["source_id"], event, raw_hash, event["event_id"], raw_hash, now)
-                    db.execute("UPDATE trigger_schedules SET next_due=? WHERE schedule_id=?", (due + interval, sid))
+                    event_hash = _hash(_json(event).encode())
+                    result = self._accept(schedule["source_id"], event, event_hash, event["event_id"], event_hash, now)
+                    db.execute("UPDATE trigger_schedules SET next_due=? WHERE schedule_id=?", (due_at + interval, schedule_id))
                     results.append(result)
             except Fault as exc:
-                self.store.audit("trigger.schedule", "deny", resource=sid, code=exc.code)
+                self.store.audit("trigger.schedule", "deny", resource=schedule_id, code=exc.code)
         return results
 
     async def run(self):

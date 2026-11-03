@@ -13,7 +13,9 @@ from app.skills import SkillError, SkillRegistry, _mapping
 
 
 def _reject_spoofed_manifest(text):
-    manifest = _mapping(text) if text else {}
+    manifest = {}
+    if text:
+        manifest = _mapping(text)
     if manifest.get("status", "draft") != "draft" or set(manifest) & {
         "signature", "reviewer", "evaluation_run_id", "release_snapshot_id"}:
         raise SkillError("manifest 不得伪造发布状态、审核者、签名或评测凭证")
@@ -65,7 +67,10 @@ def main(argv=None):
         registry = SkillRegistry(args.root)
         if args.action == "import":
             manifest = args.directory / "skill.manifest.yaml"
-            _reject_spoofed_manifest(manifest.read_text(encoding="utf-8-sig") if manifest.exists() else "")
+            manifest_text = ""
+            if manifest.exists():
+                manifest_text = manifest.read_text(encoding="utf-8-sig")
+            _reject_spoofed_manifest(manifest_text)
             result = registry.import_package(args.directory, args.version, author=args.author)
         elif args.action == "list":
             result = registry.active(args.business_id)
@@ -77,19 +82,27 @@ def main(argv=None):
             result = registry.compare(args.business_id, args.name, args.first, args.second)
         elif args.action == "details":
             result = registry.governance(args.business_id, args.name, args.version)
-        elif args.action in ("stage", "activate", "rollback"):
-            options = {"canary_percent": args.canary_percent} if args.action == "activate" else {}
-            result = getattr(registry, args.action)(args.business_id, args.name, args.version,
-                                                   reviewer=args.reviewer, **options)
+        elif args.action == "stage":
+            result = registry.stage(args.business_id, args.name, args.version, reviewer=args.reviewer)
+        elif args.action == "activate":
+            result = registry.activate(
+                args.business_id, args.name, args.version,
+                reviewer=args.reviewer, canary_percent=args.canary_percent,
+            )
+        elif args.action == "rollback":
+            result = registry.rollback(args.business_id, args.name, args.version, reviewer=args.reviewer)
         elif args.action == "revoke":
             registry.revoke(args.business_id, args.name, args.version, reviewer=args.reviewer)
             result = {"status": "revoked", "business_id": args.business_id, "name": args.name, "version": args.version}
-        else:
+        elif args.action in ("validate", "publish", "migrate"):
             _reject_spoofed_manifest(registry.inspect_package(args.name, args.version)["manifest_yaml"])
             catalog = Catalog(args.scenarios)
             if args.business_id not in catalog.scenarios:
                 raise SkillError("受信任目录中无此业务")
-            names = [tool["name"] for tool in catalog.discover(args.business_id) if tool["action_level"] == "read"]
+            names = []
+            for tool in catalog.discover(args.business_id):
+                if tool["action_level"] == "read":
+                    names.append(tool["name"])
             if catalog.scenarios[args.business_id].get("documents"):
                 names.append("retrieve_knowledge")
             if args.action == "migrate":

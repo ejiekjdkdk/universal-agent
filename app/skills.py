@@ -376,12 +376,22 @@ class SkillRegistry:
         if not hmac.compare_digest(proof["signature"], self._signature(payload)):
             raise SkillError("发布签名无效")
         report = json.loads(proof["report"])
-        if (not report.get("passed") or payload["report_digest"] != _sha(_encode(report))
-                or payload["evaluation_run_id"] != proof["evaluation_run_id"]
-                or payload["release_snapshot_id"] != row["release_snapshot_id"]
-                or [payload["business_id"], payload["name"], payload["version"]] != [row["business"], row["name"], row["version"]]
-                or payload["tools"] != json.loads(row["tools"])
-                or payload["content_seal"] != self._content_seal(db, row["name"], row["version"])):
+        # 按原顺序核验报告、发布身份、权限与内容，首个不一致即拒绝。
+        if not report.get("passed"):
+            raise SkillError("冻结内容或评测凭证已变化")
+        if payload["report_digest"] != _sha(_encode(report)):
+            raise SkillError("冻结内容或评测凭证已变化")
+        if payload["evaluation_run_id"] != proof["evaluation_run_id"]:
+            raise SkillError("冻结内容或评测凭证已变化")
+        if payload["release_snapshot_id"] != row["release_snapshot_id"]:
+            raise SkillError("冻结内容或评测凭证已变化")
+        signed_identity = [payload["business_id"], payload["name"], payload["version"]]
+        stored_identity = [row["business"], row["name"], row["version"]]
+        if signed_identity != stored_identity:
+            raise SkillError("冻结内容或评测凭证已变化")
+        if payload["tools"] != json.loads(row["tools"]):
+            raise SkillError("冻结内容或评测凭证已变化")
+        if payload["content_seal"] != self._content_seal(db, row["name"], row["version"]):
             raise SkillError("冻结内容或评测凭证已变化")
         details = db.execute("SELECT capability_bindings FROM release_details WHERE release_snapshot_id=?",
                              (row["release_snapshot_id"],)).fetchone()
@@ -416,62 +426,79 @@ class SkillRegistry:
         self._identity(reviewer)
         if isinstance(tools, str):
             raise SkillError("绑定的工具须为名称列表")
-        grants = sorted(set(tools))
-        for tool in grants:
+        granted_tools = sorted(set(tools))
+        for tool in granted_tools:
             _identifier(tool, r"[a-z][a-z0-9_]*", "工具名称")
-        if set(grants) - set(available_tools):
+        if set(granted_tools) - set(available_tools):
             raise SkillError("工具不在受信任的场景目录中")
         bindings = {} if capability_bindings is None else capability_bindings
-        if not isinstance(bindings, dict) or any(tool not in grants for tool in bindings.values()):
+        if not isinstance(bindings, dict) or any(tool not in granted_tools for tool in bindings.values()):
             raise SkillError("能力映射只能使用该发布明确绑定的工具")
-        pkg = self.inspect_package(name, version)
-        policy = _policy(_mapping(pkg["manifest_yaml"]) if pkg["manifest_yaml"] else {}, pkg["schemas"])
+        package = self.inspect_package(name, version)
+        manifest = {}
+        if package["manifest_yaml"]:
+            manifest = _mapping(package["manifest_yaml"])
+        policy = _policy(manifest, package["schemas"])
         if policy["business_scopes"] is not None and business_id not in policy["business_scopes"]:
             raise SkillError("业务不在冻结包的 business_scopes 中")
-        if set(bindings) != set(pkg["required_capabilities"]):
+        if set(bindings) != set(package["required_capabilities"]):
             raise SkillError("请为每个所需的能力和确切版本提供受信任的工具映射")
         key = (business_id, name, version)
-        snapshot = _sha(_encode([*key, pkg["digest"], grants, bindings]))
+        snapshot_id = _sha(_encode([*key, package["digest"], granted_tools, bindings]))
         with self._db() as db:
-            auth = db.execute("SELECT * FROM package_auth WHERE name=? AND version=?", (name, version)).fetchone()
-            if not auth:
+            package_auth = db.execute("SELECT * FROM package_auth WHERE name=? AND version=?", (name, version)).fetchone()
+            if not package_auth:
                 raise SkillError("旧包缺少作者记录，请显式迁移")
-            author = auth["author"] if author is None else author
+            if author is None:
+                author = package_auth["author"]
             self._identity(author)
-            if author != auth["author"] or author == reviewer:
+            if author != package_auth["author"] or author == reviewer:
                 raise SkillError("审核者必须与冻结的作者不同")
-            if auth["content_seal"] != self._content_seal(db, name, version):
+            if package_auth["content_seal"] != self._content_seal(db, name, version):
                 raise SkillError("冻结包已被改写")
-            old = db.execute("SELECT * FROM releases WHERE business=? AND name=? AND version=?", key).fetchone()
-            if old and (old["release_snapshot_id"] != snapshot or old["status"] == "revoked"):
+            existing_release = db.execute("SELECT * FROM releases WHERE business=? AND name=? AND version=?", key).fetchone()
+            if existing_release and (existing_release["release_snapshot_id"] != snapshot_id or existing_release["status"] == "revoked"):
                 raise SkillError("已发布的绑定不可覆盖，请发布新版本")
         report = self._evaluate(name, version)
         run_id = "seval_" + uuid.uuid4().hex
-        payload = {"skill_id": name, "name": name, "version": version, "business_id": business_id,
-                   "digest": pkg["digest"], "schema_version": (_mapping(pkg["manifest_yaml"]).get("schema_version", "3.0")
-                                                                if pkg["manifest_yaml"] else "3.0"),
-                   "dependency_versions": pkg["required_capabilities"], "author": author, "reviewer": reviewer,
-                   "evaluation_run_id": run_id, "release_snapshot_id": snapshot, "tools": grants,
-                   "capability_bindings": bindings, "content_seal": auth["content_seal"],
-                   "report_digest": _sha(_encode(report)), "assurance": "local-hmac-sha256"}
+        payload = {
+            "skill_id": name,
+            "name": name,
+            "version": version,
+            "business_id": business_id,
+            "digest": package["digest"],
+            "schema_version": manifest.get("schema_version", "3.0"),
+            "dependency_versions": package["required_capabilities"],
+            "author": author,
+            "reviewer": reviewer,
+            "evaluation_run_id": run_id,
+            "release_snapshot_id": snapshot_id,
+            "tools": granted_tools,
+            "capability_bindings": bindings,
+            "content_seal": package_auth["content_seal"],
+            "report_digest": _sha(_encode(report)),
+            "assurance": "local-hmac-sha256",
+        }
+        # 评测在写事务外执行；入库时重新检查内容和发布状态，防止评测期间变更。
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
-            db.execute("INSERT INTO skill_evaluations VALUES(?,?,?)", (run_id, snapshot, _encode(report)))
+            db.execute("INSERT INTO skill_evaluations VALUES(?,?,?)", (run_id, snapshot_id, _encode(report)))
             self._audit(db, "evaluate", *key, reviewer, {"evaluation_run_id": run_id, "passed": report["passed"]})
+            # 失败报告也需要提交；不能在此提前抛错，否则报告和审计会一起回滚。
             if report["passed"]:
-                if auth["content_seal"] != self._content_seal(db, name, version):
+                if package_auth["content_seal"] != self._content_seal(db, name, version):
                     raise SkillError("评测期间冻结包已变化")
-                old = db.execute("SELECT * FROM releases WHERE business=? AND name=? AND version=?", key).fetchone()
-                if old and (old["status"] not in ("validated", "legacy_pending") or old["release_snapshot_id"] != snapshot):
+                existing_release = db.execute("SELECT * FROM releases WHERE business=? AND name=? AND version=?", key).fetchone()
+                if existing_release and (existing_release["status"] not in ("validated", "legacy_pending") or existing_release["release_snapshot_id"] != snapshot_id):
                     raise SkillError("当前状态不可重新校验；请发布新版本")
-                if old:
+                if existing_release:
                     db.execute("UPDATE releases SET status='validated' WHERE business=? AND name=? AND version=?", key)
                 else:
-                    db.execute("INSERT INTO releases VALUES(?,?,?,?,?,'validated')", (*key, _encode(grants), snapshot))
-                db.execute("INSERT OR REPLACE INTO release_details VALUES(?,?)", (snapshot, _encode(bindings)))
+                    db.execute("INSERT INTO releases VALUES(?,?,?,?,?,'validated')", (*key, _encode(granted_tools), snapshot_id))
+                db.execute("INSERT OR REPLACE INTO release_details VALUES(?,?)", (snapshot_id, _encode(bindings)))
                 db.execute("INSERT OR REPLACE INTO skill_governance VALUES(?,?,?,?,?)",
-                           (snapshot, _encode(payload), self._signature(payload), run_id, _encode(report)))
-                self._audit(db, "validate", *key, reviewer, {"release_snapshot_id": snapshot})
+                           (snapshot_id, _encode(payload), self._signature(payload), run_id, _encode(report)))
+                self._audit(db, "validate", *key, reviewer, {"release_snapshot_id": snapshot_id})
         if not report["passed"]:
             raise SkillError("固定评测未通过，发布门禁拒绝")
         return self.governance(*key)
@@ -507,32 +534,43 @@ class SkillRegistry:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT * FROM releases WHERE business=? AND name=? AND version=?",
                              (business, name, version)).fetchone()
-            allowed = ("deprecated",) if _rollback else ("staged", "active")
+            allowed: tuple[str, ...] = ("staged", "active")
+            audit_action = "activate"
+            if _rollback:
+                allowed = ("deprecated",)
+                audit_action = "rollback"
             if not row or row["status"] not in allowed:
                 raise SkillError("发布必须先通过 staged，回滚仅允许 deprecated")
             payload, _ = self._verify(db, row)
             if reviewer != payload["reviewer"]:
                 raise SkillError("必须由记录中的独立审核者执行")
             rollout = db.execute("SELECT * FROM skill_rollouts WHERE business=? AND name=?", (business, name)).fetchone()
-            stable = rollout["stable_version"] if rollout else None
+            stable = None
+            if rollout:
+                stable = rollout["stable_version"]
             if canary_percent < 100:
                 stable_release = db.execute("SELECT * FROM releases WHERE business=? AND name=? AND version=? "
                                             "AND status='active'", (business, name, stable)).fetchone()
                 if not stable_release or stable == version:
                     raise SkillError("灰度需要另一个已激活的稳定版本")
                 self._verify(db, stable_release)
-            keep = [version] + ([stable] if canary_percent < 100 else [])
+            kept_versions = [version]
+            target_stable = version
+            target_canary = None
+            if canary_percent < 100:
+                kept_versions.append(stable)
+                target_stable = stable
+                target_canary = version
             for active in db.execute("SELECT version FROM releases WHERE business=? AND name=? AND status='active'",
                                      (business, name)).fetchall():
-                if active[0] not in keep:
+                if active[0] not in kept_versions:
                     db.execute("UPDATE releases SET status='deprecated' WHERE business=? AND name=? AND version=?",
                                (business, name, active[0]))
             db.execute("UPDATE releases SET status='active' WHERE business=? AND name=? AND version=?",
                        (business, name, version))
             db.execute("INSERT OR REPLACE INTO skill_rollouts VALUES(?,?,?,?,?)",
-                       (business, name, version if canary_percent == 100 else stable,
-                        None if canary_percent == 100 else version, canary_percent))
-            self._audit(db, "rollback" if _rollback else "activate", business, name, version, reviewer,
+                       (business, name, target_stable, target_canary, canary_percent))
+            self._audit(db, audit_action, business, name, version, reviewer,
                         {"canary_percent": canary_percent})
         return self.governance(business, name, version)
 
@@ -575,9 +613,13 @@ class SkillRegistry:
         result = []
         with self._db() as db:
             for row in db.execute("SELECT * FROM skill_rollouts WHERE business=? ORDER BY name", (business_id,)):
-                bucket = int(_sha(_encode([business_id, row["name"],
-                                          [actor.get(k, "") for k in ("tenant_id", "org_id", "user_id")]]))[:8], 16) % 100
-                version = row["canary_version"] if row["canary_version"] and bucket < row["percent"] else row["stable_version"]
+                # 身份字段顺序与编码必须固定，否则同一用户会在重构后落入不同灰度桶。
+                identity = [actor.get("tenant_id", ""), actor.get("org_id", ""), actor.get("user_id", "")]
+                bucket_digest = _sha(_encode([business_id, row["name"], identity]))
+                bucket = int(bucket_digest[:8], 16) % 100
+                version = row["stable_version"]
+                if row["canary_version"] and bucket < row["percent"]:
+                    version = row["canary_version"]
                 selected = candidates.get((row["name"], version))
                 if selected:
                     result.append(selected)
@@ -641,18 +683,37 @@ class SkillRegistry:
 
     def audit(self, business=None):
         with self._db() as db:
-            rows = db.execute("SELECT * FROM skill_audit " + ("WHERE business=? " if business else "") + "ORDER BY sequence",
-                              (business,) if business else ())
-            return [dict(row) | {"details": json.loads(row["details"])} for row in rows]
+            query = "SELECT * FROM skill_audit "
+            parameters: tuple[str, ...] = ()
+            if business:
+                query += "WHERE business=? "
+                parameters = (business,)
+            rows = db.execute(query + "ORDER BY sequence", parameters)
+            events = []
+            for row in rows:
+                event = dict(row)
+                event["details"] = json.loads(row["details"])
+                events.append(event)
+            return events
 
     def compare(self, business, name, first, second):
-        a, b = self.governance(business, name, first), self.governance(business, name, second)
-        old = {r["case_id"]: r["passed"] for r in a["evaluation"]["cases"]}
-        new = {r["case_id"]: r["passed"] for r in b["evaluation"]["cases"]}
-        return {"first": first, "second": second, "same_suite": a["evaluation"]["suite"] == b["evaluation"]["suite"],
-                "regressions": sorted(k for k in old if old[k] and not new.get(k, False)),
-                "bindings_compatible": a["capability_bindings"] == b["capability_bindings"],
-                "first_run_id": a["evaluation_run_id"], "second_run_id": b["evaluation_run_id"]}
+        first_release = self.governance(business, name, first)
+        second_release = self.governance(business, name, second)
+        first_results = {case["case_id"]: case["passed"] for case in first_release["evaluation"]["cases"]}
+        second_results = {case["case_id"]: case["passed"] for case in second_release["evaluation"]["cases"]}
+        regressions = []
+        for case_id, passed in first_results.items():
+            if passed and not second_results.get(case_id, False):
+                regressions.append(case_id)
+        return {
+            "first": first,
+            "second": second,
+            "same_suite": first_release["evaluation"]["suite"] == second_release["evaluation"]["suite"],
+            "regressions": sorted(regressions),
+            "bindings_compatible": first_release["capability_bindings"] == second_release["capability_bindings"],
+            "first_run_id": first_release["evaluation_run_id"],
+            "second_run_id": second_release["evaluation_run_id"],
+        }
 
     def migrate_legacy(self, business, name, version, *, author, reviewer, available_tools):
         self._identity(author)

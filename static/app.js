@@ -316,14 +316,19 @@ async function select(scene) {
 }
 
 async function loadSkills(scene) {
-  const result = await (await request(api + "/skills?business_id=" + encodeURIComponent(scene.id))).json();
-  if (state.scene !== scene) return;
-  const options = result.skills.map(skill => {
+  const response = await request(api + "/skills?business_id=" + encodeURIComponent(scene.id));
+  const result = await response.json();
+  // 切换业务后，旧请求的返回结果不能覆盖新业务的技能列表。
+  if (state.scene !== scene) {
+    return;
+  }
+  const options = [];
+  for (const skill of result.skills) {
     const option = element("option", skill.name + " · " + skill.version);
     option.value = skill.name;
     option.title = skill.description;
-    return option;
-  });
+    options.push(option);
+  }
   $("skill").replaceChildren(...options);
   showBusy(state.busy);
 }

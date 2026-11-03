@@ -201,43 +201,50 @@ class Gateway:
             deadline = min(deadline, started + self.lease["deadline"] - time.time())
         try:
             async with asyncio.timeout(self.runtime.tool_timeout):
-                slots = self.runtime.delegate_slots if adapter["type"] == "agent" else self.runtime.slots
+                slots = self.runtime.slots
+                if adapter["type"] == "agent":
+                    # 委派等待子工具时不能占用子工具需要的同一组并发名额。
+                    slots = self.runtime.delegate_slots
                 async with tool_slot(slots):
+                    # 回调只准备一次；每次实际调用时仍重新读取身份并核验权限。
+                    def authorize_retrieval():
+                        ctx = self.context()
+                        self.check_skill_tool(ctx, "retrieve_knowledge")
+                        self.check(ctx, "knowledge.read", "retrieve_knowledge")
+                        return ctx["object_ids"]
+
+                    options = {"authorize_retrieval": authorize_retrieval}
+                    if adapter["type"] == "agent":
+                        async def delegate(target, payload):
+                            self.authorize_tool(tool, arguments)
+                            self.trace("agent_delegated", {"execution_id": execution_id, "capability_id": name})
+                            child_id = "agent." + hashlib.sha256((call_id + "/" + target).encode()).hexdigest()[:32]
+                            child = await self.execute(target, payload, child_id)
+                            self.trace("agent_returned", {"execution_id": execution_id,
+                                       "child_execution_id": child["execution_id"]})
+                            return {"data": child["data"], "evidence": child["evidence"]}
+                        options["delegate"] = delegate
+                    if adapter["type"] == "mcp":
+                        options["mcp_context"] = MCPContext(
+                            tenant_id=context["tenant_id"],
+                            principal_id=json.dumps([context["org_id"], context["user_id"]]),
+                            run_context_id=self.run_id,
+                            trace_id=self.task_id,
+                            authorize=lambda: self.authorize_tool(tool, arguments),
+                            trace=lambda event, data: self.trace(event, {**data, "execution_id": execution_id}),
+                            pin_configuration=lambda key, digest: self.store.pin_mcp_configuration(self.task_id, key, digest),
+                        )
+
                     for attempt in range(2):
                         try:
                             # 排队或退避期间可能撤权，每次发出请求前都要复查。
                             self.authorize_tool(tool, arguments)
                             if self.read_only and adapter["type"] != "agent":
-                                self.store.consume_tool_attempt(self.task_id,
-                                    self.skill.get("max_tool_calls", 16) if self.skill else 16, lease=self.lease)
+                                attempt_limit = 16
+                                if self.skill:
+                                    attempt_limit = self.skill.get("max_tool_calls", 16)
+                                self.store.consume_tool_attempt(self.task_id, attempt_limit, lease=self.lease)
 
-                            def authorize_retrieval():
-                                ctx = self.context()
-                                self.check_skill_tool(ctx, "retrieve_knowledge")
-                                self.check(ctx, "knowledge.read", "retrieve_knowledge")
-                                return ctx["object_ids"]
-
-                            options = {"authorize_retrieval": authorize_retrieval}
-                            if adapter["type"] == "agent":
-                                async def delegate(target, payload):
-                                    self.authorize_tool(tool, arguments)
-                                    self.trace("agent_delegated", {"execution_id": execution_id, "capability_id": name})
-                                    child_id = "agent." + hashlib.sha256((call_id + "/" + target).encode()).hexdigest()[:32]
-                                    child = await self.execute(target, payload, child_id)
-                                    self.trace("agent_returned", {"execution_id": execution_id,
-                                               "child_execution_id": child["execution_id"]})
-                                    return {"data": child["data"], "evidence": child["evidence"]}
-                                options["delegate"] = delegate
-                            if adapter["type"] == "mcp":
-                                options["mcp_context"] = MCPContext(
-                                    tenant_id=context["tenant_id"],
-                                    principal_id=json.dumps([context["org_id"], context["user_id"]]),
-                                    run_context_id=self.run_id,
-                                    trace_id=self.task_id,
-                                    authorize=lambda: self.authorize_tool(tool, arguments),
-                                    trace=lambda event, data: self.trace(event, {**data, "execution_id": execution_id}),
-                                    pin_configuration=lambda key, digest: self.store.pin_mcp_configuration(self.task_id, key, digest),
-                                )
                             output = await self.catalog.execute(scenario_id, name, arguments, **options)
                             self.authorize_tool(tool, arguments)
                             if any("object_id" in item and item["object_id"] not in context["object_ids"]

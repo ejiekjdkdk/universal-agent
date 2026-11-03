@@ -86,9 +86,12 @@ def _endpoint(item):
 
 
 def _leaves(exc):
-    if isinstance(exc, BaseExceptionGroup):
-        return [leaf for child in exc.exceptions for leaf in _leaves(child)]
-    return [exc]
+    if not isinstance(exc, BaseExceptionGroup):
+        return [exc]
+    leaves = []
+    for child in exc.exceptions:
+        leaves.extend(_leaves(child))
+    return leaves
 
 
 class MCPGateway:
@@ -191,10 +194,18 @@ class MCPGateway:
         if credential_name and (not secret or "\r" in secret or "\n" in secret):
             raise Fault("PERMISSION_DENIED", "MCP 服务凭据不可用", 403)
         # 关联标签只传递摘要，不暴露原始身份或凭据。
-        tags = {key: hashlib.sha256(value.encode()).hexdigest() for key, value in {
-            "tenant": context.tenant_id, "principal": context.principal_id,
-            "run": context.run_context_id, "trace": context.trace_id}.items()}
-        headers = {"X-Agent-" + key.title(): value for key, value in tags.items()}
+        identity_fields = {
+            "tenant": context.tenant_id,
+            "principal": context.principal_id,
+            "run": context.run_context_id,
+            "trace": context.trace_id,
+        }
+        tags = {}
+        headers = {}
+        for key, value in identity_fields.items():
+            identity_digest = hashlib.sha256(value.encode()).hexdigest()
+            tags[key] = identity_digest
+            headers["X-Agent-" + key.title()] = identity_digest
         if secret:
             headers["Authorization"] = "Bearer " + secret
         url = endpoint["url"]
@@ -242,7 +253,9 @@ class MCPGateway:
                         raise Fault("PERMISSION_DENIED", "MCP 服务拒绝访问", 403)
                     if response.status_code >= 500:
                         await response.aclose()
-                        code = "OUTCOME_UNKNOWN" if sent and action_level != "read" else "UPSTREAM_UNAVAILABLE"
+                        code = "UPSTREAM_UNAVAILABLE"
+                        if sent and action_level != "read":
+                            code = "OUTCOME_UNKNOWN"
                         raise Fault(code, "MCP 上游不可用", 503, action_level == "read")
                     if response.headers.get("content-encoding", "identity").lower() != "identity":
                         await response.aclose()
@@ -253,7 +266,9 @@ class MCPGateway:
                     violations.append(exc)
                     raise
                 except (httpx2.TimeoutException, httpx2.NetworkError) as exc:
-                    code = "TOOL_TIMEOUT" if isinstance(exc, httpx2.TimeoutException) else "UPSTREAM_UNAVAILABLE"
+                    code = "UPSTREAM_UNAVAILABLE"
+                    if isinstance(exc, httpx2.TimeoutException):
+                        code = "TOOL_TIMEOUT"
                     if sent and action_level != "read":
                         code = "OUTCOME_UNKNOWN"
                     violations.append(Fault(code, "MCP 网络请求未完成", 503, action_level == "read"))
@@ -263,6 +278,7 @@ class MCPGateway:
                 await self.transport.aclose()
 
         started = time.monotonic()
+        # 有副作用的调用发出后遇到网络故障，无法确定远端结果，不能当作普通可重试失败。
         sent = False
         protocol = None
         try:
@@ -285,7 +301,11 @@ class MCPGateway:
                         names = [item.name for item in listing.tools]
                         if len(names) != len(set(names)):
                             raise Fault("MCP_PROTOCOL_INCOMPATIBLE", "MCP 工具名称冲突", 502)
-                        remote = next((item for item in listing.tools if item.name == tool["remote_tool_name"]), None)
+                        remote = None
+                        for listed_tool in listing.tools:
+                            if listed_tool.name == tool["remote_tool_name"]:
+                                remote = listed_tool
+                                break
                         if remote is None:
                             raise Fault("CAPABILITY_NOT_FOUND", "批准的 MCP 工具不可用", 404)
                         # 远端声明不能放宽本地约束；SDK 和本地网关分别校验输出。
@@ -317,19 +337,26 @@ class MCPGateway:
             raise
         except Exception as exc:
             leaves = _leaves(exc)
-            fault = next((e for e in [*violations, *leaves] if isinstance(e, Fault)), None)
-            if fault:
-                raise fault from None
+            # 本地传输层记录的拒绝优先于 SDK 包装异常，避免丢失权限或限流错误。
+            for error in [*violations, *leaves]:
+                if isinstance(error, Fault):
+                    raise error from None
             if any(isinstance(e, (TimeoutError, httpx2.TimeoutException)) for e in leaves):
-                code = "OUTCOME_UNKNOWN" if sent and action_level != "read" else "TOOL_TIMEOUT"
+                code = "TOOL_TIMEOUT"
+                if sent and action_level != "read":
+                    code = "OUTCOME_UNKNOWN"
                 raise Fault(code, "MCP 请求超时", 504, action_level == "read") from None
             if any(isinstance(e, (httpx2.NetworkError, httpx2.HTTPStatusError)) for e in leaves):
-                code = "OUTCOME_UNKNOWN" if sent and action_level != "read" else "UPSTREAM_UNAVAILABLE"
+                code = "UPSTREAM_UNAVAILABLE"
+                if sent and action_level != "read":
+                    code = "OUTCOME_UNKNOWN"
                 raise Fault(code, "MCP 连接不可用", 503, action_level == "read") from None
             if any(isinstance(e, MCPError) for e in leaves) and not sent:
                 raise Fault("MCP_PROTOCOL_INCOMPATIBLE", "MCP 协议协商失败", 502) from None
-            raise Fault("TOOL_OUTPUT_INVALID" if sent else "MCP_PROTOCOL_INCOMPATIBLE",
-                        "MCP 返回协议无效", 502) from None
+            code = "MCP_PROTOCOL_INCOMPATIBLE"
+            if sent:
+                code = "TOOL_OUTPUT_INVALID"
+            raise Fault(code, "MCP 返回协议无效", 502) from None
         finally:
             context.trace("mcp_execution", {"server_id": server_id, "capability_id": tool["capability_id"],
                 "capability_version": tool["version"], "protocol_version": protocol,

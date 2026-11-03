@@ -29,21 +29,38 @@ def install_skill_routes(app, runtime, admin_dependency):
     router = APIRouter(prefix="/api/v1/agent-admin/skills", tags=["SkillOps"])
 
     def invoke(operation, body, actor, **kwargs):
-        rt = runtime()
+        agent_runtime = runtime()
         reviewer = actor["user_id"]
         try:
             if operation == "validate":
-                if body.business_id not in rt.catalog.scenarios:
+                if body.business_id not in agent_runtime.catalog.scenarios:
                     raise SkillError("受信任目录中无此业务")
-                available = [t["name"] for t in rt.catalog.discover(body.business_id) if t["action_level"] == "read"]
-                if rt.catalog.scenarios[body.business_id].get("documents"):
-                    available.append("retrieve_knowledge")
-                kwargs.update(tools=body.tools, available_tools=available, capability_bindings=body.capability_bindings)
-            result = getattr(rt.skills, operation)(body.business_id, body.name, body.version, reviewer=reviewer, **kwargs)
-            rt.store.audit("skill." + operation, "allow", actor, resource=body.name)
+                available_tools = []
+                for tool in agent_runtime.catalog.discover(body.business_id):
+                    if tool["action_level"] == "read":
+                        available_tools.append(tool["name"])
+                if agent_runtime.catalog.scenarios[body.business_id].get("documents"):
+                    available_tools.append("retrieve_knowledge")
+                result = agent_runtime.skills.validate(
+                    body.business_id, body.name, body.version, tools=body.tools,
+                    available_tools=available_tools, capability_bindings=body.capability_bindings,
+                    reviewer=reviewer,
+                )
+            elif operation == "stage":
+                result = agent_runtime.skills.stage(body.business_id, body.name, body.version, reviewer=reviewer)
+            elif operation == "activate":
+                result = agent_runtime.skills.activate(
+                    body.business_id, body.name, body.version, reviewer=reviewer, **kwargs,
+                )
+            elif operation == "rollback":
+                result = agent_runtime.skills.rollback(body.business_id, body.name, body.version, reviewer=reviewer)
+            else:
+                # 此内部入口仅由下方五个固定路由调用，剩余操作是吊销。
+                result = agent_runtime.skills.revoke(body.business_id, body.name, body.version, reviewer=reviewer)
+            agent_runtime.store.audit("skill." + operation, "allow", actor, resource=body.name)
             return result or {"status": "revoked"}
         except SkillError as exc:
-            rt.store.audit("skill." + operation, "deny", actor, resource=body.name, code="SKILL_GOVERNANCE_DENIED")
+            agent_runtime.store.audit("skill." + operation, "deny", actor, resource=body.name, code="SKILL_GOVERNANCE_DENIED")
             raise Fault("SKILL_GOVERNANCE_DENIED", str(exc), 409) from None
 
     @router.post("/validate")

@@ -65,7 +65,7 @@ python -m pytest tests/test_skill_governance.py tests/test_skill_packages.py tes
 
 可选 `execution` 只支持 `trust_level: instructions_only` 和 `allow_scripts: false`；`max_tool_calls` 为 1–32 的整数，缺省为 8。Runtime 从已签名快照读取该限制并与全局预算共同执行。包内 scripts 不会执行。声明 `business_scopes` 时，发布业务必须包含在非空列表中。
 
-可选 `input_schema_ref` / `output_schema_ref` 必须指向冻结的 schemas/*.json。Schema 可用同一文件内的 `#` 引用；禁止外部 `$ref`、`$dynamicRef`、`$recursiveRef`，不会加载网络 Schema。Runtime 契约固定为：
+可选 `input_schema_ref` / `output_schema_ref` 必须指向冻结的 schemas/*.json。平台固定使用 JSON Schema Draft 2020-12，不按根 `$schema` 声明切换方言。同一文件内的 `$ref`、`$dynamicRef` 按该方言处理；`$ref`、`$dynamicRef`、`$recursiveRef` 的外部目标均被禁止，不会加载网络 Schema。旧 `$recursiveRef` 不是当前校验器支持的约束，不应依赖它实施输入或输出校验；请在新版本技能包中改用受支持的定义。本轮保留已有包的导入和加载规则，未来收紧方言或关键字门禁前须先盘点旧包并确定迁移方案。Runtime 契约固定为：
 
 - 输入：`{"message": "用户消息", "context": {"object_ids": ["对象编号"], "object_type": "可选对象类型"}}`。object_type 未指定时可以省略。
 - 输出：最终结构化结果对象，字段为 `answer`、`evidence`、`limitations`、`unresolved_items`、`artifacts`。
