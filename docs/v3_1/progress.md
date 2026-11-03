@@ -7,5 +7,5 @@
 - Task 2: complete — 编译器8个新行为先失败后通过；Provider接入2失败2通过后修复；同来源不同data_as_of证据2个用例先复现重复E1，再修复。上下文/模型/旧技能/兼容专项49 passed，14.19秒。最终全量待Task4。
 - Ruling: 证据去重键加入 source_ref/data_as_of — 原键会覆盖同版不同时点的证据，违反P1保留时点要求 — 此类结果可能增加证据数/改变后续引用编号，接口字段不变。
 - Ruling: Store.finish 原本会清理 calls.result，测试改在实际 Gateway 返回边界核验完整结果，不为满足测试改变原保留策略。
-- Task 3: pending。
+- Task 3: complete — DevKit初始16失败，补充畸形输入3失败、依赖诊断1失败，修复后新旧技能专项59 passed，35.22秒。context_compiler、skill_devkit、agent CLI三模块mypy通过；未宣称全库类型零错误。
 - Task 4: pending。
