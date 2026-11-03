@@ -35,6 +35,8 @@ python scripts/local_governance.py
 
 上述路径均以管理前缀为基址。发布回滚和软件降级是两个操作。升级前请停服务并备份 SQLite 数据库及旁边的 `plan-snapshots/`；回退应用程序时应配套还原对应代码、数据库和快照，避免用旧进程处理新状态。
 
+已发布场景的 Python 适配器可通过 `Path(__file__).parent` 读取随包的数据文件。API 和 Worker 从核验过的字节创建各自的临时运行副本，适配器应使用相对文件名。运行副本随场景目录对象释放，进程被强制终止时，系统临时目录可能留有 `agent-snapshot-*` 副本。
+
 ## 评测、指标与 Trace
 
 ```sh

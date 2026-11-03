@@ -187,7 +187,7 @@ class Releases:
             raise Fault("RELEASE_NOT_FOUND", "未找到可信候选目录", 404)
         try:
             return self.snapshots.capture(folder, scene)
-        except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+        except (OSError, ValueError, TypeError, KeyError, AttributeError, RecursionError) as exc:
             raise Fault("RELEASE_INVALID", "候选场景校验失败", 422) from exc
 
     async def _gate(self, operation, digest, scene, catalog):

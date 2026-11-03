@@ -35,6 +35,28 @@ def publish(c, scene_id):
     return route
 
 
+def test_deeply_nested_candidate_documents_return_422_and_can_be_corrected(tmp_path, monkeypatch):
+    source = ROOT / "scenarios"
+    folder = candidate(tmp_path, "notes", source)
+    documents = folder / "notes.json"
+    valid = documents.read_bytes()
+    documents.write_bytes(b"[" * 2000 + b"]" * 2000)
+    monkeypatch.setenv("AGENT_ADMIN_TOKEN", "project-admin")
+    monkeypatch.setenv("AGENT_RELEASE_CANDIDATES", str(tmp_path / "candidates"))
+    app = create_app(database=tmp_path / "db", scenarios=source, token="project-owner")
+    with TestClient(app, base_url="http://localhost", raise_server_exceptions=False) as client:
+        body = {"business_id": "notes", "candidate": "vnext"}
+        snapshots = app.state.snapshots.directory
+        original = set(snapshots.iterdir())
+        for path in ("/releases/validate", "/releases"):
+            response = client.post(ADMIN + path, headers=PUBLISHER, json=body)
+            assert response.status_code == 422, response.text
+            assert response.json()["error"]["code"] == "RELEASE_INVALID"
+            assert set(snapshots.iterdir()) == original
+        documents.write_bytes(valid)
+        publish(client, "notes")
+
+
 def test_running_task_stays_pinned_but_emergency_revoke_stops_dispatch(tmp_path, monkeypatch):
     scene = "project_brief"
     source = ROOT / "examples" / "durable" / "scenarios"

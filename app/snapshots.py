@@ -7,6 +7,7 @@ from pathlib import Path
 import re
 import tempfile
 from types import MappingProxyType
+import weakref
 
 from .catalog import Catalog, MANIFEST, _check, _local_file, _reject_duplicate_keys, _validate_documents
 from .errors import Fault
@@ -59,6 +60,13 @@ def _digest(files):
     return hashlib.sha256(serialized_entries).hexdigest()
 
 
+def write_scene_files(folder, files):
+    """在新目录还原核验过的字节，使评测、发布与执行看到相同的场景文件。"""
+    folder.mkdir(parents=True)
+    for name, content in files.items():
+        (folder / name).write_bytes(content)
+
+
 @dataclass(frozen=True)
 class Bundle:
     """已核验的元数据与源码字节，此时尚未导入候选代码。"""
@@ -66,6 +74,19 @@ class Bundle:
     scenarios: dict
     adapter_sources: dict
     files: Mapping[str, bytes]
+
+    def load_catalog(self, scene_id):
+        # 适配器可在任务执行时按 __file__ 读资料。运行副本须与目录对象同寿命。
+        scratch = tempfile.TemporaryDirectory(prefix="agent-snapshot-")
+        root = Path(scratch.name)
+        try:
+            write_scene_files(root / scene_id, self.files)
+            catalog = Catalog(root, adapter_sources=self.adapter_sources)
+        except BaseException:
+            scratch.cleanup()
+            raise
+        weakref.finalize(catalog, scratch.cleanup)
+        return catalog
 
 
 class Snapshots:
@@ -99,10 +120,7 @@ class Snapshots:
         if not destination.exists():
             with tempfile.TemporaryDirectory(dir=self.directory) as scratch:
                 staging = Path(scratch) / "bundle"
-                source = staging / scene_id
-                source.mkdir(parents=True)
-                for name, content in files.items():
-                    (source / name).write_bytes(content)
+                write_scene_files(staging / scene_id, files)
                 try:
                     staging.rename(destination)
                 except OSError:
@@ -119,11 +137,18 @@ class Snapshots:
             if folder.resolve() != folder or set(p.name for p in directory.iterdir()) != {scene_id}:
                 raise ValueError("Unexpected snapshot layout")
             files = snapshot_files(folder)
+            for entry in folder.iterdir():
+                if entry.name in files:
+                    continue
+                # 兼容旧目录中的字节码缓存，运行与评测均不会复制该目录。
+                if entry.name == "__pycache__" and entry.is_dir() and entry.resolve() == entry:
+                    continue
+                raise ValueError("Unexpected file in published snapshot")
             if _digest(files) != snapshot_id:
                 raise ValueError("Snapshot digest mismatch")
             scene = json.loads(files["scenario.json"])
             return Bundle(directory, {scene_id: scene}, {scene_id: files.get("adapter.py")}, MappingProxyType(files))
-        except (OSError, ValueError, KeyError, TypeError) as exc:
+        except (OSError, ValueError, KeyError, TypeError, RecursionError) as exc:
             raise Fault("RELEASE_SNAPSHOT_INVALID", "场景快照缺失或已损坏", 409) from exc
 
     def open(self, snapshot_id, scene_id):
@@ -131,7 +156,7 @@ class Snapshots:
         key = (snapshot_id, scene_id)
         if key not in self.cache:
             try:
-                self.cache[key] = Catalog(bundle.root, adapter_sources=bundle.adapter_sources)
+                self.cache[key] = bundle.load_catalog(scene_id)
             except (OSError, ValueError, KeyError, TypeError) as exc:
                 raise Fault("RELEASE_SNAPSHOT_INVALID", "场景快照无法加载", 409) from exc
         return self.cache[key]

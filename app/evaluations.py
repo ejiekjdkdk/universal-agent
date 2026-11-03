@@ -16,7 +16,7 @@ from .errors import Fault
 from .plans import prepare_plan
 from .providers import run_provider
 from .runtime import Gateway, Runtime
-from .snapshots import Bundle, snapshot_files
+from .snapshots import Bundle, snapshot_files, write_scene_files
 from .store import Store
 
 
@@ -125,10 +125,7 @@ def _isolated_catalog(source, sid, suite, temp):
         digest = hashlib.sha256(code.replace(b"\r\n", b"\n")).hexdigest()
         if digest != suite["adapter_sha256"] and digest not in previous_hashes:
             raise ValueError("adapter not approved for offline evaluation")
-    target = temp / sid
-    target.mkdir()
-    for name, data in files.items():
-        (target / name).write_bytes(data)
+    write_scene_files(temp / sid, files)
     adapter_sources = {sid: files["adapter.py"]} if "adapter.py" in files else {}
     return Catalog(temp, http_transport=httpx.MockTransport(http.respond), adapter_sources=adapter_sources), http
 

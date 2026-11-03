@@ -89,6 +89,47 @@ def test_gate_rejects_candidate_if_declared_sidecar_changes_answer(project):
         assert releases.select("notes", ADMIN, "") is None
 
 
+def test_extra_file_in_staged_snapshot_blocks_activation_and_cached_open(project):
+    with closing(Store(project.database)) as store:
+        releases = setup_release(project, store)
+        staged = asyncio.run(releases.stage("notes", "next", actor=ADMIN))
+        release_id = staged["release_id"]
+        opened = releases.snapshots.open(release_id, "notes")
+        stable = releases.select("notes", ADMIN, "")
+        folder = releases.snapshots.directory / release_id / "notes"
+        (folder / "not_published.txt").touch()
+
+        with pytest.raises(Fault) as rejected:
+            asyncio.run(releases.activate(release_id, 100, actor=ADMIN))
+        assert rejected.value.code == "RELEASE_SNAPSHOT_INVALID"
+        assert releases.select("notes", ADMIN, "") == stable
+        with pytest.raises(Fault) as rejected:
+            releases.snapshots.open(release_id, "notes")
+        assert rejected.value.code == "RELEASE_SNAPSHOT_INVALID"
+
+        # 已领取任务也可能在校验之后才执行，须继续读取当时核验过的资料。
+        (folder / "extra.txt").write_bytes(b"changed")
+        result = asyncio.run(opened.execute("notes", "notes_search", {"text": "probe"}))
+        assert result["data"]["summary"] == "published/crlf"
+
+
+def test_extra_file_added_during_gate_prevents_staging(project):
+    with closing(Store(project.database)) as store:
+        releases = setup_release(project, store)
+
+        def evaluate_then_add_file(bundle, scene_id):
+            report = evaluations.evaluate_release(bundle, scene_id)
+            assert report["passed"]
+            (bundle.root / scene_id / "not_published.txt").touch()
+            return report
+
+        releases.evaluate = evaluate_then_add_file
+        with pytest.raises(Fault) as rejected:
+            asyncio.run(releases.stage("notes", "next", actor=ADMIN))
+        assert rejected.value.code == "RELEASE_SNAPSHOT_INVALID"
+        assert releases.select("notes", ADMIN, "") is None
+
+
 def test_stage_cannot_publish_snapshot_tampered_with_during_passing_gate(project):
     with closing(Store(project.database)) as store:
         releases = setup_release(project, store)
