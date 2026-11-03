@@ -1,0 +1,5 @@
+[
+  {"source_id": "guide-01", "object_id": "guide-01", "title": "晨间观察 · 出发准备", "snippet": "出发前核对望远镜编号，并把空白记录卡放入防水袋。", "version": "1.0.0", "source_ref": "demo://field-guide/sections/01", "data_as_of": "2026-04-01T08:00:00Z"},
+  {"source_id": "guide-02", "object_id": "guide-02", "title": "晨间观察 · 现场记录", "snippet": "每次观察先记时刻与方位，听到重复鸣声时单独标记。", "version": "1.0.0", "source_ref": "demo://field-guide/sections/02", "data_as_of": "2026-04-02T08:00:00Z"},
+  {"source_id": "guide-03", "object_id": "guide-03", "title": "晨间观察 · 内部点位", "snippet": "备用观察点设在蓝杉坡，编号为 XS-47。", "version": "1.0.0", "source_ref": "demo://field-guide/sections/03", "data_as_of": "2026-04-03T08:00:00Z"}
+]

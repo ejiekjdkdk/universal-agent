@@ -35,3 +35,16 @@ Trace 的事件 ID 在任务内递增。前端可实时订阅，或稍后通过 
 默认 SQLite 文件为 `var/agent.db`，可通过 `AGENT_DATABASE` 指定。原有 reactive 任务由一个 API 进程运行，重启时中断任务记为失败，历史仍可查询。显式选择 `execution_mode=durable_plan` 的任务保存计划和步骤，可由嵌入式或独立 Worker 恢复。JSON 提交返回 202 和查询地址，流式提交返回 200 SSE。每次任务的调用、并发与耗时均受限，取消或超时不能撤回已发出的远程请求。[可恢复计划协议](v2/durable-plans.md)
 
 离线模式可用来开发和验收扩展。接入企业环境时，由项目提供 SSO 身份、资源授权与服务端凭据管理。
+# V3 P1 技能扩展
+
+业务接口沿用 `/api/v1/agent` 和原 Bearer 身份。交互请求可使用 `skill_id` 及 `mode: "mock"`。对已绑定技能的场景，只有一个可用技能时可由服务端选择，多个时须明确指定。技能绑定场景本阶段使用 reactive 只读运行。直接返回 SSE 的旧客户端仍可使用 `response_mode: "streaming"`。
+
+| 接口或事件 | 约定 |
+| --- | --- |
+| GET `/skills?business_id=...` | 返回 `skills` 元数据列表。只列出已发布、当前身份具备所需能力的技能。 |
+| GET `/capabilities?business_id=...` | 返回供展示的已注册场景工具。通用检索入口的权限由服务端单独核对。 |
+| POST `/chat` | 请求可携带 `context.object_ids`。技能版本由服务端固定。终态除了回答和证据，还可从 `result.limitations`、`result.unresolved_items` 获取局限和待确认事项。 |
+| GET `/tasks/{id}/events` | `skill_selected` 记录技能名、版本和发布快照；工具调用事件通过执行 ID 与结果关联。用 `Last-Event-ID` 续读。 |
+| 错误 | `SKILL_REQUIRED` 表示需要选择技能；`SKILL_UNAVAILABLE` 表示技能不可用或依赖未授权；`MISSING_EXECUTION_EVIDENCE` 表示缺少实际执行记录；`SENSITIVE_OUTPUT` 表示输出含凭据并已中止。 |
+
+导入、绑定、撤销通过受信任的本机 CLI 完成。可执行的 PowerShell 示例见[双项目运行指南](../examples/v3/README.md)。

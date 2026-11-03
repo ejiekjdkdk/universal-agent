@@ -246,7 +246,8 @@ class Store(ApprovalStore, PlanStore):
         with self._transaction(identity, "task.replay", body["business_id"], write=False):
             return self._replay(identity, body, key)
 
-    def start(self, identity, body, key, business_version, *, plan=None, snapshot_id=None, budget=None, admit=None):
+    def start(self, identity, body, key, business_version, *, plan=None, snapshot_id=None, budget=None, admit=None,
+              skill=None):
         business_id = body["business_id"]
         with self._transaction(identity, "task.start", business_id):
             existing = self._replay(identity, body, key)
@@ -261,6 +262,9 @@ class Store(ApprovalStore, PlanStore):
             else:
                 session = self._create_session(identity, business_id, body.get("context") or {})
             context = _scope(session, body.get("context"))
+            if skill:
+                # 仅服务端可绑定已发布版本。幂等键仍按原始请求计算。
+                context["skill"] = skill
             task_id, audit_id = _id("task"), _id("aud")
             self._db.execute("""INSERT INTO tasks(task_id,session_id,request_id,audit_id,business_version,
                 mode,message,status,created_at) VALUES(?,?,?,?,?,?,?,'running',?)""",
@@ -277,6 +281,8 @@ class Store(ApprovalStore, PlanStore):
             if plan is not None:
                 startup["execution_mode"] = "durable_plan"
             self._event(task_id, "task_started", startup)
+            if skill:
+                self._event(task_id, "skill_selected", {**skill, "skill_id": skill["name"]})
             if plan is not None:
                 self._create_plan(task_id, plan, snapshot_id, budget)
             self._audit("task.start", "allow", identity, task_id, business_id, None, audit_id)
@@ -340,7 +346,7 @@ class Store(ApprovalStore, PlanStore):
                 "SELECT permission FROM task_permissions WHERE task_id=?", (task_id,))}
 
     def history(self, identity, session_id, limit=6, *, allowed_objects=None, allowed_types=None,
-                allowed_permissions=None, inherit_to=None):
+                allowed_permissions=None, inherit_to=None, skill=None):
         with self._transaction(identity, "session.history", session_id, write=bool(inherit_to)):
             self._session(identity, session_id, None)
             limit = max(0, min(limit, 12))
@@ -352,6 +358,8 @@ class Store(ApprovalStore, PlanStore):
             visible = []
             for row in rows:
                 scope = json.loads(row["context"])
+                if scope.get("skill") != skill:
+                    continue
                 if allowed is not None and not allowed.issuperset(scope.get("object_ids", ())):
                     continue
                 types = self.history_types(row["task_id"])
@@ -393,13 +401,13 @@ class Store(ApprovalStore, PlanStore):
 
     def run(self, run_context_id):
         with self._lock:
-            row = self._db.execute("""SELECT r.*,t.session_id,t.status,s.business_id,s.tenant_id,s.org_id,s.user_id
+            row = self._db.execute("""SELECT r.*,t.session_id,t.status,t.mode,s.business_id,s.tenant_id,s.org_id,s.user_id
                 FROM runs r JOIN tasks t USING(task_id) JOIN sessions s USING(session_id) WHERE r.context_id=?""",
                                    (run_context_id,)).fetchone()
             if not row or row["revoked_at"] or row["expires_at"] <= time.time() or row["status"] != "running":
                 raise Fault("PERMISSION_DENIED", "Run context is unavailable.", 403)
             context = json.loads(row["context"])
-            result = {k: row[k] for k in ("task_id", "session_id", "business_id", *OWNER_FIELDS, "expires_at")}
+            result = {k: row[k] for k in ("task_id", "session_id", "business_id", *OWNER_FIELDS, "expires_at", "mode")}
             return {**result, "context": context, "object_ids": context.get("object_ids", []),
                     "object_type": context.get("object_type")}
 

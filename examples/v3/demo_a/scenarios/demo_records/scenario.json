@@ -1,0 +1,30 @@
+{
+  "id": "demo_records",
+  "version": "1.0.0",
+  "name": "虚构展品登记簿",
+  "description": "按编号读取获准查看的虚构展品登记记录。",
+  "example": "查询记录 R-1001 并给出来源。",
+  "offline_tool": "read_record",
+  "snapshot_files": ["records.json"],
+  "tools": [{
+    "name": "read_record",
+    "description": "按消息中的 R 编号查询一条已授权记录。",
+    "permission": "records.read",
+    "action_level": "read",
+    "object_ids_field": "record_ids",
+    "input_schema": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "text": {"type": "string", "minLength": 1, "maxLength": 16000},
+        "record_ids": {"type": "array", "minItems": 1, "maxItems": 64, "items": {"type": "string"}}
+      },
+      "required": ["text", "record_ids"]
+    },
+    "output_schema": {
+      "type": "object", "additionalProperties": false,
+      "properties": {"summary": {"type": "string", "minLength": 1, "maxLength": 1000}},
+      "required": ["summary"]
+    },
+    "adapter": {"type": "python", "handler": "lookup"}
+  }]
+}

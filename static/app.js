@@ -16,6 +16,7 @@ const state = {
 
 const labels = {
   task_started: "任务开始",
+  skill_selected: "载入已发布技能",
   planner_started: "启动规划器",
   tools_discovered: "发现可用工具",
   authorization: "权限校验",
@@ -109,6 +110,8 @@ function showBusy(value) {
   $("mode").disabled = value || planned;
   $("mode").hidden = Boolean(planned);
   $("planHint").hidden = !planned;
+  $("skillPicker").hidden = planned || !$("skill").options.length;
+  $("skill").disabled = value || planned;
   $("new").disabled = value;
   $("cancel").hidden = !state.running || !state.task;
   document.querySelectorAll(".scene,.past").forEach(node => {
@@ -143,7 +146,7 @@ function drawTrace(entry) {
   const item = element("li");
   const details = element("details");
   const data = entry.data || {};
-  const title = data.step_id || data.capability_id || data.tool || data.resource || "";
+  const title = data.step_id || data.capability_id || data.skill_id || data.tool || data.resource || "";
   details.append(element("summary", (labels[entry.event] || entry.event) + (title ? " · " + title : "")));
   details.append(element("pre", JSON.stringify(data, null, 2)));
   const stamp = entry.timestamp ? new Date(entry.timestamp).toLocaleTimeString() : "";
@@ -164,6 +167,12 @@ function showResult(run) {
   $("prompt").textContent = run.message ? "提问 · " + run.message : "";
   $("answer").textContent =
     run.answer || run.error?.message || (run.status === "cancelled" ? "本次运行已取消。" : "等待回答…");
+  for (const message of run.result?.limitations || []) {
+    $("answer").append(element("p", "证据与限制：" + message, "meta"));
+  }
+  for (const message of run.result?.unresolved_items || []) {
+    $("answer").append(element("p", "待确认：" + message, "meta"));
+  }
   $("evidence").replaceChildren();
   for (const [i, row] of (run.evidence || []).entries()) {
     const details = element("details");
@@ -285,7 +294,9 @@ async function history() {
 async function select(scene) {
   resetView();
   state.scene = scene;
-  $("objectScope").hidden = !scene.default_object;
+  $("skill").replaceChildren();
+  $("objectScope").hidden = !scene.default_object && !scene.object_choices?.length;
+  $("objectHint").textContent = scene.object_choices?.length ? "可选对象：" + scene.object_choices.join("、") : "";
   $("objectId").value = scene.default_object || "";
   $("executionOptions").hidden = !scene.durable_plan;
   $("executionMode").value = scene.durable_plan ? "durable_plan" : "reactive";
@@ -296,7 +307,20 @@ async function select(scene) {
     node.classList.toggle("active", node.dataset.id === scene.id);
   }
   showBusy(false);
-  await history();
+  await Promise.all([history(), loadSkills(scene)]);
+}
+
+async function loadSkills(scene) {
+  const result = await (await request(api + "/skills?business_id=" + encodeURIComponent(scene.id))).json();
+  if (state.scene !== scene) return;
+  const options = result.skills.map(skill => {
+    const option = element("option", skill.name + " · " + skill.version);
+    option.value = skill.name;
+    option.title = skill.description;
+    return option;
+  });
+  $("skill").replaceChildren(...options);
+  showBusy(state.busy);
 }
 
 async function boot() {
@@ -381,11 +405,14 @@ $("ask").onsubmit = async e => {
       response_mode: "streaming"
     };
     if (!$("objectScope").hidden && $("objectId").value.trim()) {
-      body.context = { object_ids: [$("objectId").value.trim()] };
+      const ids = $("objectId").value.split(/[,，]/).map(id => id.trim()).filter(Boolean);
+      body.context = { object_ids: [...new Set(ids)] };
     }
     if (state.scene.durable_plan && $("executionMode").value === "durable_plan") {
       body.execution_mode = "durable_plan";
       body.mode = "offline";
+    } else if ($("skill").value) {
+      body.skill_id = $("skill").value;
     }
     const response = await request(api + "/chat", {
       method: "POST",
@@ -429,6 +456,9 @@ $("ask").onsubmit = async e => {
 $("executionMode").onchange = () => showBusy(state.busy);
 $("example").onclick = () => {
   $("question").value = state.scene?.example || "";
+  if (!$("objectId").value && state.scene?.object_choices?.length) {
+    $("objectId").value = state.scene.object_choices.join(", ");
+  }
   $("question").focus();
 };
 $("new").onclick = () => {

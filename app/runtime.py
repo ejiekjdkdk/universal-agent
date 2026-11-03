@@ -2,11 +2,14 @@
 import asyncio
 import hashlib
 import json
+import os
+import re
 import time
 
 from .catalog import tool_slot
 from .errors import Fault
 from .providers import run_provider
+from .skills import SkillError, SkillRegistry
 
 
 def preview(value, depth=0):
@@ -34,6 +37,9 @@ class Gateway:
         self.snapshot_id = lease["snapshot_id"] if lease else self.store.task_snapshot(self.task_id)
         self.catalog = catalog or runtime.release_catalog(self.snapshot_id, ctx["business_id"])
         self.evidence = {}
+        self.pin = ctx["context"].get("skill")
+        self.read_only = bool(self.pin) or ctx["mode"] == "mock"
+        self.skill = None
 
     def trace(self, event, data):
         if self.lease:
@@ -45,7 +51,32 @@ class Gateway:
         self.runtime.authorize_task(context, context["business_id"], self.task_id)
         if self.runtime.releases:
             self.runtime.releases.guard(self.snapshot_id, context["business_id"])
+        if self.pin:
+            self.skill = self.runtime.load_skill(context, self.pin)
+            tools = self.runtime.visible_tools(context, context["business_id"], self.catalog, self.snapshot_id)
+            available = self.runtime.skill_capabilities(context, context["business_id"], tools, self.snapshot_id)
+            if not set(self.skill["tools"]) <= available:
+                self.store.audit("skill.dependencies", "deny", context, self.task_id, self.pin["name"], "SKILL_UNAVAILABLE")
+                raise Fault("SKILL_UNAVAILABLE", "绑定的技能依赖已停用或权限已撤销", 403)
         return context
+
+    def check_skill_tool(self, ctx, name):
+        if self.skill and name not in self.skill["tools"]:
+            self.store.audit("skill.capability", "deny", ctx, self.task_id, name, "PERMISSION_DENIED")
+            raise Fault("PERMISSION_DENIED", "能力超出已选技能范围", 403)
+
+    def read_skill_reference(self, path):
+        ctx = self.context()
+        if not self.skill or path not in self.skill["references"]:
+            raise Fault("PERMISSION_DENIED", "引用不在已发布技能的资源清单内", 403)
+        try:
+            value = self.runtime.skills.read_reference(ctx["business_id"], self.pin["name"], self.pin["version"], path)
+        except SkillError:
+            raise Fault("SKILL_UNAVAILABLE", "技能引用已不可用", 403) from None
+        if len(value) > 8192:
+            raise Fault("PROVIDER_LIMIT", "技能引用超过模型读取上限", 422)
+        self.trace("skill_reference_read", {"path": path, "chars": len(value)})
+        return value
 
     def check(self, ctx, permission, resource):
         grant = self.runtime.grant(ctx, ctx["business_id"])
@@ -58,22 +89,11 @@ class Gateway:
 
     async def discover(self):
         ctx = self.context()
-        permissions = self.runtime.grant(ctx, ctx["business_id"])["permissions"]
-        tools = []
-        for tool in self.catalog.discover(ctx["business_id"]):
-            if tool["permission"] not in permissions or tool["action_level"] not in ("read", "propose_write"):
-                continue
-            if self.runtime.releases:
-                try:
-                    self.runtime.releases.guard(self.snapshot_id, ctx["business_id"], tool["name"])
-                except Fault as exc:
-                    if exc.code == "CAPABILITY_REVOKED":
-                        continue
-                    raise
-                current = self.runtime.releases.current_tool(ctx["business_id"], ctx, "", tool["name"])
-                if not current or current["permission"] not in permissions or current["action_level"] != tool["action_level"]:
-                    continue
-            tools.append(tool)
+        tools = self.runtime.visible_tools(ctx, ctx["business_id"], self.catalog, self.snapshot_id)
+        if self.read_only:
+            tools = [tool for tool in tools if tool["action_level"] == "read"]
+        if self.skill:
+            tools = [tool for tool in tools if tool["name"] in self.skill["tools"]]
         self.trace("tools_discovered", {"tools": [tool["name"] for tool in tools]})
         return tools
 
@@ -81,12 +101,28 @@ class Gateway:
         for item in evidence:
             self.evidence[(item["source_id"], item["version"], item["snippet"])] = item
 
+    def check_output_secrets(self, payload):
+        """在工具数据进入模型、事件或数据库之前，拒绝带有凭据的结果。"""
+        text = json.dumps(payload, ensure_ascii=False)
+        known = [*self.runtime.principals, self.runtime.settings.get("api_key")]
+        known.extend(os.getenv(key) for key in ("AGENT_SERVICE_TOKEN", "AGENT_ADMIN_TOKEN"))
+        for secret in known:
+            if not secret:
+                continue
+            encoded = json.dumps(secret, ensure_ascii=False)
+            if encoded in text or (len(secret) >= 12 and encoded[1:-1] in text):
+                raise Fault("SENSITIVE_OUTPUT", "返回内容含有访问凭据，已阻止传递", 502)
+        if re.search(r'(?i)\bbearer\s+[a-z0-9._~+/=-]{8,}|"(?i:api_key|access_token|refresh_token|password|client_secret)"\s*:\s*"[^"]+"', text):
+            raise Fault("SENSITIVE_OUTPUT", "返回内容含有访问凭据，已阻止传递", 502)
+
     async def retrieve(self, query, top_k=5):
         ctx = self.context()
+        self.check_skill_tool(ctx, "retrieve_knowledge")
         self.check(ctx, "knowledge.read", "retrieve_knowledge")
         if not isinstance(query, str) or not 0 < len(query.strip()) <= 16000 or type(top_k) is not int or not 1 <= top_k <= 10:
             raise Fault("INVALID_REQUEST", "检索参数无效")
-        hits = self.catalog.retrieve(ctx["business_id"], query, top_k)
+        hits = self.catalog.retrieve(ctx["business_id"], query, top_k, object_ids=ctx["object_ids"])
+        self.check_output_secrets(hits)
         self.remember(hits)
         self.trace("knowledge_retrieved", {"source_ids": [r["source_id"] for r in hits], "query": preview(query)})
         return hits
@@ -95,8 +131,9 @@ class Gateway:
         context = self.context()
         scenario_id = context["business_id"]
         name = tool["name"]
+        self.check_skill_tool(context, name)
         self.check(context, tool["permission"], name)
-        if tool["action_level"] not in ("read", "propose_write"):
+        if tool["action_level"] not in (("read",) if self.read_only else ("read", "propose_write")):
             raise Fault("ACTION_NOT_ALLOWED", "当前版本仅允许读取或生成草稿", 403)
         if not isinstance(arguments, dict) or len(json.dumps(arguments, ensure_ascii=False)) > 32000:
             raise Fault("SCHEMA_VALIDATION_FAILED", "工具参数无效", 422)
@@ -146,6 +183,7 @@ class Gateway:
             return cached
         started = time.monotonic()
         self.trace("tool_input", {"execution_id": execution_id, "arguments": preview(arguments)})
+        self.trace("tool_started", {"execution_id": execution_id, "capability_id": name, "capability_version": version})
         deadline = started + self.runtime.tool_timeout
         if self.lease:
             deadline = min(deadline, started + self.lease["deadline"] - time.time())
@@ -158,12 +196,19 @@ class Gateway:
                             self.authorize_tool(tool, arguments)
 
                             def authorize_retrieval():
-                                self.check(self.context(), "knowledge.read", "retrieve_knowledge")
+                                ctx = self.context()
+                                self.check_skill_tool(ctx, "retrieve_knowledge")
+                                self.check(ctx, "knowledge.read", "retrieve_knowledge")
+                                return ctx["object_ids"]
 
                             output = await self.catalog.execute(
                                 scenario_id, name, arguments, authorize_retrieval=authorize_retrieval
                             )
                             self.authorize_tool(tool, arguments)
+                            if any("object_id" in item and item["object_id"] not in context["object_ids"]
+                                   for item in output["evidence"]):
+                                raise Fault("PERMISSION_DENIED", "工具返回了范围外的证据", 403)
+                            self.check_output_secrets(output)
                             break
                         except Fault as exc:
                             if attempt or not exc.retryable or tool["action_level"] != "read":
@@ -175,9 +220,13 @@ class Gateway:
                             await asyncio.sleep(delay)
             result = {"execution_id": execution_id, "capability_id": name, "capability_version": tool.get("version", self.catalog.scenarios[scenario_id]["version"]),
                       "status": "completed", "error": None, **output}
+            if self.skill:
+                # 此标记仅表示网关已取得并校验适配器返回值。
+                result.update(result_schema_version="1", verified=True, verification_scope="adapter_output_schema")
             self.store.complete_call(self.task_id, call_id, result, lease=self.lease)
             self.remember(result["evidence"])
             self.trace("tool_result", {"execution_id": execution_id, "tool": name, "output": preview(result["data"]),
+                                       "capability_version": version, "verification_scope": "adapter_output_schema",
                                        "source_ids": [s["source_id"] for s in result["evidence"]],
                                        "duration_ms": round((time.monotonic() - started) * 1000)})
             return result
@@ -205,6 +254,7 @@ class Runtime:
         self.tool_timeout = 20
         self.releases = None
         self.snapshots = None
+        self.skills: SkillRegistry | None = None
 
     def bind_releases(self, releases, snapshots):
         self.releases = releases
@@ -225,6 +275,72 @@ class Runtime:
             if all(identity.get(k) == principal[k] for k in ("tenant_id", "org_id", "user_id")):
                 return principal["grants"].get(scenario, {})
         return {}
+
+    def visible_tools(self, actor, scenario, catalog, snapshot_id):
+        grant = self.authorize(actor, scenario)
+        tools = []
+        for tool in catalog.discover(scenario):
+            if tool["permission"] not in grant["permissions"] or tool["action_level"] not in ("read", "propose_write"):
+                continue
+            if tool.get("object_ids_field") and not grant.get("objects"):
+                continue
+            if self.releases:
+                try:
+                    self.releases.guard(snapshot_id, scenario, tool["name"])
+                    current = self.releases.current_tool(scenario, actor, "", tool["name"])
+                except Fault as exc:
+                    if exc.code == "CAPABILITY_REVOKED":
+                        continue
+                    raise
+                if not current or current["permission"] not in grant["permissions"] or current["action_level"] != tool["action_level"]:
+                    continue
+            tools.append(tool)
+        return tools
+
+    def skill_capabilities(self, actor, scenario, tools, snapshot_id):
+        available = {tool["name"] for tool in tools if tool["action_level"] == "read"}
+        if "knowledge.read" in self.grant(actor, scenario)["permissions"]:
+            if self.releases:
+                try:
+                    self.releases.guard(snapshot_id, scenario, "retrieve_knowledge")
+                except Fault as exc:
+                    if exc.code == "CAPABILITY_REVOKED":
+                        return available
+                    raise
+            available.add("retrieve_knowledge")
+        return available
+
+    def eligible_skills(self, actor, scenario, tools, snapshot_id=None):
+        if self.skills is None:
+            return []
+        available = self.skill_capabilities(actor, scenario, tools, snapshot_id)
+        return [entry for entry in self.skills.active(scenario) if set(entry["tools"]) <= available]
+
+    def select_skill(self, actor, scenario, requested, catalog, snapshot_id):
+        if not requested and (self.skills is None or not self.skills.has_bindings(scenario)):
+            return None
+        candidates = self.eligible_skills(actor, scenario, self.visible_tools(actor, scenario, catalog, snapshot_id), snapshot_id)
+        if requested:
+            candidates = [entry for entry in candidates if entry["name"] == requested]
+        if len(candidates) != 1:
+            if candidates:
+                raise Fault("SKILL_REQUIRED", "请指定本次任务使用的技能", 422)
+            self.store.audit("skill.select", "deny", actor, resource=scenario, code="SKILL_UNAVAILABLE")
+            raise Fault("SKILL_UNAVAILABLE", "技能不可用或依赖能力未授权", 403)
+        entry = candidates[0]
+        return {key: entry[key] for key in ("name", "version", "digest", "release_snapshot_id")}
+
+    def load_skill(self, context, pin):
+        try:
+            if self.skills is None:
+                raise SkillError("技能目录未配置")
+            skill = self.skills.load(context["business_id"], pin["name"], pin["version"])
+            if (skill["digest"], skill["release_snapshot_id"]) == (pin["digest"], pin["release_snapshot_id"]):
+                return skill
+        except SkillError:
+            pass
+        self.store.audit("skill.load", "deny", context, context["task_id"], pin["name"], "SKILL_UNAVAILABLE")
+        raise Fault("SKILL_UNAVAILABLE", "绑定的技能版本已失效", 403)
 
     def authorize(self, identity, scenario, context=None):
         grant = self.grant(identity, scenario)
@@ -260,6 +376,7 @@ class Runtime:
     async def drive(self, identity, body, task):
         task_id = task["task_id"]
         run_id = self.store.context_id(task_id)
+        gateway = None
         try:
             gateway = Gateway(self, run_id)
             self.gateways[run_id] = gateway
@@ -278,16 +395,19 @@ class Runtime:
                     identity, task["session_id"], allowed_objects=scope["object_ids"],
                     allowed_types=allowed_types,
                     allowed_permissions=self.grant(identity, scene["id"])["permissions"],
-                    inherit_to=task_id,
+                    inherit_to=task_id, skill=gateway.pin,
                 )
             async with asyncio.timeout(120):
-                answer = await run_provider(mode, scene, body["message"], history, gateway, self.settings)
+                response = await run_provider(mode, scene, body["message"], history, gateway, self.settings)
+            result = response if isinstance(response, dict) else {"answer": response}
+            answer = result["answer"]
             if not isinstance(answer, str) or not answer.strip():
                 raise Fault("UPSTREAM_INVALID_RESPONSE", "回复为空", 502)
             gateway.context()
             evidence = list(gateway.evidence.values())
+            gateway.check_output_secrets(result)
             gateway.trace("message_delta", {"delta": answer})
-            self.store.finish(task_id, "completed", {"answer": answer, "evidence": evidence, "artifacts": []})
+            self.store.finish(task_id, "completed", {**result, "evidence": evidence, "artifacts": []})
         except asyncio.CancelledError:
             self.store.finish(task_id, "cancelled", {})
             raise
@@ -298,6 +418,11 @@ class Runtime:
                 fault = Fault("TASK_TIMEOUT", "任务超时", 504)
             else:
                 fault = Fault("INTERNAL_ERROR", "任务执行失败", 500)
-            self.store.finish(task_id, "failed", {}, fault.as_dict())
+            partial = {}
+            if gateway is not None and fault.code == "BUDGET_EXCEEDED":
+                # 仅返回已完成调用的证据，失败任务不会伪造最终回答。
+                partial = {"evidence": list(gateway.evidence.values()), "limitations": ["预算已用尽，未生成最终回答。"],
+                           "unresolved_items": ["剩余调用未执行。"]}
+            self.store.finish(task_id, "failed", partial, fault.as_dict())
         finally:
             self.gateways.pop(run_id, None)

@@ -1,0 +1,7 @@
+[
+  {
+    "token_env": "AGENT_ACCESS_TOKEN",
+    "tenant_id": "fictional-exhibit", "org_id": "local", "user_id": "reader",
+    "grants": {"demo_records": {"permissions": ["records.read"], "objects": ["R-1001"]}}
+  }
+]

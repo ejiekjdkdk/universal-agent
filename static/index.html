@@ -47,12 +47,17 @@
             <select id="mode" aria-label="规划器">
               <option value="offline">离线演示</option>
               <option value="openai">模型模式</option>
+              <option value="mock">模拟模型（本机）</option>
             </select>
           </div>
         </div>
 
         <p id="planHint" hidden>按场景计划执行。需要人工审批时可以在独立审批窗口处理。</p>
-        <label id="objectScope" hidden>本次对象 ID <input id="objectId" maxlength="128"></label>
+        <label id="skillPicker" hidden>已发布技能 <select id="skill"></select></label>
+        <label id="objectScope" hidden>本次对象 ID（多个用逗号分隔）
+          <input id="objectId" maxlength="8255" aria-describedby="objectHint">
+          <small id="objectHint"></small>
+        </label>
         <textarea id="question" maxlength="16000" required rows="5" placeholder="输入你想处理的内容…"></textarea>
 
         <div class="actions">

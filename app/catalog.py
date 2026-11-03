@@ -74,7 +74,9 @@ def _string(limit):
 ID = _string(64) | {"pattern": r"^[a-z][a-z0-9_]*$"}
 VERSION = _string(64) | {"pattern": r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$"}
 EVIDENCE = _object({k: _string(limit) for k, limit in
-                    (("source_id", 200), ("title", 300), ("snippet", 4000), ("version", 64))})
+                    (("source_id", 200), ("title", 300), ("snippet", 4000), ("version", 64),
+                     ("object_id", 128), ("source_ref", 2048), ("data_as_of", 128))},
+                   ["source_id", "title", "snippet", "version"])
 TOOL = _object({
     "name": ID, "description": _string(1024), "action_level": {"enum": ["read", "propose_write", "commit_write"]},
     "permission": _string(128), "input_schema": {"type": "object"}, "output_schema": {"type": "object"},
@@ -320,8 +322,8 @@ class Catalog:
                 raise ValueError("offline_tool must name a registered tool")
             inputs, outputs = offline["input_schema"], offline["output_schema"]
             if (inputs.get("properties", {}).get("text", {}).get("type") != "string"
-                    or set(inputs.get("required", [])) - {"text"}):
-                raise ValueError("offline_tool must accept a single text string argument")
+                    or set(inputs.get("required", [])) - {"text", offline.get("object_ids_field")}):
+                raise ValueError("offline_tool must accept text and optional bound object scope")
             if ("summary" not in outputs.get("required", [])
                     or outputs.get("properties", {}).get("summary", {}).get("type") != "string"):
                 raise ValueError("offline_tool must return a required summary string")
@@ -337,7 +339,7 @@ class Catalog:
         scene = self._scene(scenario_id)
         return [{k: copy.deepcopy(tool[k]) for k in PUBLIC_FIELDS if k in tool} for tool in scene["tools"]]
 
-    def retrieve(self, scenario_id, query, top_k=5):
+    def retrieve(self, scenario_id, query, top_k=5, *, object_ids=()):
         self._scene(scenario_id)
         if (not isinstance(query, str) or not query.strip() or len(query) > 16000 or
                 type(top_k) is not int or not 1 <= top_k <= 20):
@@ -346,6 +348,8 @@ class Catalog:
         phrase = query.strip().casefold()
         ranked = []
         for doc in self._documents[scenario_id]:
+            if "object_id" in doc and doc["object_id"] not in object_ids:
+                continue
             score = 2 * len(terms & _terms(doc["title"])) + len(terms & _terms(doc["snippet"]))
             if phrase in doc["title"].casefold() or phrase in doc["snippet"].casefold():
                 score += 3
@@ -370,9 +374,8 @@ class Catalog:
             result = await _call_http(config, arguments, self._http_transport)
         else:
             def retrieve(query, top_k=5):
-                if authorize_retrieval is not None:
-                    authorize_retrieval()
-                return self.retrieve(scenario_id, query, top_k)
+                object_ids = authorize_retrieval() if authorize_retrieval is not None else ()
+                return self.retrieve(scenario_id, query, top_k, object_ids=object_ids or ())
             handler = self._handlers[(scenario_id, name)]
             if inspect.iscoroutinefunction(handler):
                 result = await handler(arguments, retrieve)

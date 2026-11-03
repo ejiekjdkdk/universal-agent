@@ -20,6 +20,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from .catalog import Catalog
 from .errors import Fault
 from .runtime import Runtime
+from .skills import SkillRegistry
 from .store import Store
 from .plans import prepare_plan
 from .snapshots import Snapshots
@@ -54,7 +55,8 @@ class SessionInput(Strict):
 class ChatInput(SessionInput):
     session_id: Identifier | None = None
     message: Message
-    mode: Literal["offline", "openai"] = "offline"
+    mode: Literal["offline", "mock", "openai"] = "offline"
+    skill_id: Identifier | None = None
     response_mode: Literal["blocking", "streaming"] = "blocking"
     execution_mode: Literal["reactive", "durable_plan"] = "reactive"
     budget: dict[str, int] | None = None
@@ -114,7 +116,7 @@ class RequestLimits:
 
 
 def create_app(*, scenarios=None, database=None, token=None, model_settings=None, principals=None,
-               embedded_worker=None):
+               embedded_worker=None, skill_root=None):
     model = model_settings if model_settings is not None else {
         "base_url": os.getenv("AGENT_MODEL_BASE_URL", "").strip(),
         "model": os.getenv("AGENT_MODEL_NAME", "").strip(),
@@ -145,6 +147,7 @@ def create_app(*, scenarios=None, database=None, token=None, model_settings=None
         app.state.snapshots = Snapshots(db_path, catalog)
         store = Store(db_path)
         rt = Runtime(catalog, store, actors, model)
+        rt.skills = SkillRegistry(Path(skill_root or os.getenv("AGENT_SKILL_ROOT") or db_path.parent / "skills"))
         app.state.runtime = rt
         rt.role_source = role_source(catalog, local_token, principals, admin_token, service_token)
         dispatcher = None
@@ -165,7 +168,7 @@ def create_app(*, scenarios=None, database=None, token=None, model_settings=None
             await asyncio.gather(*workers, return_exceptions=True)
             store.close()
 
-    app = FastAPI(title="Universal Agent", version="2.0.0", lifespan=lifespan)
+    app = FastAPI(title="Universal Agent", version="3.0.0-p1", lifespan=lifespan)
     app.add_middleware(RequestLimits)
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=["localhost", "127.0.0.1"])
 
@@ -267,6 +270,8 @@ def create_app(*, scenarios=None, database=None, token=None, model_settings=None
             plan_path = catalog.root / scenario_id / "plan.json"
             summary["durable_plan"] = plan_path.is_file()
             summary["default_object"] = objects[0] if len(objects) == 1 else None
+            if len(objects) > 1:
+                summary["object_choices"] = objects[:64]
             scenes.append(summary)
         return {"scenarios": scenes, "unavailable_scenarios": unavailable,
                 "model_available": model_ready, "model_name": model.get("model", ""),
@@ -277,6 +282,27 @@ def create_app(*, scenarios=None, database=None, token=None, model_settings=None
         context = body.context.model_dump(exclude_none=True)
         runtime().authorize(actor, body.business_id, context)
         return runtime().store.create_session(actor, body.business_id, context)
+
+    def discovery(actor, business_id):
+        rt = runtime()
+        rt.authorize(actor, business_id)
+        snapshot_id = rt.releases.select(business_id, actor, "")
+        catalog = rt.release_catalog(snapshot_id, business_id)
+        return snapshot_id, rt.visible_tools(actor, business_id, catalog, snapshot_id)
+
+    @app.get(API + "/skills")
+    async def skills(business_id: Identifier, actor=Depends(identify)):
+        snapshot_id, tools = discovery(actor, business_id)
+        return {"skills": runtime().eligible_skills(actor, business_id, tools, snapshot_id)}
+
+    @app.get(API + "/capabilities")
+    async def capabilities(business_id: Identifier, actor=Depends(identify)):
+        snapshot_id, tools = discovery(actor, business_id)
+        if runtime().skills.has_bindings(business_id):
+            skills = runtime().eligible_skills(actor, business_id, tools, snapshot_id)
+            allowed = {name for skill in skills for name in skill["tools"]}
+            tools = [tool for tool in tools if tool["name"] in allowed]
+        return {"capabilities": tools}
 
     @app.get(API + "/sessions/{session_id}")
     async def get_session(session_id: Identifier, actor=Depends(identify)):
@@ -309,6 +335,8 @@ def create_app(*, scenarios=None, database=None, token=None, model_settings=None
             request_data.pop("execution_mode")
             if body.budget is not None:
                 raise Fault("INVALID_REQUEST", "budget 只适用于 durable_plan")
+        elif body.skill_id is not None:
+            raise Fault("INVALID_REQUEST", "skill_id 仅适用于 reactive")
         elif body.mode != "offline":
             raise Fault("INVALID_REQUEST", "当前持久计划使用离线场景规划器")
         agent_runtime.authorize(actor, body.business_id, request_data["context"])
@@ -339,6 +367,8 @@ def create_app(*, scenarios=None, database=None, token=None, model_settings=None
             catalog = agent_runtime.release_catalog(selected_release, scenario_id)
             task_options = {}
             if is_durable:
+                if agent_runtime.skills.has_bindings(scenario_id):
+                    raise Fault("ACTION_NOT_ALLOWED", "已绑定技能的场景仅支持只读交互任务", 403)
                 snapshots = app.state.snapshots
                 snapshot_id = selected_release or snapshots.current.get(scenario_id)
                 if not snapshot_id:
@@ -355,6 +385,11 @@ def create_app(*, scenarios=None, database=None, token=None, model_settings=None
                 task_options = {"plan": plan, "budget": budget, "snapshot_id": snapshot_id}
             elif selected_release:
                 task_options["snapshot_id"] = selected_release
+            if not is_durable:
+                task_options["skill"] = agent_runtime.select_skill(actor, scenario_id, body.skill_id, catalog, selected_release)
+                if task_options["skill"] and not selected_release:
+                    # 普通场景同样有启动快照，技能任务固定适配器及数据版本。
+                    task_options["snapshot_id"] = app.state.snapshots.baseline(scenario_id)
 
             # 入库时再核对一次发布绑定，防止准备计划期间恰好切换版本。
             def check_release_at_admission():

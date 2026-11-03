@@ -1,0 +1,23 @@
+@api = http://127.0.0.1:8765/api/v1/agent
+@token = {{$processEnv AGENT_ACCESS_TOKEN}}
+
+### 查看此业务可用的受控工具
+GET {{api}}/capabilities?business_id=demo_fragments
+Authorization: Bearer {{token}}
+
+### 检索并归纳两条获准查看的手册片段
+# @name summary
+POST {{api}}/chat
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{"business_id":"demo_fragments","message":"归纳晨间观察的准备和记录要求。","skill_id":"fragment-summary","mode":"mock","context":{"object_ids":["guide-01","guide-02"]}}
+
+### 查看证据来源和终态
+GET {{api}}/tasks/{{summary.response.body.$.task_id}}/trace
+Authorization: Bearer {{token}}
+
+### 从事件号 1 以后重放 SSE
+GET {{api}}/tasks/{{summary.response.body.$.task_id}}/events
+Authorization: Bearer {{token}}
+Last-Event-ID: 1

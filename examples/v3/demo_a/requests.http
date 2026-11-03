@@ -1,0 +1,25 @@
+@api = http://127.0.0.1:8765/api/v1/agent
+@token = {{$processEnv AGENT_ACCESS_TOKEN}}
+
+### 查看当前主体可发现的记录查询技能
+GET {{api}}/skills?business_id=demo_records
+Authorization: Bearer {{token}}
+
+### 查询获准访问的展品；保留返回的 task_id
+# @name lookup
+POST {{api}}/chat
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{"business_id":"demo_records","message":"查询记录 R-1001 并给出来源。","skill_id":"record-lookup","mode":"mock","context":{"object_ids":["R-1001"]}}
+
+### 将工具执行编号、工具结果与任务终态对齐
+GET {{api}}/tasks/{{lookup.response.body.$.task_id}}/trace
+Authorization: Bearer {{token}}
+
+### 查询他人记录，入场时即返回 403
+POST {{api}}/chat
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{"business_id":"demo_records","message":"查询记录 R-1002。","skill_id":"record-lookup","context":{"object_ids":["R-1002"]}}

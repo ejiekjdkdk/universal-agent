@@ -1,0 +1,30 @@
+{
+  "id": "demo_fragments",
+  "version": "1.0.0",
+  "name": "虚构观察手册",
+  "description": "检索授权的手册片段并生成带引用的摘录式摘要。",
+  "example": "归纳晨间观察的准备和记录要求。",
+  "offline_tool": "summarize_fragments",
+  "documents": "fragments.json",
+  "tools": [{
+    "name": "summarize_fragments",
+    "description": "从授权的观察手册章节中检索与问题匹配的片段，并按来源归纳。",
+    "permission": "fragments.summarize",
+    "action_level": "read",
+    "object_ids_field": "fragment_ids",
+    "input_schema": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "text": {"type": "string", "minLength": 1, "maxLength": 16000},
+        "fragment_ids": {"type": "array", "minItems": 1, "maxItems": 64, "items": {"type": "string"}}
+      },
+      "required": ["text", "fragment_ids"]
+    },
+    "output_schema": {
+      "type": "object", "additionalProperties": false,
+      "properties": {"summary": {"type": "string", "minLength": 1, "maxLength": 2000}},
+      "required": ["summary"]
+    },
+    "adapter": {"type": "python", "handler": "summarize"}
+  }]
+}

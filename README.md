@@ -14,6 +14,8 @@ Universal Agent 是一套可跨项目复用的通用 Agent 底座。它负责模
 
 ## 启动
 
+**V3 P0＋P1** 支持从标准 `SKILL.md` 导入草稿，由本机操作者绑定工具并发布。在工作台切换业务、选择技能，点击「使用示例」即可填写问题和对象范围。两个独立项目分别演示虚构记录查询和文档片段归纳。参见[双项目运行指南](examples/v3/README.md)、[环境审计](docs/p0-environment-audit.md)、[兼容性对照](docs/migration-matrix.md)和[验收结果](docs/v3/acceptance.md)。
+
 需要 Python 3.11 或更新版本。在 Windows 上进入仓库目录，执行 `.\start.cmd`。首次启动会创建虚拟环境并安装依赖，需要能访问 Python 包源。打开 <http://127.0.0.1:8765>。个人模式只监听本机。按 Ctrl+C 停止服务。
 
 其他系统，或已有 Python 环境时，可使用以下命令。
