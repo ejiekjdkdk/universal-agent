@@ -102,7 +102,10 @@ class Gateway:
 
     def remember(self, evidence):
         for item in evidence:
-            self.evidence[(item["source_id"], item["version"], item["snippet"])] = item
+            # 同一版本在不同来源或时点的观察不能被当成同一条证据覆盖。
+            key = (item["source_id"], item["version"], item["snippet"],
+                   item.get("source_ref"), item.get("data_as_of"))
+            self.evidence[key] = item
 
     def check_output_secrets(self, payload):
         """在工具数据进入模型、事件或数据库之前，拒绝带有凭据的结果。"""

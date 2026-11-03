@@ -10,6 +10,7 @@ import re
 import httpx
 
 from .errors import Fault
+from .context_compiler import ContextSession
 
 
 def _tool(name, description, fields, required):
@@ -52,6 +53,8 @@ SYSTEM = (
 )
 READ_REFERENCE = _tool("read_skill_reference", "Read one published reference from the selected skill.",
                        {"path": {"type": "string", "maxLength": 256}}, ["path"])
+READ_CONTEXT = _tool("read_context_reference", "Read original data from a current task context reference.",
+                     {"ref": {"type": "string", "maxLength": 64}}, ["ref"])
 
 
 def _invalid_reply():
@@ -179,6 +182,8 @@ def _parse_call(call, seen):
             )
         elif name == "read_skill_reference":
             valid = set(args) == {"path"} and isinstance(args["path"], str) and 0 < len(args["path"]) <= 256
+        elif name == "read_context_reference":
+            valid = set(args) == {"ref"} and isinstance(args["ref"], str) and bool(re.fullmatch(r"ctx_[a-f0-9]{32}", args["ref"]))
         else:
             valid = False
         if not valid:
@@ -193,7 +198,8 @@ def _parse_call(call, seen):
 def _label_evidence(items, sources):
     labeled = []
     for item in items:
-        key = (item.get("source_id"), item.get("version"), item.get("snippet"))
+        key = (item.get("source_id"), item.get("version"), item.get("snippet"),
+               item.get("source_ref"), item.get("data_as_of"))
         index = sources.setdefault(key, len(sources) + 1)
         labeled.append({**item, "citation": f"[E{index}]"})
     return labeled
@@ -293,7 +299,7 @@ def _final_reply(answer, sources, structured):
 
 
 async def _model_loop(complete, messages, gateway, max_rounds, max_calls, rates, *, structured=False,
-                      max_context_bytes=256000):
+                      max_context_bytes=256000, context_session=None):
     seen: set[str] = set()
     sources: dict[tuple, int] = {}
     observed_summaries: list[str] = []
@@ -301,10 +307,14 @@ async def _model_loop(complete, messages, gateway, max_rounds, max_calls, rates,
     for round_no in range(1, max_rounds + 1):
         # 本轮仍会发送历史和前序工具结果，发送前复核这些数据依赖的当前授权。
         gateway.context()
-        if structured and len(json.dumps(messages, ensure_ascii=False).encode("utf-8")) > max_context_bytes:
+        model_messages = messages
+        if context_session is not None:
+            compiled = context_session.compile()
+            model_messages = [json.loads(raw) for raw in compiled.messages_json]
+        if (structured or context_session is not None) and len(json.dumps(model_messages, ensure_ascii=False).encode("utf-8")) > max_context_bytes:
             raise Fault("BUDGET_EXCEEDED", "本轮上下文超过服务端字节预算", 422)
         gateway.trace("model_round", {"round": round_no})
-        reply, usage = await complete(messages)
+        reply, usage = await complete(model_messages)
         _record_usage(gateway, round_no, usage, rates)
         calls = reply.get("tool_calls")
         if calls is not None and not isinstance(calls, list):
@@ -323,6 +333,8 @@ async def _model_loop(complete, messages, gateway, max_rounds, max_calls, rates,
                     result["limitations"] = ["本次工具未返回来源证据。"]
                     result["unresolved_items"] = []
                 result["limitations"].append("本次任务只执行读取，未执行写入。")
+                if context_session is not None:
+                    result["limitations"].extend(context_session.limitations)
             return result
         if len(seen) + len(calls) > max_calls or round_no == max_rounds:
             if structured:
@@ -332,12 +344,22 @@ async def _model_loop(complete, messages, gateway, max_rounds, max_calls, rates,
         messages.append(
             {"role": "assistant", "content": None, "tool_calls": [clean for clean, _, _ in parsed]}
         )
+        if context_session is not None:
+            context_session.add(messages[-1], "tool_call", True)
         for clean, name, args in parsed:
             gateway.trace("model_tool_call", {"round": round_no, "function": name})
             if name == "read_skill_reference" and not getattr(gateway, "skill", None):
                 raise Fault("PERMISSION_DENIED", "未选择已发布的技能", 403)
-            entry = await _tool_result(gateway, name, args, clean["id"], sources)
+            if name == "read_context_reference":
+                if context_session is None:
+                    raise Fault("PERMISSION_DENIED", "当前任务没有启用上下文引用。", 403)
+                entry = {"role": "tool", "tool_call_id": clean["id"],
+                         "content": context_session.read(args["ref"])}
+            else:
+                entry = await _tool_result(gateway, name, args, clean["id"], sources)
             messages.append(entry)
+            if context_session is not None:
+                context_session.add(entry, "tool_result", True, summarize=name == "execute_capability")
             if structured and name in ("execute_capability", "retrieve_knowledge"):
                 completed_read = True
                 data = json.loads(entry["content"])
@@ -405,6 +427,9 @@ async def run_provider(
         raise Fault("INVALID_REQUEST", "未知的运行模式。")
     max_rounds = _budget(settings, "max_rounds", 4, 12)
     max_calls = _budget(settings, "max_calls", 8, 32)
+    compiler_enabled = settings.get("context_compiler", os.getenv("AGENT_CONTEXT_COMPILER", "0") == "1")
+    if type(compiler_enabled) is not bool:
+        raise Fault("MODEL_NOT_CONFIGURED", "上下文编译开关必须为布尔值。", 503)
     messages = [{"role": "system", "content": SYSTEM}]
     structured = bool(skill or mode == "mock")
     max_context_bytes = _budget(settings, "max_context_bytes", 256000, 1000000) if structured else 256000
@@ -421,13 +446,32 @@ async def run_provider(
             ensure_ascii=False)})
     for entry in history[-12:]:
         if entry.get("role") in ("user", "assistant") and isinstance(entry.get("content"), str):
-            messages.append({"role": entry["role"], "content": entry["content"][:4000]})
+            content = entry["content"] if compiler_enabled else entry["content"][:4000]
+            messages.append({"role": entry["role"], "content": content})
     messages.append({"role": "user", "content": message})
+    offered = [*TOOLS, READ_REFERENCE] if skill and skill["references"] else list(TOOLS)
+    context_session = None
+    if compiler_enabled:
+        offered.append(READ_CONTEXT)
+        context_session = ContextSession(gateway, settings, offered)
+        for index, entry in enumerate(messages):
+            if index == 0:
+                context_session.add(entry, "system_policy", True)
+            elif skill and index == 1:
+                context_session.add(entry, "skill_instruction", True)
+            elif index == len(messages) - 1:
+                current = gateway.context()
+                state = {"task_id": current["task_id"], "status": "running", "execution_mode": "reactive",
+                         "object_ids": current["object_ids"], "snapshot_id": gateway.snapshot_id}
+                context_session.add({"role": "user", "content": json.dumps({"task_state": state})}, "task_state", True)
+                context_session.add(entry, "user_message", True)
+            else:
+                context_session.add(entry, "history", False)
     if mode in ("mock", "offline"):
         gateway.trace("provider_selected", {"mode": "mock", "model": "deterministic"})
         provider = MockModelProvider(scenario, message, gateway.context(), skill)
         return await _model_loop(provider.complete, messages, gateway, max_rounds, max_calls, (None, None),
-                                 structured=True, max_context_bytes=max_context_bytes)
+                                 structured=True, max_context_bytes=max_context_bytes, context_session=context_session)
     url, model, key = _configuration(settings)
     gateway.trace("provider_selected", {"mode": "openai", "model": model})
     headers = {"Authorization": f"Bearer {key}"} if key else {}
@@ -447,11 +491,10 @@ async def run_provider(
                 _price(settings, "output_usd_per_million"),
             )
             async def complete(turn):
-                offered = [*TOOLS, READ_REFERENCE] if skill and skill["references"] else TOOLS
                 return await _completion(client, url, model, turn, offered)
 
             return await _model_loop(complete, messages, gateway, max_rounds, max_calls, rates, structured=structured,
-                                     max_context_bytes=max_context_bytes)
+                                     max_context_bytes=max_context_bytes, context_session=context_session)
     except (TimeoutError, httpx.TimeoutException):
         raise Fault("MODEL_TIMEOUT", "模型请求超时。", 504, True) from None
     except httpx.RequestError:
