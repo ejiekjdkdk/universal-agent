@@ -32,11 +32,13 @@ class ReadCache:
         self.flights = {}
 
     async def run(self, key, ttl, participant, operation):
+        """每个等待者独立鉴权；同键查询共享物理执行，但不共享取消和返回对象。"""
         participant["guard"]()
         now = time.monotonic()
-        for expired in list(self.entries):
-            if self.entries[expired][0] <= now:
-                del self.entries[expired]
+        for entry_key in list(self.entries):
+            expires_at, _ = self.entries[entry_key]
+            if expires_at <= now:
+                del self.entries[entry_key]
         if key in self.entries:
             self.entries.move_to_end(key)
             return json.loads(self.entries[key][1])
@@ -48,29 +50,29 @@ class ReadCache:
             flight = {"participants": {}}
             self.flights[key] = flight
 
-            def select(charge=False):
+            def select_participant(charge=False):
                 # 发起者退出后，从剩余等待者中选择仍获授权的预算承担者。
                 last_error = None
-                for item in list(flight["participants"].values()):
-                    if "error" in item:
-                        last_error = item["error"]
+                for candidate in list(flight["participants"].values()):
+                    if "error" in candidate:
+                        last_error = candidate["error"]
                         continue
                     try:
-                        item["guard"]()
+                        candidate["guard"]()
                         if charge:
-                            item["charge"]()
-                        return item["value"]
+                            candidate["charge"]()
+                        return candidate["value"]
                     except Fault as exc:
-                        item["error"] = exc
+                        candidate["error"] = exc
                         last_error = exc
                 if last_error is not None:
                     raise last_error
                 raise asyncio.CancelledError()
 
-            async def execute():
+            async def execute_shared_query():
                 try:
-                    output = await operation(select)
-                    select()
+                    output = await operation(select_participant)
+                    select_participant()
                     encoded = json.dumps(output, ensure_ascii=False, allow_nan=False).encode("utf-8")
                     # 超大输出仍完整返回，只是不留在进程共享缓存中。
                     if len(encoded) <= 1048576:
@@ -82,27 +84,30 @@ class ReadCache:
                     if self.flights.get(key) is flight:
                         self.flights.pop(key, None)
 
-            flight["task"] = asyncio.create_task(execute())
-        token = object()
-        flight["participants"][token] = participant
-        task = flight["task"]
+            flight["task"] = asyncio.create_task(execute_shared_query())
+        participant_token = object()
+        flight["participants"][participant_token] = participant
+        shared_task = flight["task"]
         try:
-            while not task.done():
+            while not shared_task.done():
                 if "error" in participant:
                     raise participant["error"]
                 participant["guard"]()
-                await asyncio.wait({task}, timeout=0.05)
+                # wait不会把当前等待者的取消传播给共享查询。
+                await asyncio.wait({shared_task}, timeout=0.05)
             if "error" in participant:
                 raise participant["error"]
             participant["guard"]()
             # JSON往返使等待者不共享可变对象；执行ID由外层任务单独生成。
-            return json.loads(json.dumps(task.result(), ensure_ascii=False, allow_nan=False))
+            serialized = json.dumps(shared_task.result(), ensure_ascii=False, allow_nan=False)
+            return json.loads(serialized)
         finally:
-            flight["participants"].pop(token, None)
+            flight["participants"].pop(participant_token, None)
+            # 只由最后一个离开的等待者回收查询，并等待资源释放完成。
             if not flight["participants"]:
-                if not task.done():
-                    task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
+                if not shared_task.done():
+                    shared_task.cancel()
+                await asyncio.gather(shared_task, return_exceptions=True)
 
     async def close(self):
         tasks = [flight["task"] for flight in self.flights.values()]

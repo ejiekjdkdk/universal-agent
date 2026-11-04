@@ -189,9 +189,13 @@ class Gateway:
         context = self.context()
         scenario = context["business_id"]
         adapter = self.catalog._tools[scenario][tool["name"]]["adapter"]
-        remote_context = MCPContext(tenant_id=context["tenant_id"],
-            principal_id=json.dumps([context["org_id"], context["user_id"]]), run_context_id=self.run_id,
-            trace_id=self.task_id, authorize=lambda: self.authorize_tool(tool, arguments))
+        remote_context = MCPContext(
+            tenant_id=context["tenant_id"],
+            principal_id=json.dumps([context["org_id"], context["user_id"]]),
+            run_context_id=self.run_id,
+            trace_id=self.task_id,
+            authorize=lambda: self.authorize_tool(tool, arguments),
+        )
         remote_gateway = self.catalog._mcp_gateway
         endpoint, server, mapped = remote_gateway.authorize_reuse(adapter["server_id"], adapter["tool_id"], remote_context)
         for field in ("action_level", "input_schema", "output_schema"):
@@ -217,11 +221,19 @@ class Gateway:
         current = tool
         if self.runtime.releases:
             current = self.runtime.releases.current_tool(scenario, context, "", tool["name"])
-        key_parts = {"identity": [context[key] for key in ("tenant_id", "org_id", "user_id")],
-                     "business": scenario, "grant": self.runtime.grant(context, scenario),
-                     "scope": self.store.scope(self.task_id), "tool": tool, "current": current,
-                     "adapter": adapter, "arguments": arguments, "policy": policy,
-                     "skill": self.pin, "snapshot": self.snapshot_id}
+        key_parts = {
+            "identity": [context["tenant_id"], context["org_id"], context["user_id"]],
+            "business": scenario,
+            "grant": self.runtime.grant(context, scenario),
+            "scope": self.store.scope(self.task_id),
+            "tool": tool,
+            "current": current,
+            "adapter": adapter,
+            "arguments": arguments,
+            "policy": policy,
+            "skill": self.pin,
+            "snapshot": self.snapshot_id,
+        }
         if adapter["type"] == "mcp":
             binding, governed = self._mcp_binding(tool, arguments)
             if not governed:
@@ -239,56 +251,68 @@ class Gateway:
                 raise Fault("CAPABILITY_REVOKED", "只读缓存的授权范围或数据版本已改变", 403)
 
         def charge():
-            if self.read_only:
-                limit = self.skill.get("max_tool_calls", 16) if self.skill else 16
-                self.store.consume_tool_attempt(self.task_id, limit, lease=self.lease)
+            if not self.read_only:
+                return
+            limit = 16
+            if self.skill:
+                limit = self.skill.get("max_tool_calls", 16)
+            self.store.consume_tool_attempt(self.task_id, limit, lease=self.lease)
 
         async def operation(select):
             # 只有实际执行者占并发名额；等待者不会阻塞自己等待的查询。
-            async with asyncio.timeout(self.runtime.tool_timeout):
-                async with tool_slot(self.runtime.slots):
-                    deadline = time.monotonic() + self.runtime.tool_timeout
-                    def authorize_retrieval():
-                        gateway = select()
-                        context = gateway.context()
-                        gateway.check_skill_tool(context, "retrieve_knowledge")
-                        gateway.check(context, "knowledge.read", "retrieve_knowledge")
-                        return context["object_ids"]
-                    options = {"authorize_retrieval": authorize_retrieval}
-                    if self.runtime.result_store:
-                        options["validate_output"] = self.runtime.result_store.validate_output
+            async with (
+                asyncio.timeout(self.runtime.tool_timeout),
+                tool_slot(self.runtime.slots),
+            ):
+                deadline = time.monotonic() + self.runtime.tool_timeout
+                def authorize_retrieval():
                     gateway = select()
                     context = gateway.context()
-                    adapter = self.catalog._tools[context["business_id"]][tool["name"]]["adapter"]
-                    if adapter["type"] == "mcp":
-                        options["mcp_context"] = MCPContext(tenant_id=context["tenant_id"],
-                            principal_id=json.dumps([context["org_id"], context["user_id"]]),
-                            run_context_id=gateway.run_id, trace_id=gateway.task_id,
-                            authorize=lambda: select(),
-                            trace=lambda event, data: select().trace(event, data),
-                            pin_configuration=lambda name, digest: select().store.pin_mcp_configuration(
-                                select().task_id, name, digest))
-                    for attempt in range(2):
-                        try:
-                            gateway = select(True)
-                            scenario = gateway.context()["business_id"]
-                            output = await self.catalog.execute(scenario, tool["name"], arguments, **options)
-                            gateway = select()
-                            context = gateway.context()
-                            for item in output["evidence"]:
-                                if "object_id" in item and item["object_id"] not in context["object_ids"]:
-                                    raise Fault("PERMISSION_DENIED", "工具返回了范围外的证据", 403)
-                            gateway.check_output_secrets(output)
-                            return output
-                        except Fault as exc:
-                            if attempt or not exc.retryable:
-                                raise
-                            delay = max(0.2, getattr(exc, "retry_after", 0.2))
-                            if time.monotonic() + delay >= deadline:
-                                raise
-                            select().trace("tool_retry", {"capability_id": tool["name"],
-                                           "error_code": exc.code, "delay_s": delay})
-                            await asyncio.sleep(delay)
+                    gateway.check_skill_tool(context, "retrieve_knowledge")
+                    gateway.check(context, "knowledge.read", "retrieve_knowledge")
+                    return context["object_ids"]
+                options = {"authorize_retrieval": authorize_retrieval}
+                if self.runtime.result_store:
+                    options["validate_output"] = self.runtime.result_store.validate_output
+                gateway = select()
+                context = gateway.context()
+                adapter = self.catalog._tools[context["business_id"]][tool["name"]]["adapter"]
+                if adapter["type"] == "mcp":
+                    options["mcp_context"] = MCPContext(
+                        tenant_id=context["tenant_id"],
+                        principal_id=json.dumps([context["org_id"], context["user_id"]]),
+                        run_context_id=gateway.run_id,
+                        trace_id=gateway.task_id,
+                        authorize=lambda: select(),
+                        trace=lambda event, data: select().trace(event, data),
+                        pin_configuration=lambda name, digest: select().store.pin_mcp_configuration(
+                            select().task_id, name, digest
+                        ),
+                    )
+                for attempt in range(2):
+                    try:
+                        gateway = select(True)
+                        scenario = gateway.context()["business_id"]
+                        output = await self.catalog.execute(scenario, tool["name"], arguments, **options)
+                        gateway = select()
+                        context = gateway.context()
+                        for item in output["evidence"]:
+                            if "object_id" in item and item["object_id"] not in context["object_ids"]:
+                                raise Fault("PERMISSION_DENIED", "工具返回了范围外的证据", 403)
+                        gateway.check_output_secrets(output)
+                        return output
+                    except Fault as exc:
+                        if attempt or not exc.retryable:
+                            raise
+                        delay = max(0.2, getattr(exc, "retry_after", 0.2))
+                        if time.monotonic() + delay >= deadline:
+                            raise
+                        select().trace("tool_retry", {
+                            "capability_id": tool["name"],
+                            "error_code": exc.code,
+                            "delay_s": delay,
+                        })
+                        await asyncio.sleep(delay)
         participant = {"guard": guard, "charge": charge, "value": self}
         output = await self.runtime.read_cache.run(key, ttl, participant, operation)
         self.trace("read_cache_result", {"capability_id": tool["name"], "scope_digest": key})
@@ -401,14 +425,28 @@ class Gateway:
                 # 此标记仅表示网关已取得并校验适配器返回值。
                 result.update(result_schema_version="1", verified=True, verification_scope="adapter_output_schema")
             if self.runtime.result_store:
-                provenance = {"capability_id": name, "capability_version": version, "snapshot_id": self.snapshot_id,
-                              "permission": tool["permission"], "action_level": tool["action_level"],
-                              "arguments": arguments, "skill": self.pin}
+                provenance = {
+                    "capability_id": name,
+                    "capability_version": version,
+                    "snapshot_id": self.snapshot_id,
+                    "permission": tool["permission"],
+                    "action_level": tool["action_level"],
+                    "arguments": arguments,
+                    "skill": self.pin,
+                }
                 if adapter["type"] == "mcp":
-                    binding = self.store._db.execute("SELECT digest FROM task_mcp_bindings WHERE task_id=? AND capability_key=?",
-                                                    (self.task_id, adapter["server_id"] + "/" + adapter["tool_id"])).fetchone()
-                    provenance["mcp"] = {"server_id": adapter["server_id"], "tool_id": adapter["tool_id"],
-                                         "config_digest": binding[0] if binding else None}
+                    binding = self.store._db.execute(
+                        "SELECT digest FROM task_mcp_bindings WHERE task_id=? AND capability_key=?",
+                        (self.task_id, adapter["server_id"] + "/" + adapter["tool_id"]),
+                    ).fetchone()
+                    config_digest = None
+                    if binding:
+                        config_digest = binding[0]
+                    provenance["mcp"] = {
+                        "server_id": adapter["server_id"],
+                        "tool_id": adapter["tool_id"],
+                        "config_digest": config_digest,
+                    }
                 with self.store._transaction():
                     self.store._guard_lease(self.task_id, self.lease, call_id)
                     self.context()

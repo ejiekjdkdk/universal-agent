@@ -23,7 +23,11 @@ def authorize_result(runtime, actor, metadata, provenance):
     name = provenance["capability_id"]
     runtime.releases.guard(snapshot, business, name)
     catalog = runtime.release_catalog(snapshot, business)
-    tool = next((tool for tool in catalog.discover(business) if tool["name"] == name), None)
+    tool = None
+    for candidate in catalog.discover(business):
+        if candidate["name"] == name:
+            tool = candidate
+            break
     current = runtime.releases.current_tool(business, actor, "", name)
     grant = runtime.grant(actor, business)
     if not tool or not current or current["action_level"] != provenance["action_level"]:
@@ -34,12 +38,14 @@ def authorize_result(runtime, actor, metadata, provenance):
     if tool["permission"] not in grant["permissions"] or current["permission"] not in grant["permissions"]:
         raise Fault("PERMISSION_DENIED", "读取结果的工具权限已撤销。", 403)
     scope = runtime.store.scope(task_id)
+    # 固定版本和当前版本可能用不同字段约束对象，读取结果时仍须同时满足。
     for definition in (tool, current):
         field = definition.get("object_ids_field")
-        if field:
-            objects = provenance["arguments"].get(field)
-            if not isinstance(objects, list) or not objects or not set(objects) <= set(scope.get("object_ids", [])):
-                raise Fault("PERMISSION_DENIED", "结果来源对象不再符合当前能力范围。", 403)
+        if not field:
+            continue
+        objects = provenance["arguments"].get(field)
+        if not isinstance(objects, list) or not objects or not set(objects) <= set(scope.get("object_ids", [])):
+            raise Fault("PERMISSION_DENIED", "结果来源对象不再符合当前能力范围。", 403)
     pin = provenance.get("skill")
     if runtime.store.skill_pin(task_id) != pin:
         raise Fault("RESULT_INTEGRITY_ERROR", "结果技能绑定不属于当前任务。", 502)
@@ -51,30 +57,44 @@ def authorize_result(runtime, actor, metadata, provenance):
         if name not in skill["tools"] or not set(skill["tools"]) <= available:
             raise Fault("SKILL_UNAVAILABLE", "结果关联的技能依赖已失效。", 403)
     binding = provenance.get("mcp")
-    if binding:
-        gateway = catalog._mcp_gateway
-        if gateway is None:
-            raise Fault("CAPABILITY_REVOKED", "结果来源MCP配置已停用。", 403)
-        remote_context = MCPContext(tenant_id=actor["tenant_id"], principal_id=json.dumps([actor["org_id"], actor["user_id"]]),
-                             run_context_id="result-read", trace_id=task_id, authorize=lambda: None)
-        endpoint, server, tool = gateway.authorize_reuse(binding["server_id"], binding["tool_id"], remote_context)
-        digest = gateway.binding_digest(endpoint, server, tool, remote_context)
-        if digest != binding["config_digest"]:
-            raise Fault("CAPABILITY_REVOKED", "结果来源MCP映射已改变。", 403)
+    if not binding:
+        return
+    gateway = catalog._mcp_gateway
+    if gateway is None:
+        raise Fault("CAPABILITY_REVOKED", "结果来源MCP配置已停用。", 403)
+    remote_context = MCPContext(
+        tenant_id=actor["tenant_id"],
+        principal_id=json.dumps([actor["org_id"], actor["user_id"]]),
+        run_context_id="result-read",
+        trace_id=task_id,
+        authorize=lambda: None,
+    )
+    endpoint, server, mapped_tool = gateway.authorize_reuse(
+        binding["server_id"], binding["tool_id"], remote_context
+    )
+    digest = gateway.binding_digest(endpoint, server, mapped_tool, remote_context)
+    if digest != binding["config_digest"]:
+        raise Fault("CAPABILITY_REVOKED", "结果来源MCP映射已改变。", 403)
 
 
 def install_result_routes(app, runtime, identify):
     @app.get(API + "/tasks/{task_id}/results")
     async def task_results(task_id: str, actor=Depends(identify)):
-        rt = runtime()
-        task = rt.store.task(actor, task_id)
-        rt.authorize_task(actor, task["business_id"], task_id)
-        with rt.store._lock:
-            rows = rt.store._db.execute("SELECT result_ref FROM tool_results WHERE task_id=? ORDER BY rowid", (task_id,)).fetchall()
+        current_runtime = runtime()
+        task = current_runtime.store.task(actor, task_id)
+        current_runtime.authorize_task(actor, task["business_id"], task_id)
+        with current_runtime.store._lock:
+            rows = current_runtime.store._db.execute(
+                "SELECT result_ref FROM tool_results WHERE task_id=? ORDER BY rowid", (task_id,)
+            ).fetchall()
         items = []
         for row in rows:
             try:
-                items.append(rt.result_store.metadata(row[0], actor, lambda meta, source: authorize_result(rt, actor, meta, source)))
+                item = current_runtime.result_store.metadata(
+                    row[0], actor,
+                    lambda metadata, provenance: authorize_result(current_runtime, actor, metadata, provenance),
+                )
+                items.append(item)
             except Fault as error:
                 if error.code not in {"RESULT_NOT_FOUND", "RESULT_EXPIRED"}:
                     raise
@@ -82,18 +102,27 @@ def install_result_routes(app, runtime, identify):
 
     @app.get(API + "/results/{result_ref}")
     async def metadata(result_ref: str, actor=Depends(identify)):
-        rt = runtime()
-        result = rt.result_store.metadata(result_ref, actor, lambda meta, source: authorize_result(rt, actor, meta, source))
+        current_runtime = runtime()
+        result = current_runtime.result_store.metadata(
+            result_ref, actor,
+            lambda metadata, provenance: authorize_result(current_runtime, actor, metadata, provenance),
+        )
         return JSONResponse(result, headers=HEADERS)
 
     @app.get(API + "/results/{result_ref}/pages")
     async def page(result_ref: str, cursor: str | None = None, actor=Depends(identify)):
-        rt = runtime()
-        result = rt.result_store.page(result_ref, cursor, actor, lambda meta, source: authorize_result(rt, actor, meta, source))
+        current_runtime = runtime()
+        result = current_runtime.result_store.page(
+            result_ref, cursor, actor,
+            lambda metadata, provenance: authorize_result(current_runtime, actor, metadata, provenance),
+        )
         return JSONResponse(result, headers=HEADERS)
 
     @app.delete(API + "/results/{result_ref}")
     async def revoke(result_ref: str, actor=Depends(identify)):
-        rt = runtime()
-        result = rt.result_store.revoke(result_ref, actor, lambda meta, source: authorize_result(rt, actor, meta, source))
+        current_runtime = runtime()
+        result = current_runtime.result_store.revoke(
+            result_ref, actor,
+            lambda metadata, provenance: authorize_result(current_runtime, actor, metadata, provenance),
+        )
         return JSONResponse(result, headers=HEADERS)

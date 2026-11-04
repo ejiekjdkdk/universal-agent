@@ -123,10 +123,13 @@ class ResultStore:
             for statement in SCHEMA.split(";"):
                 if statement.strip():
                     store._db.execute(statement)
-            finished = store._db.execute("SELECT DISTINCT t.task_id,t.finished_at FROM tasks t JOIN tool_results r USING(task_id) "
-                                         "WHERE t.finished_at IS NOT NULL").fetchall()
-            for task in finished:
-                self.finish_task(task["task_id"], datetime.fromisoformat(task["finished_at"]).timestamp())
+            finished_tasks = store._db.execute(
+                "SELECT DISTINCT t.task_id,t.finished_at FROM tasks t JOIN tool_results r USING(task_id) "
+                "WHERE t.finished_at IS NOT NULL"
+            ).fetchall()
+            for task in finished_tasks:
+                completed_at = datetime.fromisoformat(task["finished_at"]).timestamp()
+                self.finish_task(task["task_id"], completed_at)
 
     async def maintain(self):
         """空闲期间也清除到期密文；读取到期时间的拒绝不依赖此定时器。"""
@@ -154,22 +157,41 @@ class ResultStore:
                     raise Fault("RESULT_CONFLICT", "已保存的执行结果不能被替换。", 409)
                 return existing[0]
             self.purge()
-            used = self.store._db.execute("SELECT COALESCE(SUM(length(ciphertext)+length(nonce)+length(CAST(metadata AS BLOB))),0) "
-                                          "FROM tool_results").fetchone()[0]
+            used_bytes = self.store._db.execute(
+                "SELECT COALESCE(SUM(length(ciphertext)+length(nonce)+length(CAST(metadata AS BLOB))),0) "
+                "FROM tool_results"
+            ).fetchone()[0]
             now = time.time()
             ref = "res_" + secrets.token_hex(24)
-            metadata = {"result_ref": ref, "task_id": task_id, "execution_id": execution_id,
-                        "created_at": now, "expires_at": now + self.ttl_seconds,
-                        "byte_count": len(payload), "result_bytes": len(raw), "digest": digest,
-                        "key_id": self.active_key,
-                        "owner": {key: task[key] for key in ("tenant_id", "org_id", "user_id", "business_id")}}
-            encoded = _json(metadata)
-            if used + len(payload) + 28 + len(encoded.encode()) > self.quota_bytes:
+            metadata = {
+                "result_ref": ref,
+                "task_id": task_id,
+                "execution_id": execution_id,
+                "created_at": now,
+                "expires_at": now + self.ttl_seconds,
+                "byte_count": len(payload),
+                "result_bytes": len(raw),
+                "digest": digest,
+                "key_id": self.active_key,
+                "owner": {
+                    "tenant_id": task["tenant_id"],
+                    "org_id": task["org_id"],
+                    "user_id": task["user_id"],
+                    "business_id": task["business_id"],
+                },
+            }
+            metadata_json = _json(metadata)
+            metadata_bytes = metadata_json.encode("utf-8")
+            # 配额包含12字节随机数与16字节认证标签，不只计算明文载荷。
+            stored_bytes = len(payload) + 12 + 16 + len(metadata_bytes)
+            if used_bytes + stored_bytes > self.quota_bytes:
                 raise Fault("RESULT_QUOTA_EXCEEDED", "结果存储已达容量上限。", 503)
             nonce = secrets.token_bytes(12)
-            ciphertext = AESGCM(self.keys[self.active_key]).encrypt(nonce, payload, encoded.encode())
-            self.store._db.execute("INSERT INTO tool_results VALUES(?,?,?,?,?,?,?,?)",
-                                   (ref, task_id, execution_id, metadata["expires_at"], len(payload), encoded, nonce, ciphertext))
+            ciphertext = AESGCM(self.keys[self.active_key]).encrypt(nonce, payload, metadata_bytes)
+            self.store._db.execute(
+                "INSERT INTO tool_results VALUES(?,?,?,?,?,?,?,?)",
+                (ref, task_id, execution_id, metadata["expires_at"], len(payload), metadata_json, nonce, ciphertext),
+            )
             self.store._audit("result.store", "allow", dict(task), task_id, ref, None)
             return ref
 
@@ -197,7 +219,10 @@ class ResultStore:
                 raise Fault("RESULT_KEY_UNAVAILABLE", "读取此结果所需的密钥不可用。", 503)
             raw = AESGCM(self.keys[key_id]).decrypt(row["nonce"], row["ciphertext"], row["metadata"].encode())
             payload = json.loads(raw)
-            if len(raw) != row["byte_count"] or hashlib.sha256(_json(payload["result"]).encode()).hexdigest() != metadata["digest"]:
+            if len(raw) != row["byte_count"]:
+                raise ValueError("结果摘要不一致")
+            result_digest = hashlib.sha256(_json(payload["result"]).encode()).hexdigest()
+            if result_digest != metadata["digest"]:
                 raise ValueError("结果摘要不一致")
         except (InvalidTag, ValueError, TypeError, KeyError, UnicodeError, RecursionError):
             raise Fault("RESULT_INTEGRITY_ERROR", "结果完整性校验失败。", 502) from None
@@ -230,22 +255,33 @@ class ResultStore:
 
     def metadata(self, ref, actor, authorize):
         record = self._authorized(ref, actor, authorize)
-        meta = record["metadata"]
+        metadata = record["metadata"]
         result = record["result"]
         summary = result.get("data", {}).get("summary", "")
         if not isinstance(summary, str):
             summary = ""
-        self.store.audit("result.metadata", "allow", actor, meta["task_id"], ref)
-        return {key: meta[key] for key in ("result_ref", "task_id", "execution_id", "created_at", "expires_at", "digest", "result_bytes")} | {
-            "summary": summary[:2048], "summary_truncated": len(summary) > 2048,
-            "evidence_count": len(result.get("evidence", [])), "encoding": "utf-8-json"}
+        self.store.audit("result.metadata", "allow", actor, metadata["task_id"], ref)
+        return {
+            "result_ref": metadata["result_ref"],
+            "task_id": metadata["task_id"],
+            "execution_id": metadata["execution_id"],
+            "created_at": metadata["created_at"],
+            "expires_at": metadata["expires_at"],
+            "digest": metadata["digest"],
+            "result_bytes": metadata["result_bytes"],
+            "summary": summary[:2048],
+            "summary_truncated": len(summary) > 2048,
+            "evidence_count": len(result.get("evidence", [])),
+            "encoding": "utf-8-json",
+        }
 
     def page(self, ref, cursor, actor, authorize):
         record = self._authorized(ref, actor, authorize)
         meta = record["metadata"]
         raw = _json(record["result"]).encode("utf-8")
-        key = HKDF(algorithm=hashes.SHA256(), length=32, salt=None,
-                   info=b"agent-result-cursor-v1").derive(self.keys[meta["key_id"]])
+        cursor_key = HKDF(
+            algorithm=hashes.SHA256(), length=32, salt=None, info=b"agent-result-cursor-v1"
+        ).derive(self.keys[meta["key_id"]])
         offset = 0
         if cursor is not None:
             try:
@@ -254,15 +290,19 @@ class ResultStore:
                 encoded, signature = cursor.split(".")
                 if not re.fullmatch(r"[a-f0-9]{64}", signature):
                     raise ValueError("游标签名无效")
-                if not hmac.compare_digest(signature, hmac.new(key, encoded.encode("ascii"), hashlib.sha256).hexdigest()):
+                expected_signature = hmac.new(cursor_key, encoded.encode("ascii"), hashlib.sha256).hexdigest()
+                if not hmac.compare_digest(signature, expected_signature):
                     raise ValueError("游标签名不符")
                 decoded = base64.b64decode(encoded + "=" * (-len(encoded) % 4), altchars=b"-_", validate=True)
                 if base64.urlsafe_b64encode(decoded).decode().rstrip("=") != encoded:
                     raise ValueError("游标编码无效")
                 value = json.loads(decoded)
                 offset = value["offset"]
-                if (set(value) != {"ref", "digest", "offset"} or value["ref"] != ref or value["digest"] != meta["digest"]
-                        or type(offset) is not int or not 0 < offset < len(raw)):
+                if set(value) != {"ref", "digest", "offset"}:
+                    raise ValueError("游标范围无效")
+                if value["ref"] != ref or value["digest"] != meta["digest"]:
+                    raise ValueError("游标范围无效")
+                if type(offset) is not int or not 0 < offset < len(raw):
                     raise ValueError("游标范围无效")
             except (ValueError, TypeError, KeyError, UnicodeError):
                 self.store.audit("result.page", "deny", actor, meta["task_id"], ref, "RESULT_CURSOR_INVALID")
@@ -274,10 +314,18 @@ class ResultStore:
         if end < len(raw):
             value = _json({"ref": ref, "digest": meta["digest"], "offset": end}).encode()
             encoded = base64.urlsafe_b64encode(value).decode().rstrip("=")
-            next_cursor = encoded + "." + hmac.new(key, encoded.encode(), hashlib.sha256).hexdigest()
+            signature = hmac.new(cursor_key, encoded.encode(), hashlib.sha256).hexdigest()
+            next_cursor = encoded + "." + signature
         self.store.audit("result.page", "allow", actor, meta["task_id"], ref)
-        return {"result_ref": ref, "digest": meta["digest"], "offset": offset, "content": content,
-                "encoding": "utf-8-json", "next_cursor": next_cursor, "expires_at": meta["expires_at"]}
+        return {
+            "result_ref": ref,
+            "digest": meta["digest"],
+            "offset": offset,
+            "content": content,
+            "encoding": "utf-8-json",
+            "next_cursor": next_cursor,
+            "expires_at": meta["expires_at"],
+        }
 
     def revoke(self, ref, actor, authorize):
         with self.store._transaction():
@@ -294,8 +342,9 @@ class ResultStore:
         """终态保留期从完成时起算；重新认证元数据，不复活已过期或已删除的结果。"""
         with self.store._transaction():
             now = time.time()
-            rows = self.store._db.execute("SELECT * FROM tool_results WHERE task_id=? AND expires_at>?",
-                                          (task_id, now)).fetchall()
+            rows = self.store._db.execute(
+                "SELECT * FROM tool_results WHERE task_id=? AND expires_at>?", (task_id, now)
+            ).fetchall()
             for row in rows:
                 try:
                     if "finished_at" in json.loads(row["metadata"]):
@@ -304,12 +353,16 @@ class ResultStore:
                     raise Fault("RESULT_INTEGRITY_ERROR", "结果元数据无效。", 502) from None
                 record = self._decode(row)
                 metadata = record["metadata"]
-                finished_at = now if completed_at is None else completed_at
+                finished_at = completed_at
+                if finished_at is None:
+                    finished_at = now
                 metadata["finished_at"] = finished_at
                 metadata["expires_at"] = finished_at + self.ttl_seconds
                 encoded = _json(metadata)
                 payload = _json({"result": record["result"], "provenance": record["provenance"]}).encode()
                 nonce = secrets.token_bytes(12)
                 ciphertext = AESGCM(self.keys[metadata["key_id"]]).encrypt(nonce, payload, encoded.encode())
-                self.store._db.execute("UPDATE tool_results SET expires_at=?,metadata=?,nonce=?,ciphertext=? WHERE result_ref=?",
-                                       (metadata["expires_at"], encoded, nonce, ciphertext, row["result_ref"]))
+                self.store._db.execute(
+                    "UPDATE tool_results SET expires_at=?,metadata=?,nonce=?,ciphertext=? WHERE result_ref=?",
+                    (metadata["expires_at"], encoded, nonce, ciphertext, row["result_ref"]),
+                )
