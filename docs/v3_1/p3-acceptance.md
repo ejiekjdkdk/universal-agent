@@ -1,6 +1,6 @@
 # V3.1 P3 验收记录
 
-基线 main@82b1a7337ff71b6bd5ffc11ec3daca7144d0d669；实施分支 codex/v31-p3。用户确认仅显式本地测试 Replay、本地模拟模型 HTTP 与虚构数据；真实商业模型 NOT_RUN。main 尚未合并本轮。
+基线 main@82b1a7337ff71b6bd5ffc11ec3daca7144d0d669；实施分支 codex/v31-p3。用户确认仅显式本地测试 Replay、本地模拟模型 HTTP 与虚构数据；真实商业模型 NOT_RUN。分支交付时 main 尚未合并本轮；后续 main 集成与重新回归见 [P3 集成记录](../audits/v31-p3-integration.md)。
 
 ## 自动化覆盖
 
