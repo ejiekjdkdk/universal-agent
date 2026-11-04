@@ -1,0 +1,78 @@
+{
+  "version": "1",
+  "profiles": {
+    "primary": {
+      "provider_id": "primary",
+      "model_ref": "fictional-model",
+      "base_url": "http://127.0.0.1:18881/v1",
+      "credential_env": "",
+      "enabled": false,
+      "profile_version": "test-1",
+      "verified_at": 0,
+      "expires_at": 1,
+      "verification_kind": "mock",
+      "evidence_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "supports_tool_calling": true,
+      "supports_structured_output": true,
+      "supports_streaming": true,
+      "supports_parallel_tool_calls": false,
+      "supports_usage_reporting": true,
+      "context_window_tokens": 32000,
+      "max_output_tokens": 128,
+      "data_handling_class": [
+        "synthetic"
+      ],
+      "region": "local",
+      "retention_class": "no_store",
+      "input_usd_per_million": 1.0,
+      "output_usd_per_million": 2.0
+    },
+    "secondary": {
+      "provider_id": "secondary",
+      "model_ref": "fictional-model",
+      "base_url": "http://127.0.0.1:18882/v1",
+      "credential_env": "",
+      "enabled": false,
+      "profile_version": "test-1",
+      "verified_at": 0,
+      "expires_at": 1,
+      "verification_kind": "mock",
+      "evidence_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "supports_tool_calling": true,
+      "supports_structured_output": true,
+      "supports_streaming": true,
+      "supports_parallel_tool_calls": false,
+      "supports_usage_reporting": true,
+      "context_window_tokens": 32000,
+      "max_output_tokens": 128,
+      "data_handling_class": [
+        "synthetic"
+      ],
+      "region": "local",
+      "retention_class": "no_store",
+      "input_usd_per_million": 1.0,
+      "output_usd_per_million": 2.0
+    }
+  },
+  "routes": {
+    "notes": {
+      "allowed_providers": [
+        "primary",
+        "secondary"
+      ],
+      "data_class": "synthetic",
+      "allowed_regions": [
+        "local"
+      ],
+      "allowed_retention_classes": [
+        "no_store"
+      ],
+      "result_max_age_s": 60,
+      "stream": false,
+      "max_attempts": 2,
+      "max_total_tokens": 100000,
+      "max_cost_usd": 1.0,
+      "timeout_s": 2
+    }
+  }
+}

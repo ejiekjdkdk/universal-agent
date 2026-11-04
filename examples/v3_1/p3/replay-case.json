@@ -1,0 +1,110 @@
+{
+  "schema_version": "3.1",
+  "case_id": "sample",
+  "version": "baseline",
+  "fixture_policy": "synthetic",
+  "release_snapshot_id": "fixture-1",
+  "model_profile_version": "mock-1",
+  "time": 1900000000,
+  "message": "sample",
+  "permissions": [
+    "record.read"
+  ],
+  "object_ids": [
+    "a"
+  ],
+  "redactions": [],
+  "expected_status": "completed",
+  "tools": [
+    {
+      "name": "lookup",
+      "permission": "record.read",
+      "action_level": "read",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "summary": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "summary"
+        ],
+        "additionalProperties": false
+      },
+      "recordings": [
+        {
+          "arguments": {
+            "text": "sample"
+          },
+          "output": {
+            "data": {
+              "summary": "虚构结果"
+            },
+            "evidence": [
+              {
+                "source_id": "fixture-a",
+                "title": "虚构记录",
+                "snippet": "虚构结果",
+                "version": "1",
+                "object_id": "a",
+                "source_ref": "fixture://a"
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ],
+  "responses": [
+    {
+      "status_code": 200,
+      "body": {
+        "choices": [
+          {
+            "message": {
+              "role": "assistant",
+              "tool_calls": [
+                {
+                  "id": "read-1",
+                  "type": "function",
+                  "function": {
+                    "name": "execute_capability",
+                    "arguments": "{\"name\": \"lookup\", \"arguments\": {\"text\": \"sample\"}}"
+                  }
+                }
+              ]
+            },
+            "finish_reason": "tool_calls"
+          }
+        ]
+      }
+    },
+    {
+      "status_code": 200,
+      "body": {
+        "choices": [
+          {
+            "message": {
+              "role": "assistant",
+              "content": "{\"answer\": \"\\u865a\\u6784\\u7ed3\\u679c [E1]\", \"limitations\": [], \"unresolved_items\": []}"
+            },
+            "finish_reason": "stop"
+          }
+        ]
+      }
+    }
+  ]
+}

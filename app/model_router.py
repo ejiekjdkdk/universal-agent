@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import time
+from typing import Any
 
 import httpx
 
@@ -157,8 +158,8 @@ def load_policy(settings):
 
 def _stream_body(raw):
     """整段有界收齐后解析流，不把半截参数交给执行器。"""
-    message = {"role": "assistant", "content": ""}
-    calls = {}
+    message: dict[str, Any] = {"role": "assistant", "content": ""}
+    calls: dict[int, dict[str, Any]] = {}
     usage = None
     finished = None
     done = False
@@ -436,8 +437,10 @@ class ProviderRouter:
                 self._guard()
                 authorize()
                 known = False
+                prompt = 0
+                output = 0
                 if profile["supports_usage_reporting"] is True and isinstance(usage, dict):
-                    prompt, output = usage.get("prompt_tokens"), usage.get("completion_tokens")
+                    prompt, output = usage.get("prompt_tokens", -1), usage.get("completion_tokens", -1)
                     known = (type(prompt) is int and type(output) is int and 0 <= prompt <= estimate
                              and 0 <= output <= profile["max_output_tokens"]
                              and usage.get("total_tokens") == prompt + output)
