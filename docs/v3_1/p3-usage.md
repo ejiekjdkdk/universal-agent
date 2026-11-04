@@ -38,6 +38,8 @@ record 先脱敏再运行：显式 `redactions` 值、常见凭据模式和邮�
 
 ZIP 只有 case.json、recording.json、manifest.json；最大 4 MiB，不向磁盘解压。签名、版本和各文件摘要先验证，run 还要求全部app Python代码、依赖锁、实际安装包版本、Python版本和系统类别摘要一致。升级代码或环境后重新录制候选包，再 compare；不能用旧包加载历史 Python 代码。执行时隔离宿主服务环境变量，只保留系统与临时目录变量；录制前脱敏仍读取操作者原环境。结构结果参与确定性比较，延迟只单独报告。
 
+P4 起指纹还包含实际 SQLite 版本、source id、线程模式和原生扩展/库摘要；仅替换 SQLite DLL 也需要重新录制。发布环境须另通过 `scripts/release_check.py environment`，精确回放通过不等于环境含 WAL 修复。
+
 compare 固定输入与工具夹具，不同输入为 INCOMPARABLE；权限扩大、证据丢失、Schema 破坏或终态退化为 FAIL。文本差异单列，不自动断言模型质量改善；未知成本不计算精确收益。PASS 仅表示这些本地门禁没有发现退化，不代表任意业务语义或安全绝对正确。候选模型以显式录制响应表示，真实商业模型 comparative 验证仍为 NOT_RUN。
 
 ## 验证和回退

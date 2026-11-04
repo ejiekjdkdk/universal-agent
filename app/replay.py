@@ -24,6 +24,7 @@ from .result_store import _bounded
 from .runtime import Runtime
 from .schema_validation import _simple_schema
 from .store import Store
+from .runtime_environment import sqlite_runtime
 
 
 VERSION = "3.1-p3.1"
@@ -68,7 +69,7 @@ def _engine_digest():
     # 覆盖传递依赖的实际版本，避免同一锁文件下不同环境被误认为同一执行器。
     packages = sorted((item.metadata["Name"], item.version) for item in distributions())
     return _sha(_bytes({"files": files, "python": platform.python_version(),
-                        "platform": platform.system(), "packages": packages}))
+                        "platform": platform.system(), "packages": packages, "sqlite": sqlite_runtime()}))
 
 
 def _key(key):

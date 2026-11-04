@@ -46,6 +46,20 @@ def test_engine_digest_covers_execution_dependencies(monkeypatch):
     assert replay._engine_digest() != before
 
 
+@pytest.mark.parametrize("field", ["version", "source_id", "extension_sha256", "library_sha256"])
+def test_replay_rejects_native_sqlite_change(tmp_path, monkeypatch, field):
+    """更换原生库而不改 Python/pip 时，也不能误报为精确回放。"""
+    native = {"version": "3.53.1", "source_id": "fictional-build-a", "threadsafety": 3,
+              "extension_sha256": "a" * 64, "library_sha256": "b" * 64}
+    monkeypatch.setattr(replay, "sqlite_runtime", lambda: dict(native), raising=False)
+    path = tmp_path / "native.zip"
+    replay.record_case(case(), path, KEY)
+    assert replay.run_replay(path, KEY)["status"] == "PASS"
+    native[field] = "fictional-changed-sqlite"
+    with pytest.raises(ValueError, match="运行代码"):
+        replay.run_replay(path, KEY)
+
+
 def test_custom_profile_secret_cannot_enter_tool_store_or_model(monkeypatch):
     secret = 'fictional-custom-provider-key-987\\escaped'
     monkeypatch.setenv("P3_AUDIT_KEY", secret)
