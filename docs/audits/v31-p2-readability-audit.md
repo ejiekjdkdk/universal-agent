@@ -1,5 +1,7 @@
 # V3.1 P2 可读性审查与优化
 
+后续集成：本轮优化与高风险修复已纳入 main，见[两轮审计集成记录](v31-two-audits-integration.md)。下文分支描述为本轮审查时的状态。
+
 日期：2026-11-04。基线：`main@6fa92f0`。工作分支：`codex/v31-p2-readability-audit`。
 
 ## 范围与结论
