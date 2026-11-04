@@ -10,11 +10,11 @@ P3 在 V3.1 P0/P1/P2 基础上增加可信模型路由和显式本地 Replay。�
 
 `routes` 按业务 ID 定义有序候选、数据类别、区域与保存策略允许列表，以及请求、Token、成本和结果年龄预算。data_class 必须保守覆盖整个业务出站数据，包括输入、历史、技能与工具结果。未验证的严格输出/工具能力不可用；启用 stream 时还须验证流能力。凭据通过 `credential_env` 引用本机环境变量，不能写进配置或仓库。
 
-每次发送重新鉴权和核对冻结配置；中途变更配置或凭据会终止旧任务。429/503/408、超时、连接失败、不完整流允许有界切换。已成功工具按规范化参数复用并重新鉴权；过期或 freshness 改变会失败，不为刷新数据重执行。状态未知的副作用恢复仍由原 durable_plan 负责。
+每次发送重新鉴权和核对冻结配置；中途变更配置或凭据会终止旧任务。冻结的全部画像凭据在工具结果入库、模型响应和消息/工具Schema发送前检查，拒绝转发到其他候选。429/503/408、超时、连接失败、不完整流允许有界切换。已成功工具按规范化参数复用并重新鉴权；过期或 freshness 改变会失败，不为刷新数据重执行。状态未知的副作用恢复仍由原 durable_plan 负责。
 
 P3 固定使用 Chat Completions 的 strict json_schema、max_completion_tokens、parallel_tool_calls=false。不同兼容服务可能不支持这些字段，必须先做实际协议验证。流有界收齐、校验完整后再执行工具；不把供应商原始流直接送给网页。
 
-失败或未知 usage 保留保守预算。`audit_logs` 中 `action=model.attempt` 记录画像/策略摘要、请求序号、预留和已知用量；不记录 Prompt 或凭据。不支持精确 tokenizer，字节估算可能使小窗口更早拒绝。价格仅代表可信配置，不能视为供应商账单。
+失败或未知 usage 保留保守预算，已发送后取消也记录未知用量且不再切换候选。`audit_logs` 中 `action=model.attempt` 记录画像/策略摘要、请求序号、预留和已知用量；不记录 Prompt 或凭据。不支持精确 tokenizer，字节估算可能使小窗口更早拒绝。价格仅代表可信配置，不能视为供应商账单。
 
 ## 显式本地 Replay
 
@@ -36,7 +36,7 @@ python scripts/replay.py compare --baseline work/replay-baseline.zip --candidate
 
 record 先脱敏再运行：显式 `redactions` 值、常见凭据模式和邮件地址会替换；脱敏字段冲突拒绝。自动规则不能识别所有个人信息或任意业务秘密，输入应优先使用虚构数据；操作者必须检查导出内容。`fixture_policy=redacted` 是声明，不能替代人工检查。脱敏改变语义时应修正夹具，不能声称复现了原始私密任务。
 
-ZIP 只有 case.json、recording.json、manifest.json；最大 4 MiB，不向磁盘解压。签名、版本和各文件摘要先验证，run 还要求执行代码摘要一致。升级代码后重新录制候选包，再 compare；不能用旧包加载历史 Python 代码。结构结果参与确定性比较，延迟只单独报告。
+ZIP 只有 case.json、recording.json、manifest.json；最大 4 MiB，不向磁盘解压。签名、版本和各文件摘要先验证，run 还要求全部app Python代码、依赖锁、实际安装包版本、Python版本和系统类别摘要一致。升级代码或环境后重新录制候选包，再 compare；不能用旧包加载历史 Python 代码。执行时隔离宿主服务环境变量，只保留系统与临时目录变量；录制前脱敏仍读取操作者原环境。结构结果参与确定性比较，延迟只单独报告。
 
 compare 固定输入与工具夹具，不同输入为 INCOMPARABLE；权限扩大、证据丢失、Schema 破坏或终态退化为 FAIL。文本差异单列，不自动断言模型质量改善；未知成本不计算精确收益。PASS 仅表示这些本地门禁没有发现退化，不代表任意业务语义或安全绝对正确。候选模型以显式录制响应表示，真实商业模型 comparative 验证仍为 NOT_RUN。
 

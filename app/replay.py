@@ -5,10 +5,12 @@ from datetime import datetime, timezone
 import hashlib
 import hmac
 import io
+from importlib.metadata import distributions
 import json
 import os
 from pathlib import Path
 import re
+import platform
 import tempfile
 import time
 from unittest.mock import patch
@@ -59,9 +61,14 @@ def _sha(raw):
 def _engine_digest():
     root = Path(__file__).parent
     files = {}
-    for name in ("providers.py", "model_router.py", "runtime.py", "catalog.py", "store.py", "context_compiler.py", "replay.py"):
-        files[name] = _sha((root / name).read_bytes().replace(b"\r\n", b"\n"))
-    return _sha(_bytes(files))
+    for path in sorted(root.rglob("*.py")):
+        files[path.relative_to(root).as_posix()] = _sha(path.read_bytes().replace(b"\r\n", b"\n"))
+    lock = root.parent / "requirements-win-py311.lock"
+    files[lock.name] = _sha(lock.read_bytes().replace(b"\r\n", b"\n"))
+    # 覆盖传递依赖的实际版本，避免同一锁文件下不同环境被误认为同一执行器。
+    packages = sorted((item.metadata["Name"], item.version) for item in distributions())
+    return _sha(_bytes({"files": files, "python": platform.python_version(),
+                        "platform": platform.system(), "packages": packages}))
 
 
 def _key(key):
@@ -245,8 +252,12 @@ def _execute(case):
     _validate_case(case)
     stamp = datetime.fromtimestamp(case["time"], timezone.utc).isoformat()
     # 仅供独立本地CLI；不得在运行中的API进程调用此同步测试工具。
+    environment = {}
+    for name in ("SystemRoot", "WINDIR", "TEMP", "TMP"):
+        if name in os.environ:
+            environment[name] = os.environ[name]
     with patch("time.time", return_value=case["time"]), patch("app.store._now", return_value=stamp), patch.dict(
-        os.environ, {"AGENT_MCP_SERVERS": "", "AGENT_SPECIALISTS": "0"}
+        os.environ, environment, clear=True
     ):
         return asyncio.run(_run_case(case))
 

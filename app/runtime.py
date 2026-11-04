@@ -9,6 +9,7 @@ import time
 from .catalog import tool_slot
 from .errors import Fault
 from .providers import run_provider
+from .model_router import reject_model_credentials
 from .skills import SkillError, SkillRegistry
 from .mcp_gateway import MCPContext
 from .result_store import ResultStore, load_p2_policy
@@ -122,6 +123,7 @@ class Gateway:
 
     def check_output_secrets(self, payload):
         """在工具数据进入模型、事件或数据库之前，拒绝带有凭据的结果。"""
+        reject_model_credentials(payload, getattr(self, "_model_credentials", ()))
         text = json.dumps(payload, ensure_ascii=False)
         known = [*self.runtime.principals, self.runtime.settings.get("api_key")]
         known.extend(os.getenv(key) for key in ("AGENT_SERVICE_TOKEN", "AGENT_ADMIN_TOKEN"))

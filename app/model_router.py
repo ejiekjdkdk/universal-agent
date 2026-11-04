@@ -230,7 +230,34 @@ def _stream_body(raw):
     return {"choices": [{"message": message, "finish_reason": finished}], "usage": usage}
 
 
-def _reply(body, secret, profile):
+def reject_model_credentials(payload, credentials):
+    """检查所有固定画像的凭据，包括嵌套JSON文本，阻止它们进入工具存储或其他模型。"""
+    secrets = [secret for secret in credentials if secret]
+    if not secrets:
+        return
+    pending = [(payload, 0)]
+    while pending:
+        value, depth = pending.pop()
+        if depth > 32:
+            raise _invalid()
+        if isinstance(value, dict):
+            for key, item in value.items():
+                pending.append((key, depth + 1))
+                pending.append((item, depth + 1))
+        elif isinstance(value, list):
+            for item in value:
+                pending.append((item, depth + 1))
+        elif isinstance(value, str):
+            if any(secret in value for secret in secrets):
+                raise Fault("SENSITIVE_OUTPUT", "内容含有模型访问凭据，已阻止传递。", 502)
+            if value.lstrip().startswith(("{", "[", '"')):
+                try:
+                    pending.append((_json(value), depth + 1))
+                except ValueError:
+                    pass
+
+
+def _reply(body, credentials, profile):
     if not isinstance(body, dict) or not isinstance(body.get("choices"), list) or len(body["choices"]) != 1:
         raise _invalid()
     choice = body["choices"][0]
@@ -239,35 +266,18 @@ def _reply(body, secret, profile):
     message = choice.get("message")
     if not isinstance(message, dict) or message.get("role") != "assistant" or message.get("refusal"):
         raise _invalid()
-    if secret:
-        pending = [(message, 0)]
-        while pending:
-            value, depth = pending.pop()
-            if depth > 16:
-                raise _invalid()
-            if isinstance(value, dict):
-                for key, item in value.items():
-                    pending.append((key, depth + 1))
-                    pending.append((item, depth + 1))
-            elif isinstance(value, list):
-                for item in value:
-                    pending.append((item, depth + 1))
-            elif isinstance(value, str):
-                if secret in value:
-                    raise _invalid()
-                # content/arguments本身也是JSON文本，须在解码后检查转义凭据。
-                if value.lstrip().startswith(("{", "[", '"')):
-                    try:
-                        pending.append((_json(value), depth + 1))
-                    except ValueError:
-                        pass
+    reject_model_credentials(message, credentials)
     calls = message.get("tool_calls")
     if calls is not None and not isinstance(calls, list):
         raise _invalid()
     if calls:
+        if choice["finish_reason"] != "tool_calls":
+            raise _invalid()
         if len(calls) > 1 and profile["supports_parallel_tool_calls"] is not True:
             raise _invalid()
     else:
+        if choice["finish_reason"] != "stop":
+            raise _invalid()
         answer = message.get("content")
         if not isinstance(answer, str) or not is_valid(FINAL_SCHEMA, _json(answer)):
             raise _invalid()
@@ -290,6 +300,8 @@ class ProviderRouter:
         self.keys = {}
         for name, profile in self.policy["profiles"].items():
             self.keys[name] = os.getenv(profile["credential_env"], "") if profile["credential_env"] else ""
+        # 网关在任何工具结果入库前使用同一任务冻结的全部凭据检查。
+        self.gateway._model_credentials = tuple(self.keys.values())
         self.failed = set()
         self.generation = 0
         self.selected = None
@@ -390,6 +402,7 @@ class ProviderRouter:
                 continue
             if len(_encoded(turn).encode("utf-8")) > self.settings.get("max_context_bytes", 256000):
                 raise Fault("BUDGET_EXCEEDED", "模型输入超过服务端字节预算。", 422)
+            reject_model_credentials({"messages": turn, "tools": self.tools}, self.keys.values())
             reserve = estimate + profile["max_output_tokens"]
             input_rate = Decimal(str(profile["input_usd_per_million"]))
             output_rate = Decimal(str(profile["output_usd_per_million"]))
@@ -433,7 +446,7 @@ class ProviderRouter:
                                 raise _invalid()
                             raw.extend(piece)
                 body = _stream_body(raw.decode("utf-8")) if self.route["stream"] else _json(raw)
-                reply, usage = _reply(body, key, profile)
+                reply, usage = _reply(body, self.keys.values(), profile)
                 self._guard()
                 authorize()
                 known = False
@@ -452,6 +465,12 @@ class ProviderRouter:
                 metadata.update(outcome="succeeded", usage_known=known, duration_ms=round((time.monotonic() - started) * 1000))
                 self._audit(metadata)
                 return reply, usage if known and not unknown_usage else None
+            except asyncio.CancelledError:
+                # 已发送请求仍可能计费；保留预留并记录未知用量，然后继续原取消语义。
+                metadata.update(outcome="cancelled", usage_known=False,
+                                duration_ms=round((time.monotonic() - started) * 1000))
+                self._audit(metadata)
+                raise
             except (TimeoutError, httpx.TimeoutException, httpx.RequestError) as error:
                 last_error = Fault("MODEL_TIMEOUT" if isinstance(error, (TimeoutError, httpx.TimeoutException)) else "MODEL_CONNECTION_ERROR",
                                    "模型服务暂时不可用。", 504, True)
