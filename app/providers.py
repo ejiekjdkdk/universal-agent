@@ -11,6 +11,7 @@ import httpx
 
 from .errors import Fault
 from .context_compiler import ContextSession
+from .model_router import ProviderRouter, load_policy
 
 
 def _tool(name, description, fields, required):
@@ -322,7 +323,7 @@ def _final_reply(answer, sources, structured):
 
 
 async def _model_loop(complete, messages, gateway, max_rounds, max_calls, rates, *, structured=False,
-                      max_context_bytes=256000, context_session=None):
+                      max_context_bytes=256000, context_session=None, router=None):
     seen: set[str] = set()
     sources: dict[tuple, int] = {}
     observed_summaries: list[str] = []
@@ -346,13 +347,18 @@ async def _model_loop(complete, messages, gateway, max_rounds, max_calls, rates,
         gateway.context()
         authorize_sources()
         model_messages = messages
-        if context_session is not None:
+        if context_session is not None and router is None:
             compiled = context_session.compile()
             model_messages = [json.loads(raw) for raw in compiled.messages_json]
-        if (structured or context_session is not None) and len(json.dumps(model_messages, ensure_ascii=False).encode("utf-8")) > max_context_bytes:
+        if router is None and (structured or context_session is not None) and len(json.dumps(model_messages, ensure_ascii=False).encode("utf-8")) > max_context_bytes:
             raise Fault("BUDGET_EXCEEDED", "本轮上下文超过服务端字节预算", 422)
         gateway.trace("model_round", {"round": round_no})
-        reply, usage = await complete(model_messages)
+        if router is None:
+            reply, usage = await complete(model_messages)
+        else:
+            # 候选确定后才编译；故障切换仅重试此请求，不重启业务工具循环。
+            reply, usage = await router.complete(messages, context_session, authorize_sources)
+            rates = router.rates
         # 模型等待期间也可能撤权，不能再用旧数据形成最终回答或后续决策。
         authorize_sources()
         _record_usage(gateway, round_no, usage, rates)
@@ -395,13 +401,18 @@ async def _model_loop(complete, messages, gateway, max_rounds, max_calls, rates,
             gateway.trace("model_tool_call", {"round": round_no, "function": name})
             if name == "read_skill_reference" and not getattr(gateway, "skill", None):
                 raise Fault("PERMISSION_DENIED", "未选择已发布的技能", 403)
-            if name == "read_context_reference":
+            entry = router.reuse(name, args, clean["id"]) if router is not None else None
+            if entry is not None:
+                pass
+            elif name == "read_context_reference":
                 if context_session is None:
                     raise Fault("PERMISSION_DENIED", "当前任务没有启用上下文引用。", 403)
                 entry = {"role": "tool", "tool_call_id": clean["id"],
                          "content": context_session.read(args["ref"])}
             else:
                 entry = await _tool_result(gateway, name, args, clean["id"], sources)
+            if router is not None:
+                router.remember(name, args, entry)
             if name in {"execute_capability", "retrieve_knowledge", "read_result_page"}:
                 result_sources.append((name, source_arguments))
             if name == "execute_capability":
@@ -486,13 +497,16 @@ async def run_provider(
         return result["data"]["summary"]
     if mode not in ("openai", "openai_compatible", "mock", "offline"):
         raise Fault("INVALID_REQUEST", "未知的运行模式。")
+    routed = mode in ("openai", "openai_compatible") and load_policy(settings) is not None
     max_rounds = _budget(settings, "max_rounds", 4, 12)
     max_calls = _budget(settings, "max_calls", 8, 32)
     compiler_enabled = settings.get("context_compiler", os.getenv("AGENT_CONTEXT_COMPILER", "0") == "1")
     if type(compiler_enabled) is not bool:
         raise Fault("MODEL_NOT_CONFIGURED", "上下文编译开关必须为布尔值。", 503)
+    if routed:
+        compiler_enabled = True
     messages = [{"role": "system", "content": SYSTEM}]
-    structured = bool(skill or mode == "mock")
+    structured = bool(skill or mode == "mock" or routed)
     max_context_bytes = _budget(settings, "max_context_bytes", 256000, 1000000) if structured else 256000
     if structured:
         messages[0]["content"] += (
@@ -535,6 +549,15 @@ async def run_provider(
         provider = MockModelProvider(scenario, message, gateway.context(), skill)
         return await _model_loop(provider.complete, messages, gateway, max_rounds, max_calls, (None, None),
                                  structured=True, max_context_bytes=max_context_bytes, context_session=context_session)
+    if routed:
+        router = ProviderRouter(settings, gateway, offered)
+        try:
+            async with asyncio.timeout(90):
+                return await _model_loop(None, messages, gateway, max_rounds, max_calls, (None, None),
+                                         structured=True, max_context_bytes=max_context_bytes,
+                                         context_session=context_session, router=router)
+        except TimeoutError:
+            raise Fault("MODEL_TIMEOUT", "模型运行超时。", 504, True) from None
     url, model, key = _configuration(settings)
     gateway.trace("provider_selected", {"mode": "openai", "model": model})
     headers = {"Authorization": f"Bearer {key}"} if key else {}

@@ -370,6 +370,9 @@ class ProviderRouter:
             authorize()
             turn = messages
             limit = profile["context_window_tokens"] - profile["max_output_tokens"] - 1024
+            if limit < 1:
+                last_error = Fault("CONTEXT_BUDGET_EXCEEDED", "候选模型窗口不足以保留输出与安全余量。", 422)
+                continue
             if context_session is not None:
                 context_session.input_budget = limit
                 try:

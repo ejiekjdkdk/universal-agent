@@ -134,7 +134,8 @@ def create_app(*, scenarios=None, database=None, token=None, model_settings=None
     local_token = configured_token or secrets.token_urlsafe(32)
     service_token = os.getenv("AGENT_SERVICE_TOKEN")
     admin_token = os.getenv("AGENT_ADMIN_TOKEN")
-    model_ready = bool(model.get("base_url") and model.get("model"))
+    from .model_router import load_policy
+    model_ready = bool(load_policy(model) or model.get("base_url") and model.get("model"))
     bursts = defaultdict(deque)
 
     @asynccontextmanager
