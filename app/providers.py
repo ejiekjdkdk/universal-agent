@@ -328,9 +328,23 @@ async def _model_loop(complete, messages, gateway, max_rounds, max_calls, rates,
     observed_summaries: list[str] = []
     projection_limitations: list[str] = []
     completed_read = False
+    result_sources = []
+
+    def authorize_sources():
+        # 即使关闭上下文编译，模型重发的工具数据仍须遵守来源的实时撤销。
+        for function, encoded in result_sources:
+            arguments = json.loads(encoded)
+            if function == "execute_capability":
+                gateway._authorize_result_source(arguments["name"], arguments["arguments"])
+            elif function == "retrieve_knowledge":
+                gateway._authorize_result_source(function, arguments)
+            else:
+                gateway._read_result_page(arguments["ref"], arguments.get("cursor"))
+
     for round_no in range(1, max_rounds + 1):
         # 本轮仍会发送历史和前序工具结果，发送前复核这些数据依赖的当前授权。
         gateway.context()
+        authorize_sources()
         model_messages = messages
         if context_session is not None:
             compiled = context_session.compile()
@@ -339,6 +353,8 @@ async def _model_loop(complete, messages, gateway, max_rounds, max_calls, rates,
             raise Fault("BUDGET_EXCEEDED", "本轮上下文超过服务端字节预算", 422)
         gateway.trace("model_round", {"round": round_no})
         reply, usage = await complete(model_messages)
+        # 模型等待期间也可能撤权，不能再用旧数据形成最终回答或后续决策。
+        authorize_sources()
         _record_usage(gateway, round_no, usage, rates)
         calls = reply.get("tool_calls")
         if calls is not None and not isinstance(calls, list):
@@ -375,6 +391,7 @@ async def _model_loop(complete, messages, gateway, max_rounds, max_calls, rates,
         if context_session is not None:
             context_session.add(messages[-1], "tool_call", True)
         for clean, name, args in parsed:
+            source_arguments = json.dumps(args, ensure_ascii=False)
             gateway.trace("model_tool_call", {"round": round_no, "function": name})
             if name == "read_skill_reference" and not getattr(gateway, "skill", None):
                 raise Fault("PERMISSION_DENIED", "未选择已发布的技能", 403)
@@ -385,6 +402,8 @@ async def _model_loop(complete, messages, gateway, max_rounds, max_calls, rates,
                          "content": context_session.read(args["ref"])}
             else:
                 entry = await _tool_result(gateway, name, args, clean["id"], sources)
+            if name in {"execute_capability", "retrieve_knowledge", "read_result_page"}:
+                result_sources.append((name, source_arguments))
             if name == "execute_capability":
                 projection = json.loads(entry["content"])
                 if "result_ref" in projection:

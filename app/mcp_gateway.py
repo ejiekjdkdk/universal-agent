@@ -8,7 +8,9 @@ import ipaddress
 import json
 import os
 from dataclasses import dataclass
+from contextvars import ContextVar
 from collections import OrderedDict, deque
+import logging
 from pathlib import Path
 import re
 import time
@@ -18,10 +20,35 @@ from urllib.parse import urlsplit
 from jsonschema import Draft202012Validator
 
 from .errors import Fault
+from .schema_validation import is_valid_async
 
 
 MAX_RESPONSE = 262144
 PROTOCOL = "2026-07-28"
+_protected_sdk_logs = ContextVar("protected_mcp_sdk_logs", default=False)
+
+
+class _SafeSDKLog(logging.Filter):
+    """SDK异常可能包含响应原文；网关调用内只保留日志级别和固定诊断。"""
+
+    def filter(self, record):
+        if _protected_sdk_logs.get():
+            record.msg = "MCP客户端诊断已脱敏，错误类别请查看任务Trace"
+            record.args = ()
+            record.exc_info = None
+            record.exc_text = None
+            record.stack_info = None
+        return True
+
+
+_sdk_log_filter = _SafeSDKLog()
+# 锁定SDK的客户端/公共分发器使用这些日志名，包括历史名称client。
+for _logger_name in (
+    "client", "mcp.client.client", "mcp.client.streamable_http", "mcp.client.caching",
+    "mcp.shared.direct_dispatcher", "mcp.shared.dispatcher", "mcp.shared.jsonrpc_dispatcher",
+    "mcp.shared.tool_name_validation",
+):
+    logging.getLogger(_logger_name).addFilter(_sdk_log_filter)
 
 
 @dataclass(frozen=True)
@@ -468,6 +495,7 @@ class MCPGateway:
         # 有副作用的调用发出后遇到网络故障，无法确定远端结果，不能当作普通可重试失败。
         sent = False
         protocol = None
+        log_scope = _protected_sdk_logs.set(True)
         try:
             # 按顺序进入超时、HTTP连接和MCP会话，退出时仍按相反顺序释放。
             async with (
@@ -514,14 +542,20 @@ class MCPGateway:
                 for schema in (remote.input_schema, remote.output_schema):
                     if schema is not None:
                         _schema(schema)
-                _validate(arguments, remote.input_schema, "SCHEMA_VALIDATION_FAILED")
-                validate_result = client.session.validate_tool_result
+                # 远端Schema包含正则等可耗尽CPU的规则，必须在可回收进程中执行。
+                if not await is_valid_async(remote.input_schema, arguments):
+                    raise Fault("SCHEMA_VALIDATION_FAILED", "MCP 数据与批准结构不符", 422)
                 async def validate_bounded_result(name, result):
-                    # SDK会先验证远端Schema，必须在这一步之前拒绝过深或过大的结构。
+                    # 接管SDK的同步校验入口，保留原Schema语义并先限制结构。
                     from .result_store import _bounded
                     if result.structured_content is not None:
                         _bounded(result.structured_content)
-                    await validate_result(name, result)
+                    if remote.output_schema is None:
+                        return
+                    if result.structured_content is None and "structured_content" not in result.model_fields_set:
+                        raise Fault("TOOL_OUTPUT_INVALID", "MCP 工具未返回结构化结果", 502)
+                    if not await is_valid_async(remote.output_schema, result.structured_content, dialect="auto"):
+                        raise Fault("TOOL_OUTPUT_INVALID", "MCP 数据与批准结构不符", 502)
                 client.session.validate_tool_result = validate_bounded_result
                 guard()
                 sent = True
@@ -568,6 +602,7 @@ class MCPGateway:
                 code = "TOOL_OUTPUT_INVALID"
             raise Fault(code, "MCP 返回协议无效", 502) from None
         finally:
+            _protected_sdk_logs.reset(log_scope)
             context.trace("mcp_execution", {"server_id": server_id, "capability_id": tool["capability_id"],
                 "capability_version": tool["version"], "protocol_version": protocol,
                 "duration_ms": round((time.monotonic() - started) * 1000)})

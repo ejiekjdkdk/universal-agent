@@ -5,8 +5,6 @@ import json
 import os
 import re
 import time
-from jsonschema import Draft202012Validator
-from referencing.exceptions import Unresolvable
 
 from .catalog import tool_slot
 from .errors import Fault
@@ -15,6 +13,7 @@ from .skills import SkillError, SkillRegistry
 from .mcp_gateway import MCPContext
 from .result_store import ResultStore, load_p2_policy
 from .read_cache import ReadCache
+from .schema_validation import is_valid as schema_is_valid
 
 
 def preview(value, depth=0):
@@ -137,8 +136,7 @@ class Gateway:
 
     async def retrieve(self, query, top_k=5):
         ctx = self.context()
-        self.check_skill_tool(ctx, "retrieve_knowledge")
-        self.check(ctx, "knowledge.read", "retrieve_knowledge")
+        self._authorize_result_source("retrieve_knowledge", {})
         if not isinstance(query, str) or not 0 < len(query.strip()) <= 16000 or type(top_k) is not int or not 1 <= top_k <= 10:
             raise Fault("INVALID_REQUEST", "检索参数无效")
         if self.read_only:
@@ -208,6 +206,28 @@ class Gateway:
         self.store.pin_mcp_configuration(self.task_id, adapter["server_id"] + "/" + adapter["tool_id"], digest)
         return remote_gateway._scope_key(endpoint, server, remote_context), "p2" in server
 
+    def _authorize_result_source(self, name, arguments):
+        """旧工具数据再次进入模型或引用读取前，复查本地能力和远端绑定。"""
+        context = self.context()
+        business = context["business_id"]
+        if name == "retrieve_knowledge":
+            self.check_skill_tool(context, name)
+            self.check(context, "knowledge.read", name)
+            if self.runtime.releases:
+                self.runtime.releases.guard(self.snapshot_id, business, name)
+            return
+        tool = None
+        for candidate in self.catalog.discover(business):
+            if candidate["name"] == name:
+                tool = candidate
+                break
+        if tool is None:
+            raise Fault("CAPABILITY_REVOKED", "上下文来源工具已不可用。", 403)
+        self.authorize_tool(tool, arguments)
+        adapter = self.catalog._tools[business][name]["adapter"]
+        if adapter["type"] == "mcp":
+            self._mcp_binding(tool, arguments)
+
     def _cache_scope(self, tool, arguments):
         cache = self.runtime.read_cache
         context = self.context()
@@ -265,11 +285,13 @@ class Gateway:
                 tool_slot(self.runtime.slots),
             ):
                 deadline = time.monotonic() + self.runtime.tool_timeout
+                used_knowledge = False
                 def authorize_retrieval():
+                    nonlocal used_knowledge
                     gateway = select()
                     context = gateway.context()
-                    gateway.check_skill_tool(context, "retrieve_knowledge")
-                    gateway.check(context, "knowledge.read", "retrieve_knowledge")
+                    gateway._authorize_result_source("retrieve_knowledge", {})
+                    used_knowledge = True
                     return context["object_ids"]
                 options = {"authorize_retrieval": authorize_retrieval}
                 if self.runtime.result_store:
@@ -300,7 +322,7 @@ class Gateway:
                             if "object_id" in item and item["object_id"] not in context["object_ids"]:
                                 raise Fault("PERMISSION_DENIED", "工具返回了范围外的证据", 403)
                         gateway.check_output_secrets(output)
-                        return output
+                        return {"output": output, "used_knowledge": used_knowledge}
                     except Fault as exc:
                         if attempt or not exc.retryable:
                             raise
@@ -314,9 +336,12 @@ class Gateway:
                         })
                         await asyncio.sleep(delay)
         participant = {"guard": guard, "charge": charge, "value": self}
-        output = await self.runtime.read_cache.run(key, ttl, participant, operation)
+        shared = await self.runtime.read_cache.run(key, ttl, participant, operation)
+        if shared["used_knowledge"]:
+            # 每个命中者都继承实际读取依赖，不能只有物理执行者留下权限记录。
+            self._authorize_result_source("retrieve_knowledge", {})
         self.trace("read_cache_result", {"capability_id": tool["name"], "scope_digest": key})
-        return output
+        return shared["output"]
 
     async def execute(self, name, arguments, call_id):
         context = self.context()
@@ -366,8 +391,7 @@ class Gateway:
                         # 回调只准备一次；每次实际调用时仍重新读取身份并核验权限。
                         def authorize_retrieval():
                             ctx = self.context()
-                            self.check_skill_tool(ctx, "retrieve_knowledge")
-                            self.check(ctx, "knowledge.read", "retrieve_knowledge")
+                            self._authorize_result_source("retrieve_knowledge", {})
                             return ctx["object_ids"]
 
                         options = {"authorize_retrieval": authorize_retrieval}
@@ -525,11 +549,8 @@ class Runtime:
     def _validate_skill_value(schema, value):
         if schema is None:
             return
-        try:
-            if Draft202012Validator(schema).is_valid(value):
-                return
-        except (ValueError, TypeError, RecursionError, Unresolvable):
-            pass
+        if schema_is_valid(schema, value):
+            return
         raise Fault("SKILL_SCHEMA_INVALID", "技能输入或结果不符合已发布的结构", 422)
 
     @property
@@ -635,10 +656,13 @@ class Runtime:
         if getattr(self, "triggers", None):
             self.triggers.guard_task(task_id)
         grant = self.authorize(actor, scenario, self.store.scope(task_id))
-        if (not self.store.permissions(task_id).issubset(grant.get("permissions", []))
+        required_permissions = self.store.permissions(task_id)
+        if (not required_permissions.issubset(grant.get("permissions", []))
                 or not self.store.history_types(task_id).issubset(grant.get("resource_types", []))):
             self.store.audit("task_access", "deny", actor, task_id, scenario, "PERMISSION_DENIED")
             raise Fault("PERMISSION_DENIED", "读取本次任务所需的权限已撤销", 403)
+        if self.releases and "knowledge.read" in required_permissions:
+            self.releases.guard(self.store.task_snapshot(task_id), scenario, "retrieve_knowledge")
 
     def launch(self, identity, body, task):
         task_id = task["task_id"]

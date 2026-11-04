@@ -19,6 +19,10 @@ class Gateway:
     def context(self):
         return {}
 
+    def _authorize_result_source(self, name, arguments):
+        # 此替身只测试模型协议；真实来源撤权由集成测试覆盖。
+        self.context()
+
     async def discover(self):
         return [{"name": "outline", "description": "Prepare an outline",
                  "input_schema": {"type": "object"}, "output_schema": {"type": "object"},

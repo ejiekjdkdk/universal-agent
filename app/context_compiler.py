@@ -167,17 +167,7 @@ class ContextSession:
         if scope != self.scope or self.gateway.snapshot_id != self.snapshot_id:
             raise Fault("PERMISSION_DENIED", "上下文引用不属于当前任务。", 403)
         for name, arguments in self.sources:
-            if name == "retrieve_knowledge":
-                self.gateway.check_skill_tool(current, name)
-                self.gateway.check(current, "knowledge.read", name)
-                if self.gateway.runtime.releases:
-                    self.gateway.runtime.releases.guard(self.snapshot_id, current["business_id"], name)
-                continue
-            tool = next((tool for tool in self.gateway.catalog.discover(current["business_id"])
-                         if tool["name"] == name), None)
-            if tool is None:
-                raise Fault("CAPABILITY_REVOKED", "上下文来源工具已不可用。", 403)
-            self.gateway.authorize_tool(tool, json.loads(arguments))
+            self.gateway._authorize_result_source(name, json.loads(arguments))
         return current
 
     def read(self, ref: str) -> str:
