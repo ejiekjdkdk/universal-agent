@@ -19,6 +19,12 @@ sys.path.insert(0, str(ROOT))
 from app.runtime_environment import sqlite_runtime, sqlite_wal_fixed
 
 REQUIRED_NODES = {
+    "V31-020": ["tests/test_skill_install.py::test_signed_install_is_idempotent_draft_and_rejects_conflicts",
+                "tests/test_skill_install.py::test_invalid_install_leaves_no_registry[tampered]",
+                "tests/test_skill_install.py::test_invalid_install_leaves_no_registry[wrong-key]",
+                "tests/test_skill_install.py::test_invalid_install_leaves_no_registry[unsigned]"],
+    "WINDOWS-START": ["tests/test_start_runtime.py::test_cmd_checks_registration_and_lock_before_app",
+                      "tests/test_start_runtime.py::test_startup_rejects_runtime_drift"],
     "V31-044": ["tests/test_v31_compatibility.py::test_v31_preserves_v3_public_and_database_contracts",
                 "tests/test_api.py::", "tests/test_durable_api.py::"],
     "V31-045": ["tests/test_p4_stream_release.py::test_real_disconnect_replays_only_persisted_events[reactive]",

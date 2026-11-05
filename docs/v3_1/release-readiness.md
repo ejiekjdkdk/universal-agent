@@ -10,6 +10,22 @@
 
 SQLite 官方说明受影响范围与修复见 <https://sqlite.org/wal.html#walreset>；3.51.3+、3.44.6/3.50.7 所在回补分支可用。旧环境可用于历史调查，不作为 P4 的并发 WAL 发布环境。此门禁的已验证目标限 Windows 64 位 Python 3.11。
 
+## 登记默认启动环境
+
+在 Windows 仓库根目录，用**受信任、已单独创建**的虚拟环境解释器登记路径。以下路径仅为示例，请替换为自己机器的实际位置：
+
+```powershell
+& 'D:\agent-runtime\env\Scripts\python.exe' -I scripts/start_runtime.py --register
+if ($LASTEXITCODE -ne 0) { throw '运行时登记失败' }
+.\start.cmd --check
+if ($LASTEXITCODE -ne 0) { throw '启动前检查失败' }
+.\start.cmd
+```
+
+如尚无该环境：从[固定的 Windows x64 构建](https://github.com/astral-sh/python-build-standalone/releases/download/20261026/cpython-3.11.18%2B20261026-x86_64-pc-windows-msvc-install_only_stripped.tar.gz)取得上文指定的归档，用 `Get-FileHash -Algorithm SHA256` 与上文摘要核对。匹配后解压到独立受信目录，用其中的 `python\python.exe -m venv D:\agent-runtime\env` 创建**全新**虚拟环境，再用该环境的 `Scripts\python.exe -m pip install -r requirements-win-py311.lock` 安装依赖。已有同名目录时另选新目录；不要改造旧环境。日常启动不再安装依赖。
+
+登记文件 `.runtime-python` 属于当前检出的本机配置，不提交 Git。默认启动每次复核环境，不会自动改用旧 `.venv` 或 PATH 中的 Python。解释器搬迁后需重新登记；不要登记他人提供的未经核实的可执行文件。环境检查通过仅说明可用该运行时启动，完整发布检查另见下节。
+
 ## 执行检查
 
 先在干净的候选 Git 工作树、固定依赖环境中运行；源码目录不能有 `.env`。可信配置与密钥留在源码外。证据目录必须全新、位于源码外，已有目录拒绝覆盖。

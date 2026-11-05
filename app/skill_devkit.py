@@ -1,11 +1,11 @@
-"""离线检查和打包候选技能；不执行包内代码，也不改变发布注册表。"""
+"""离线检查和打包候选技能。显式安装将已验签的工件登记为本地无权限草稿。"""
 import hashlib
 import hmac
 from importlib import metadata
 import json
 import multiprocessing
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import re
 import stat
 import sys
@@ -17,7 +17,7 @@ from jsonschema import Draft202012Validator, SchemaError
 from referencing.exceptions import Unresolvable
 import yaml
 
-from .skills import SkillError, _dependencies, _identifier, _local, _mapping, _package, _safe_key
+from .skills import SkillError, SkillRegistry, _dependencies, _identifier, _local, _mapping, _package, _safe_key
 
 MAX_FILE = 65536
 MAX_TOTAL = 2 * 1024 * 1024
@@ -117,6 +117,8 @@ def _files(directory: Path) -> dict[str, bytes]:
 def _validate_bytes(name: str, files: dict[str, bytes], capabilities: Iterable[str]):
     """在私有临时目录解析同一份字节，避免验证源文件后又打包另一份内容。"""
     _identifier(name, r"[a-z0-9]+(?:-[a-z0-9]+)*", "Skill 名称")
+    if PureWindowsPath(name).is_reserved():
+        raise SkillError("Skill 名称不能是 Windows 设备名")
     approved = set(_dependencies({"required_capabilities": list(capabilities)}))
     try:
         manifest = _mapping(files["skill.manifest.yaml"].decode("utf-8-sig")) if "skill.manifest.yaml" in files else {}
@@ -284,12 +286,30 @@ def pack_skill(directory: Path, output: Path, capabilities: Iterable[str], signi
 
 
 def inspect_artifact(path: Path, signing_key: bytes | None = None) -> dict:
+    report, _ = _read_artifact(path, signing_key)
+    return report
+
+
+def install_artifact(path: Path, root: Path, capabilities: Iterable[str], *, signing_key: bytes, author: str) -> dict:
+    if signing_key is None:
+        raise SkillError("安装需要受信任的工件验证密钥")
+    report, package = _read_artifact(path, signing_key)
+    approved = _dependencies({"required_capabilities": list(capabilities)})
+    if not set(package.dependencies) <= set(approved):
+        raise SkillError("技能依赖未出现在操作者批准的能力清单")
+    SkillRegistry._identity(author)
+    draft = SkillRegistry(root)._store_package(package, author, artifact_digest=report["package_digest"])
+    return {**report, "installation": draft["installation"], "content_digest": package.digest}
+
+
+def _read_artifact(path: Path, signing_key: bytes | None):
     path = Path(path)
     _local(path)
     if path.stat().st_size > 2 * MAX_TOTAL:
         raise SkillError("工件超过大小上限")
     files = {}
     names: set[str] = set()
+    directories = {}
     total = 0
     try:
         with zipfile.ZipFile(path) as archive:
@@ -298,8 +318,18 @@ def inspect_artifact(path: Path, signing_key: bytes | None = None) -> dict:
                 raise SkillError("工件条目过多")
             for entry in entries:
                 name = entry.filename
+                if entry.orig_filename != name:
+                    raise SkillError("工件路径包含非规范分隔符或空字符")
                 if name != "artifact.json":
                     _check_path(name)
+                parts = name.split("/")
+                for depth in range(1, len(parts)):
+                    directory = "/".join(parts[:depth])
+                    folded = directory.casefold()
+                    if folded in names or directories.setdefault(folded, directory) != directory:
+                        raise SkillError("工件目录路径冲突")
+                if name.casefold() in directories:
+                    raise SkillError("工件文件与目录路径冲突")
                 mode = stat.S_IFMT(entry.external_attr >> 16)
                 if (name.casefold() in names or mode not in (0, stat.S_IFREG) or entry.is_dir()
                         or entry.flag_bits & 1 or entry.compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED)):
@@ -352,7 +382,7 @@ def inspect_artifact(path: Path, signing_key: bytes | None = None) -> dict:
         raise SkillError("工件内容与身份或依赖不一致")
     return {"status": "PASS", "skill_id": package.name, "version": package.version,
             "package_digest": calculated, "signature": signature_status, "publication": "draft",
-            "authorization": "NOT_GRANTED", "installation": "NOT_RUN", "files": sorted(files)}
+            "authorization": "NOT_GRANTED", "installation": "NOT_RUN", "files": sorted(files)}, package
 
 
 def doctor() -> dict:

@@ -1,6 +1,6 @@
 # V3.1 首轮使用方式
 
-本轮为现有 V3 的可选增强，P2/P3/P4 新能力尚未完成。Python环境、启动网页及原 SkillOps 用法保持不变。
+本页记录 P0/P1 增量用法及后续的签名工件安装入口。其他阶段的交付见 [README 版本历史](../../README.md#版本迭代历史)。
 
 ## 上下文编译
 
@@ -32,6 +32,17 @@ fixtures 放在 tests/*.json，每个文件为列表，单条形如 `{"id":"miss
 候选工件使用固定ZIP元数据、文件摘要、依赖锁和包摘要。可在本地环境变量中配置至少32字节的独立工件密钥，并为pack/inspect显式传 `--signing-key-env <变量名>`。密钥不写入工件。未提供验证密钥时，只能报告unsigned/unverified，不得当成可信发布签名；本机HMAC不是PKI。
 
 inspect只检查，不安装，不发布。原目录导入发布继续使用 scripts/skillctl.py；发布时仍需作者、审核者、工具绑定和固定评测。不要把ZIP检查成功当成已审核安装。第三项目的完整演示见 examples/v3/demo_c/README.md。
+
+## 签名工件安装
+
+在受信任的本地终端，用独立的工件 HMAC 密钥打包；安装时从可信配置取得同一密钥，以及允许的能力依赖清单。不要采用 ZIP 自带的密钥或能力批准列表。以下示例沿用前面生成的不含能力依赖的 `my-skill`；`SKILL_ARTIFACT_KEY` 是已配置的环境变量名，值至少 32 字节，不要提交到 Git。
+
+```powershell
+python scripts/agent.py skill pack work/my-skill --out work/signed --signing-key-env SKILL_ARTIFACT_KEY
+python scripts/agent.py skill install work/signed/my-skill-1.0.0.zip --root var/skills --author local-author --signing-key-env SKILL_ARTIFACT_KEY
+```
+
+`--root` 应指向应用使用的本地 Skill 注册表。需要能力依赖时，在打包和安装命令中均指定 `--capabilities <可信JSON文件>`。安装只登记草稿：没有激活版本、工具权限或脚本执行。要让业务使用该技能，仍须通过原 [SkillOps 校验、暂存与发布流程](../v3/skillops.md)。HMAC 证明工件由持有同一秘密的受信任一方签名，不验证个人身份或业务质量。
 
 ## 兼容性与限制
 

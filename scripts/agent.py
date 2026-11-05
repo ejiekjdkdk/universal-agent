@@ -7,7 +7,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from app.skill_devkit import doctor, init_skill, inspect_artifact, pack_skill, test_skill, validate_skill
+from app.skill_devkit import doctor, init_skill, inspect_artifact, install_artifact, pack_skill, test_skill, validate_skill
 
 
 def main(argv=None):
@@ -31,6 +31,12 @@ def main(argv=None):
     inspect = skills.add_parser("inspect", help="有界读取并验证候选工件，不解压安装")
     inspect.add_argument("artifact", type=Path)
     inspect.add_argument("--signing-key-env")
+    install = skills.add_parser("install", help="验证签名并安装为本地无权限草稿")
+    install.add_argument("artifact", type=Path)
+    install.add_argument("--root", required=True, type=Path)
+    install.add_argument("--author", required=True, help="本地操作员确认的作者标识")
+    install.add_argument("--signing-key-env", required=True)
+    install.add_argument("--capabilities", type=Path, help="操作者批准的 ID@VERSION JSON 列表")
     args = parser.parse_args(argv)
     try:
         key = None
@@ -54,6 +60,8 @@ def main(argv=None):
             result = test_skill(args.directory, capabilities)
         elif args.action == "pack":
             result = pack_skill(args.directory, args.out, capabilities, signing_key=key)
+        elif args.action == "install":
+            result = install_artifact(args.artifact, args.root, capabilities, signing_key=key, author=args.author)
         else:
             result = inspect_artifact(args.artifact, signing_key=key)
     except (ValueError, OSError) as error:

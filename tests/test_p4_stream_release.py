@@ -154,6 +154,16 @@ def test_code_and_configuration_rollback_preserve_history(tmp_path):
     state.mkdir()
     scenes = state / "scenarios"
     scene = copy_scene(ROOT / "scenarios/notes", scenes / "notes")
+    archive = copy_scene(scene, scenes / "archive")
+    archive_manifest = archive / "scenario.json"
+    manifest = json.loads(archive_manifest.read_text(encoding="utf-8"))
+    manifest["id"] = "archive"
+    archive_manifest.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+    archive_docs = archive / "notes.json"
+    documents = json.loads(archive_docs.read_text(encoding="utf-8"))
+    document = documents[0]
+    document["snippet"] += " 归档项目原文。" * 25
+    archive_docs.write_text(json.dumps(documents, ensure_ascii=False), encoding="utf-8")
     probe = state / "physical"
     probe.mkdir()
     # 发布门禁也会执行适配器；只在历史读取前后比较探针，避免把合法评测误计为重放。
@@ -180,6 +190,8 @@ def test_code_and_configuration_rollback_preserve_history(tmp_path):
     assert len(set(buckets)) == 2
     percent = min(buckets) + 1
     principals = state / "principals.json"
+    for actor in actors:
+        actor["grants"]["archive"] = {"permissions": ["knowledge.read", "notes.read"]}
     principals.write_text(json.dumps(actors), encoding="utf-8")
     policy = state / "p2.json"
     policy.write_text(json.dumps({"results": {"keys": {"local": "P4_RESULT_KEY"}, "active_key": "local", "page_bytes": 512}}), encoding="utf-8")
@@ -228,7 +240,7 @@ def test_code_and_configuration_rollback_preserve_history(tmp_path):
             path = API + "/tasks/" + task["task_id"]
             items = connection.get(path + "/results", headers=headers).raise_for_status().json()["results"]
             ref = items[0]["result_ref"]
-            page = result_pages(ref, headers)
+            page = result_pages(connection, ref, headers)
             events = replay_for(headers, path)
             records.append((label, headers, task, ref, page, events))
             return task
@@ -237,11 +249,11 @@ def test_code_and_configuration_rollback_preserve_history(tmp_path):
             response = connection.get(path + "/events", headers=headers).raise_for_status()
             return list(frames(response.iter_lines()))
 
-        def result_pages(ref, headers):
+        def result_pages(reader, ref, headers):
             pages = []
             cursor = None
             while True:
-                response = connection.get(API + "/results/" + ref + "/pages", headers=headers,
+                response = reader.get(API + "/results/" + ref + "/pages", headers=headers,
                                           params={"cursor": cursor} if cursor else {})
                 page = response.raise_for_status().json()
                 pages.append(page)
@@ -289,7 +301,7 @@ def test_code_and_configuration_rollback_preserve_history(tmp_path):
                 if ref in {deleted_ref, expired_ref}:
                     assert response.status_code == 404
                 else:
-                    assert result_pages(ref, headers) == page
+                    assert result_pages(connection, ref, headers) == page
                 assert [item["event"] for item in events if item["event"] in TERMINALS] == ["task_completed"]
             assert sorted(p.name for p in probe.iterdir()) == before
             assert connection.get(ADMIN + "/skills/notes/lookup/1.0.0", headers=PUBLISHER).raise_for_status().json() == governance
@@ -317,6 +329,13 @@ def test_code_and_configuration_rollback_preserve_history(tmp_path):
         kill(active[0])
         active = boot(ROOT, "candidate-reads-baseline")
         check_history()
+        archive_task = connection.post(API + "/chat", json=BODY | {"business_id": "archive"}).raise_for_status().json()
+        assert archive_task["status"] == "completed" and archive_task["business_id"] == "archive"
+        archive_path = API + "/tasks/" + archive_task["task_id"] + "/results"
+        [archive_result] = connection.get(archive_path).raise_for_status().json()["results"]
+        archive_ref = archive_result["result_ref"]
+        archive_pages = result_pages(connection, archive_ref, {})
+        assert len(archive_pages) > 1
         # 热改角色文件后立即拒绝；保持撤权状态跨代码切换。
         for actor in actors:
             actor["grants"]["notes"]["permissions"].remove("notes.read")
@@ -353,10 +372,28 @@ def test_code_and_configuration_rollback_preserve_history(tmp_path):
                             AGENT_RELEASE_CANDIDATES=str(restored / "candidates"), AGENT_P2_POLICY=str(restored / "p2.json"),
                             P4_RELEASE_PROBE=str(restored / "physical"))
         restored_client = client(stack, restored_env)
-        start_api(stack, old_root, restored_env, restored, "restored-api", restored_client, "-c", COUNTED_API)
+        restored_api = start_api(stack, old_root, restored_env, restored, "restored-api", restored_client, "-c", COUNTED_API)
         assert (restored / "skills/.operator-key").read_bytes() == operator_key
         assert restored_client.get(ADMIN + "/skills/notes/lookup/1.0.0", headers=PUBLISHER).raise_for_status().json() == governance
-        for _, headers, task, ref, _, _ in records:
-            assert restored_client.get(API + "/tasks/" + task["task_id"], headers=headers).raise_for_status().json() == task
-            assert restored_client.get(API + "/results/" + ref + "/pages", headers=headers).status_code in (403, 404)
-        assert sorted(p.name for p in (restored / "physical").iterdir()) == sorted(p.name for p in probe.iterdir())
+        def check_restored_results():
+            for _, headers, task, ref, _, _ in records:
+                assert restored_client.get(API + "/tasks/" + task["task_id"], headers=headers).raise_for_status().json() == task
+                status = 404 if ref in (deleted_ref, expired_ref) else 403
+                assert restored_client.get(API + "/results/" + ref + "/pages", headers=headers).status_code == status
+            assert restored_client.get(archive_path).raise_for_status().json()["results"] == [archive_result]
+            pages = result_pages(restored_client, archive_ref, {})
+            assert pages == archive_pages
+            result = json.loads("".join(page["content"] for page in pages))
+            assert document["snippet"] in result["data"]["summary"]
+            assert result["evidence"] == archive_task["evidence"]
+            assert any(all(item[key] == document[key] for key in ("source_id", "version", "snippet"))
+                       for item in result["evidence"])
+            foreign = restored_client.get(API + "/results/" + archive_ref + "/pages", headers=stable_headers,
+                                          params={"cursor": pages[0]["next_cursor"]})
+            assert foreign.status_code == 404 and "content" not in foreign.json()
+            assert sorted(p.name for p in (restored / "physical").iterdir()) == sorted(p.name for p in probe.iterdir())
+
+        check_restored_results()
+        kill(restored_api[0])
+        start_api(stack, ROOT, restored_env, restored, "restored-current", restored_client, "-c", COUNTED_API)
+        check_restored_results()

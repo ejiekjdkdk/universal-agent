@@ -314,12 +314,26 @@ class SkillRegistry:
             pkg = _package(directory, version)
         except (OSError, UnicodeError, yaml.YAMLError, RecursionError, SchemaError, json.JSONDecodeError) as err:
             raise SkillError("Skill 包文件或元信息无效") from err
+        return self._store_package(pkg, author)
+
+    def _store_package(self, pkg, author, *, artifact_digest=None):
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
             key = (pkg.name, pkg.version)
             old = db.execute("SELECT digest FROM packages WHERE name=? AND version=?", key).fetchone()
             if old and old["digest"] != pkg.digest:
                 raise SkillError("同名同版本包已存在且内容不同")
+            if artifact_digest and old:
+                receipt = db.execute(
+                    "SELECT details,author,content_seal FROM skill_audit JOIN package_auth USING(name,version) "
+                    "WHERE action='install' AND actor=author AND name=? AND version=?", key).fetchone()
+                if (not receipt or json.loads(receipt["details"]).get("artifact_digest") != artifact_digest
+                        or receipt["author"] != author
+                        or receipt["content_seal"] != self._content_seal(db, *key)):
+                    raise SkillError("现有版本与工件安装记录不一致")
+                if db.execute("SELECT 1 FROM releases WHERE name=? AND version=?", key).fetchone():
+                    raise SkillError("已进入发布治理的版本无法再次安装为草稿")
+                return {"installation": "ALREADY_INSTALLED"}
             if not old:
                 db.execute("INSERT INTO packages VALUES(?,?,?,?,?)", (*key, pkg.description, pkg.digest, pkg.body))
                 db.executemany("INSERT INTO refs VALUES(?,?,?,?)",
@@ -331,6 +345,9 @@ class SkillRegistry:
                 raise SkillError("已导入包的作者不可改写")
             db.execute("INSERT OR IGNORE INTO package_auth VALUES(?,?,?,?)",
                        (*key, author, self._content_seal(db, *key)))
+            if artifact_digest:
+                self._audit(db, "install", "", *key, author, {"digest": pkg.digest, "artifact_digest": artifact_digest})
+                return {"installation": "INSTALLED"}
             self._audit(db, "import", "", *key, author, {"digest": pkg.digest})
         return dict(name=pkg.name, version=pkg.version, description=pkg.description, digest=pkg.digest,
                     status="draft", required_capabilities=pkg.dependencies)
