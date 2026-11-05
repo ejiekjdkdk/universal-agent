@@ -12,6 +12,7 @@ import sys
 import tempfile
 from typing import Iterable
 import zipfile
+import zlib
 
 from jsonschema import Draft202012Validator, SchemaError
 from referencing.exceptions import Unresolvable
@@ -347,7 +348,7 @@ def _read_artifact(path: Path, signing_key: bytes | None):
                 if name != "artifact.json":
                     _check_content(raw)
                 files[name] = raw
-    except (zipfile.BadZipFile, RuntimeError, NotImplementedError) as error:
+    except (zipfile.BadZipFile, zlib.error, EOFError, RuntimeError, NotImplementedError) as error:
         raise SkillError("工件ZIP结构无效") from error
     descriptor = _json(files.pop("artifact.json", b"{}"))
     required = {"format", "skill_id", "version", "files", "dependencies", "dependency_lock_digest", "package_digest", "signature"}

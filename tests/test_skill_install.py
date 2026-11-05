@@ -97,7 +97,7 @@ def test_paths_rejected_before_content_validation(tmp_path, bad_name):
 
 def test_wire_backslash_cannot_alias_signed_member(candidate, tmp_path, monkeypatch, capsys):
     archive = pack(candidate, tmp_path / "out")
-    # Replace only ZIP header filenames, leaving the signed JSON payload unmodified.
+    # 只替换 ZIP 头内的文件名，保持签名清单原样。
     with zipfile.ZipFile(archive) as src:
         member = src.getinfo("references/usage.md")
         local_name = member.header_offset + 30
@@ -123,3 +123,19 @@ def test_archive_rejects_directory_case_aliases_before_materialization(tmp_path)
         dst.writestr("references/dir/b.md", "two")
     with pytest.raises(SkillError, match="路径.*冲突"):
         inspect_artifact(archive)
+
+
+def test_broken_deflate_returns_cli_failure_without_installing(tmp_path, monkeypatch, capsys):
+    archive = tmp_path / "broken.zip"
+    name = "SKILL.md"
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
+        bundle.writestr(name, b"candidate")
+        member = bundle.getinfo(name)
+    # DEFLATE 保留的块类型：目录和文件名合法，但读取内容一定失败。
+    data = bytearray(archive.read_bytes())
+    data[member.header_offset + 30 + len(name) + len(member.extra)] = 0x07
+    archive.write_bytes(data)
+    root = tmp_path / "registry"
+    code, report = install(archive, root, monkeypatch, capsys)
+    assert code == 1 and report["status"] == "FAIL"
+    assert not root.exists()
